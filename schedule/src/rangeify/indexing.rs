@@ -350,12 +350,9 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
         _c @ Call { body, args, info: _ }
             if matches!(body.op(), Op::Sink(..) | Op::Program(..)) => {
             for arg in args {
-                let mut src = Arc::clone(arg);
-                while let Op::Reshape(ops::Reshape { src: inner, .. }) = src.op() {
-                    src = Arc::clone(inner);
-                }
-                if !is_always_contiguous(&src) {
-                    ctx.mark_realize_non_removable(&src);
+                let src = through_reshapes(arg);
+                if !is_always_contiguous(src) {
+                    ctx.mark_realize_non_removable(src);
                 }
             }
             None
@@ -379,8 +376,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             {
                 ctx.clear_realize(value);
             }
-            let index_base = index.base().id;
-            if value.any_in_subtree(|n| n.id == index_base) && !self_read_misses_store(index, value, index_base) {
+            if !self_read_misses_store(index, value, index.base().id) {
                 ctx.mark_realize_non_removable(value);
             }
             None
@@ -415,78 +411,73 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
     }
 }
 
-/// Split an integer index expression into `(varying part, constant addend)`.
-///
-/// `t` yields `(Some(t), 0)` and `t + 1` yields `(Some(t), 1)`, which is all a
-/// scan needs to tell one time slot from the next.
-fn split_const_addend(u: &Arc<UOp>) -> (Option<u64>, i64) {
-    match u.op() {
-        Op::Cast(ops::Cast { src, .. }) => split_const_addend(src),
-        Op::Const(value) => match value.0 {
-            ConstValue::Int(v) => (None, v),
-            ConstValue::UInt(v) => (None, v as i64),
-            _ => (Some(u.id), 0),
-        },
-        Op::Binary(BinaryOp::Add, a, b) => match (split_const_addend(a), split_const_addend(b)) {
-            ((var, c), (None, k)) | ((None, k), (var, c)) => (var, c + k),
-            _ => (Some(u.id), 0),
-        },
-        _ => (Some(u.id), 0),
+/// `node` seen through any number of RESHAPEs; other movement ops stay.
+fn through_reshapes(node: &Arc<UOp>) -> &Arc<UOp> {
+    let mut cur = node;
+    while let Op::Reshape(ops::Reshape { src, .. }) = cur.op() {
+        cur = src;
     }
+    cur
 }
 
 /// Whether two shrink windows over one buffer provably cover disjoint memory.
 ///
-/// True when some axis separates them by a constant at least as large as both
-/// windows — the scan case, where step `t` reads slot `t` and writes slot
-/// `t + 1`.
+/// True when on some axis the offset gap, once simplified, clears the other
+/// window in either direction: `a` starts at or past the end of `b`, or ends
+/// at or before the start of `b`. That is the scan case, where step `t` reads
+/// slot `t` and writes slot `t + 1`, and its strided variants.
 fn windows_disjoint(a: (&[Arc<UOp>], &[Arc<UOp>]), b: (&[Arc<UOp>], &[Arc<UOp>])) -> bool {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
+
     let ((a_off, a_size), (b_off, b_size)) = (a, b);
-    if a_off.len() != b_off.len() {
-        return false;
-    }
-    a_off.iter().zip(b_off).zip(a_size.iter().zip(b_size)).any(|((ao, bo), (asz, bsz))| {
-        let (Some(asz), Some(bsz)) = (asz.vmax().try_int(), bsz.vmax().try_int()) else { return false };
-        let ((a_var, a_c), (b_var, b_c)) = (split_const_addend(ao), split_const_addend(bo));
-        a_var == b_var && (a_c - b_c).abs() >= asz.max(bsz)
-    })
+    a_off.len() == b_off.len()
+        && a_off.iter().zip(b_off).zip(a_size.iter().zip(b_size)).any(|((ao, bo), (asz, bsz))| {
+            let (Some(asz), Some(bsz)) = (asz.vmax().try_int(), bsz.vmax().try_int()) else { return false };
+            let Ok(gap) = ao.try_sub(bo) else { return false };
+            let gap = crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), gap, &mut ());
+            let Some((min, max)) = *SoundVminVmaxProperty::get(&gap) else { return false };
+            min.try_int().is_some_and(|min| min >= bsz) || max.try_int().is_some_and(|max| max <= -asz)
+        })
 }
 
 /// The `(offsets, sizes, viewed shape)` of a SHRINK that windows `base`
 /// directly, seen through any number of reshapes.
 type ShrinkView = (Vec<Arc<UOp>>, Vec<Arc<UOp>>, Option<svod_ir::shape::Shape>);
 
+/// `None` for offsets without sound bounds: reading through their casts
+/// would miss a wrap-around, so such a SHRINK is not a window we can place.
 fn shrink_over_base(node: &Arc<UOp>, base: u64) -> Option<ShrinkView> {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
+
     let Op::Shrink(ops::Shrink { src, offsets, sizes }) = node.op() else { return None };
-    let mut cur = src;
-    while let Op::Reshape(ops::Reshape { src: inner, .. }) = cur.op() {
-        cur = inner;
-    }
-    (cur.id == base)
+    (through_reshapes(src).id == base && SoundVminVmaxProperty::get(offsets).is_some())
         .then(|| (extract_shape_uops(offsets), extract_shape_uops(sizes), src.shape().ok().flatten().cloned()))
 }
 
 /// Whether every read of `base` inside a STORE's value misses the slot the
-/// STORE writes.
+/// STORE writes (vacuously, when the value never reads `base`).
 ///
 /// The STORE rule's WAR temp exists for self-assigns that overlap; a scan
 /// reading slot `t` and writing slot `t + 1` does not, and paying for the temp
 /// there costs one extra kernel and one extra buffer round trip per time step.
 ///
-/// Every unproven case keeps the temp: a size whose bound is symbolic, a
-/// non-SHRINK read of the base, a movement op other than RESHAPE between the
-/// SHRINK and the base, or two windows viewed through different shapes.
+/// Every unproven case keeps the temp: a STORE target that is not a SHRINK, a
+/// size whose bound exceeds the gap, a non-SHRINK read of the base, a movement
+/// op other than RESHAPE between the SHRINK and the base, or two windows viewed
+/// through different shapes.
 fn self_read_misses_store(index: &Arc<UOp>, value: &Arc<UOp>, base: u64) -> bool {
-    let Some((store_off, store_size, store_shape)) = shrink_over_base(index, base) else { return false };
-
-    let mut aliasing: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let store = shrink_over_base(index, base);
+    let mut aliasing: HashSet<u64> = HashSet::new();
     for node in value.toposort() {
         if node.id != base && !node.op().sources().iter().any(|src| aliasing.contains(&src.id)) {
             continue;
         }
-        if let Some((off, size, shape)) = shrink_over_base(&node, base)
-            && shape == store_shape
-            && windows_disjoint((&store_off, &store_size), (&off, &size))
+        if let Some((store_off, store_size, store_shape)) = &store
+            && let Some((off, size, shape)) = shrink_over_base(&node, base)
+            && shape == *store_shape
+            && windows_disjoint((store_off, store_size), (&off, &size))
         {
             continue;
         }

@@ -15,6 +15,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use crate::ops;
 use crate::{BinaryOp, Op, UOp};
 
@@ -36,6 +38,43 @@ fn symbolic_contains_max_term(expr: &Arc<UOp>, needle: &Arc<UOp>) -> bool {
         }
         _ => false,
     }
+}
+
+/// Value of a constant leaf, folding `Mul` of constants (`neg` spells `-c` as `c * -1`).
+fn const_leaf(uop: &UOp) -> Option<i128> {
+    match uop.op() {
+        Op::Const(c) => const_to_i128(&c.0),
+        Op::Binary(BinaryOp::Mul, lhs, rhs) => Some(const_leaf(lhs)? * const_leaf(rhs)?),
+        _ => None,
+    }
+}
+
+/// Split an `Add` chain into its constant addend and the ids of its varying terms.
+fn affine_terms(expr: &Arc<UOp>, varying: &mut SmallVec<[u64; 4]>) -> i128 {
+    if let Op::Binary(BinaryOp::Add, lhs, rhs) = expr.op() {
+        return affine_terms(lhs, varying) + affine_terms(rhs, varying);
+    }
+    const_leaf(expr).unwrap_or_else(|| {
+        varying.push(expr.id);
+        0
+    })
+}
+
+/// `c1 - c2` when `a = terms + c1` and `b = terms + c2` over the same multiset
+/// of varying terms, e.g. `(t + 1) - t` or `(1 + t) - (t + 3)`.
+///
+/// Only an `Add` on either side can carry a cancelling term, so the shape
+/// hot paths (`ceildiv` on a bare variable) skip the decomposition.
+fn affine_difference(a: &Arc<UOp>, b: &Arc<UOp>) -> Option<i128> {
+    let is_add = |uop: &Arc<UOp>| matches!(uop.op(), Op::Binary(BinaryOp::Add, ..));
+    if !is_add(a) && !is_add(b) {
+        return None;
+    }
+    let (mut terms_a, mut terms_b) = (SmallVec::new(), SmallVec::new());
+    let (c_a, c_b) = (affine_terms(a, &mut terms_a), affine_terms(b, &mut terms_b));
+    terms_a.sort_unstable();
+    terms_b.sort_unstable();
+    (terms_a == terms_b).then_some(c_a - c_b)
 }
 
 /// Symbolic Integer - either a concrete value or a symbolic UOp expression.
@@ -355,6 +394,11 @@ impl std::ops::Sub for &SInt {
             _ if self == rhs => SInt::Const(0),
             _ => {
                 let (a, b) = self.arithmetic_pair(rhs);
+                // A provably negative extent is the same caller bug as in the concrete arm.
+                if let Some(diff) = affine_difference(&a, &b) {
+                    assert!(diff >= 0, "SInt subtraction underflow: {self} - {rhs} = {diff}");
+                    return SInt::Const(diff as usize);
+                }
                 SInt::Symbolic(a.try_sub(&b).unwrap())
             }
         }

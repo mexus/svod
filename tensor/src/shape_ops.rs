@@ -860,15 +860,10 @@ impl Tensor {
         let start: SInt = start.into();
         let len: SInt = len.into();
         let shape = self.shape()?;
-        if start.as_const() == Some(0) && len == shape[dim] {
-            return Ok(self.clone());
-        }
-        // `(offset, size)` rather than `(begin, end)`: a symbolic `start` must
-        // not turn the narrowed axis symbolic (see `UOp::shrink_sized`).
-        let sized: Vec<(SInt, SInt)> = (0..ndim)
-            .map(|d| if d == dim { (start.clone(), len.clone()) } else { (SInt::Const(0), shape[d].clone()) })
+        let ranges: Vec<(SInt, SInt)> = (0..ndim)
+            .map(|d| if d == dim { (start.clone(), &start + &len) } else { (SInt::Const(0), shape[d].clone()) })
             .collect();
-        self.uop().shrink_sized(&sized).map(Self::new).context(UOpSnafu).map_err(Into::into)
+        self.uop().try_shrink(&ranges).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Center-crop or center-pad each specified axis to the target size.

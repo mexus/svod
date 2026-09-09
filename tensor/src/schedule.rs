@@ -486,13 +486,17 @@ fn collect_linear_sched_ops_internal(
     Ok(linear_ops)
 }
 
-/// Eagerly unroll the schedule control stream into a flat list of kernel
-/// invocations.
+/// Unroll the schedule control stream into a flat list of kernel invocations.
 ///
-/// Every outer loop iteration produces one invocation per kernel inside it,
-/// with concrete `fixedvars` derived from the loop counters at that point.
-/// Outer ranges must have concrete `vmin`/`vmax` (validated by
-/// `schedule_range_bounds`) — there is no symbolic-iteration support today.
+/// Loop membership is structural, not positional: a kernel belongs to the loop
+/// whose RANGE its CALL binds, and is replayed once per trip with the counter
+/// in `fixedvars`. Every other kernel runs once — where the topological order
+/// put it, unless it reads a loop's output, in which case it waits for that
+/// loop's END. A kernel that binds a range outside the range's RANGE…END span,
+/// or that a loop body depends on while reading the loop's own output, is a
+/// construction error. Outer ranges must have concrete `vmin`/`vmax`
+/// (validated by `schedule_range_bounds`) — there is no symbolic-iteration
+/// support today.
 fn collect_kernel_invocations(
     root: &Arc<UOp>,
     items: &[PreScheduleItem],
@@ -500,131 +504,116 @@ fn collect_kernel_invocations(
 ) -> Result<Vec<KernelInvocation>> {
     let callable_ids: HashSet<u64> = items.iter().map(|it| it.kernel.id).collect();
     let linear_ops = collect_linear_sched_ops_internal(root, &callable_ids, scheduled_range_ids)?;
+    let by_kernel: HashMap<u64, &PreScheduleItem> = items.iter().map(|it| (it.kernel.id, it)).collect();
+    let construction = |details: String| -> Error { ErrorKind::IrConstruction { details }.into() };
 
-    let bound_ranges_by_kernel: HashMap<u64, &[BoundRangeRef]> =
-        items.iter().map(|it| (it.kernel.id, it.bound_ranges.as_slice())).collect();
+    let mut invocations = Vec::new();
+    // Transitive callable ancestry, built in linear (topological) order.
+    let mut ancestors: HashMap<u64, HashSet<u64>> = HashMap::new();
+    let mut open: Vec<u64> = Vec::new();
+    let mut members: HashMap<u64, Vec<u64>> = HashMap::new();
+    // Kernels reading a loop's output, with the open loops they wait for.
+    let mut deferred: Vec<(u64, HashSet<u64>)> = Vec::new();
 
-    // Pre-validation: every declared Range must have a matching End, and every
-    // bound_range on every kernel must reference a declared Range.
-    let mut declared_ranges: HashSet<u64> = HashSet::new();
-    let mut ended_ranges: HashSet<u64> = HashSet::new();
     for op in &linear_ops {
         match op {
             LinearSchedOp::Range { range } => {
-                declared_ranges.insert(range.id);
-            }
-            LinearSchedOp::End { range, .. } => {
-                ended_ranges.insert(range.id);
-            }
-            LinearSchedOp::Call { .. } => {}
-        }
-    }
-    for &rid in &declared_ranges {
-        if !ended_ranges.contains(&rid) {
-            return IrConstructionSnafu { details: format!("schedule range {rid} is missing END in strict scheduler") }
-                .fail()
-                .map_err(Into::into);
-        }
-    }
-    for item in items {
-        for br in &item.bound_ranges {
-            if !declared_ranges.contains(&br.range_uop.id) {
-                return IrConstructionSnafu {
-                    details: format!(
-                        "CALL {} bound variable '{}' references schedule range {} missing from linear schedule",
-                        item.kernel.id, br.var_name, br.range_uop.id
-                    ),
+                schedule_range_bounds(range)?;
+                if open.contains(&range.id) {
+                    return Err(construction(format!("schedule range {} is declared twice", range.id)));
                 }
-                .fail()
-                .map_err(Into::into);
-            }
-        }
-    }
-
-    // Bytecode interpreter (range/end drives a counter, call emits an
-    // invocation). The output is the eagerly-unrolled invocation list.
-    let mut invocations = Vec::new();
-    let mut in_ranges: HashMap<u64, i64> = HashMap::new();
-    let mut range_ptrs: HashMap<u64, usize> = HashMap::new();
-    let mut range_bounds: HashMap<u64, (i64, i64)> = HashMap::new();
-
-    let mut sched_ptr = 0usize;
-    while sched_ptr < linear_ops.len() {
-        match &linear_ops[sched_ptr] {
-            LinearSchedOp::Range { range } => {
-                let bounds = if let Some(bounds) = range_bounds.get(&range.id).copied() {
-                    bounds
-                } else {
-                    let bounds = schedule_range_bounds(range)?;
-                    range_bounds.insert(range.id, bounds);
-                    bounds
-                };
-                in_ranges.insert(range.id, bounds.0);
-                range_ptrs.insert(range.id, sched_ptr + 1);
-            }
-            LinearSchedOp::End { range, kernel_id } => {
-                if !bound_ranges_by_kernel.contains_key(kernel_id) {
-                    return IrConstructionSnafu {
-                        details: format!("linear END references unknown CALL id {kernel_id}"),
-                    }
-                    .fail()
-                    .map_err(Into::into);
-                }
-                let (_, vmax) = if let Some(bounds) = range_bounds.get(&range.id).copied() {
-                    bounds
-                } else {
-                    let bounds = schedule_range_bounds(range)?;
-                    range_bounds.insert(range.id, bounds);
-                    bounds
-                };
-                let Some(cur) = in_ranges.get_mut(&range.id) else {
-                    return IrConstructionSnafu {
-                        details: format!("END references schedule range {} that is not active", range.id),
-                    }
-                    .fail()
-                    .map_err(Into::into);
-                };
-                if *cur < vmax {
-                    *cur += 1;
-                    let Some(jump_ptr) = range_ptrs.get(&range.id).copied() else {
-                        return IrConstructionSnafu {
-                            details: format!("missing loop jump pointer for schedule range {}", range.id),
-                        }
-                        .fail()
-                        .map_err(Into::into);
-                    };
-                    sched_ptr = jump_ptr;
-                    continue;
-                }
+                open.push(range.id);
             }
             LinearSchedOp::Call { kernel_id } => {
-                let Some(bound_ranges) = bound_ranges_by_kernel.get(kernel_id) else {
-                    return IrConstructionSnafu {
-                        details: format!("linear CALL references unknown kernel id {kernel_id}"),
-                    }
-                    .fail()
-                    .map_err(Into::into);
-                };
-                let mut fixedvars = HashMap::new();
-                for br in *bound_ranges {
-                    let Some(value) = in_ranges.get(&br.range_uop.id).copied() else {
-                        return IrConstructionSnafu {
-                            details: format!(
-                                "CALL {} bound variable '{}' references inactive schedule range {}",
-                                kernel_id, br.var_name, br.range_uop.id
-                            ),
-                        }
-                        .fail()
-                        .map_err(Into::into);
-                    };
-                    fixedvars.insert(br.var_name.clone(), value);
+                let item = by_kernel
+                    .get(kernel_id)
+                    .ok_or_else(|| construction(format!("linear CALL references unknown kernel id {kernel_id}")))?;
+                let mut reach: HashSet<u64> = item.dependencies.iter().copied().collect();
+                for dep in &item.dependencies {
+                    reach.extend(ancestors.get(dep).into_iter().flatten().copied());
                 }
-                invocations.push(KernelInvocation { kernel_id: *kernel_id, fixedvars });
+                match item.bound_ranges.as_slice() {
+                    [] => {
+                        let waits: HashSet<u64> = open
+                            .iter()
+                            .copied()
+                            .filter(|range| members.get(range).is_some_and(|m| m.iter().any(|k| reach.contains(k))))
+                            .collect();
+                        if waits.is_empty() {
+                            invocations.push(KernelInvocation { kernel_id: *kernel_id, fixedvars: HashMap::new() });
+                        } else {
+                            deferred.push((*kernel_id, waits));
+                        }
+                    }
+                    [bound] => {
+                        if !open.contains(&bound.range_uop.id) {
+                            return Err(construction(format!(
+                                "CALL {} binds variable '{}' to schedule range {} outside the range's RANGE…END span",
+                                kernel_id, bound.var_name, bound.range_uop.id
+                            )));
+                        }
+                        members.entry(bound.range_uop.id).or_default().push(*kernel_id);
+                    }
+                    _ => {
+                        return Err(construction(format!(
+                            "CALL {kernel_id} binds {} schedule ranges; nested schedule loops are not supported",
+                            item.bound_ranges.len()
+                        )));
+                    }
+                }
+                ancestors.insert(*kernel_id, reach);
+            }
+            LinearSchedOp::End { range, kernel_id } => {
+                if !by_kernel.contains_key(kernel_id) {
+                    return Err(construction(format!("linear END references unknown CALL id {kernel_id}")));
+                }
+                let Some(position) = open.iter().position(|id| *id == range.id) else {
+                    return Err(construction(format!("END references schedule range {} that is not active", range.id)));
+                };
+                let body = members.remove(&range.id).unwrap_or_default();
+                for member in &body {
+                    let reach = &ancestors[member];
+                    if let Some((blocker, _)) = deferred.iter().find(|(k, _)| reach.contains(k)) {
+                        return Err(construction(format!(
+                            "kernel {member} in schedule loop {} depends on kernel {blocker}, which reads the loop's output",
+                            range.id
+                        )));
+                    }
+                    let interleaved = open
+                        .iter()
+                        .filter(|other| **other != range.id)
+                        .any(|other| members.get(other).is_some_and(|m| m.iter().any(|k| reach.contains(k))));
+                    if interleaved {
+                        return Err(construction(format!(
+                            "kernel {member} in schedule loop {} depends on the body of a loop that is still open",
+                            range.id
+                        )));
+                    }
+                }
+                let (vmin, vmax) = schedule_range_bounds(range)?;
+                for trip in vmin..=vmax {
+                    for member in &body {
+                        let bound = &by_kernel[member].bound_ranges[0];
+                        let fixedvars = HashMap::from([(bound.var_name.clone(), trip)]);
+                        invocations.push(KernelInvocation { kernel_id: *member, fixedvars });
+                    }
+                }
+                open.remove(position);
+                deferred.retain_mut(|(kernel_id, waits)| {
+                    waits.remove(&range.id);
+                    if !waits.is_empty() {
+                        return true;
+                    }
+                    invocations.push(KernelInvocation { kernel_id: *kernel_id, fixedvars: HashMap::new() });
+                    false
+                });
             }
         }
-        sched_ptr += 1;
     }
 
+    if let Some(range) = open.first() {
+        return Err(construction(format!("schedule range {range} is missing END in strict scheduler")));
+    }
     Ok(invocations)
 }
 
@@ -730,10 +719,10 @@ pub struct BoundRangeRef {
 
 /// Linearized scheduling control op (internal to schedule construction).
 ///
-/// The strict scheduler walks these as a small bytecode (Range/End drive a
-/// loop counter, Call emits an invocation) — see `collect_kernel_invocations`.
-/// Eager unrolling at pre-schedule time turns them into a flat
-/// `Vec<KernelInvocation>`.
+/// The strict scheduler walks these as a small bytecode (Range opens a loop,
+/// Call joins it or runs once, End replays the members per trip) — see
+/// `collect_kernel_invocations`. Eager unrolling at pre-schedule time turns
+/// them into a flat `Vec<KernelInvocation>`.
 #[derive(Clone, Debug)]
 enum LinearSchedOp {
     Range { range: Arc<UOp> },
@@ -1165,6 +1154,18 @@ pub fn instantiate_schedule(
         }
     }
 
+    // A kernel's loop, as `(range id, counter name)`: the counter's value in an
+    // invocation's `fixedvars` is the trip it belongs to.
+    let loop_of_kernel: HashMap<u64, (u64, &str)> = pre_schedule
+        .items
+        .iter()
+        .filter_map(|item| match item.bound_ranges.as_slice() {
+            [bound] => Some((item.kernel.id, (bound.range_uop.id, bound.var_name.as_str()))),
+            _ => None,
+        })
+        .collect();
+    let mut trip_instances: HashMap<(u64, i64), Vec<usize>> = HashMap::new();
+
     let mut schedule = Vec::with_capacity(pre_schedule.invocations.len());
     let mut expanded_instances_by_kernel: HashMap<u64, Vec<usize>> = HashMap::new();
     for invocation in &pre_schedule.invocations {
@@ -1190,17 +1191,19 @@ pub fn instantiate_schedule(
                 instance_dependencies.extend(instances.iter().copied());
             }
         }
-        // A schedule loop is a recurrence: iteration `t` reads what iteration
-        // `t - 1` wrote, at a symbolic offset into the same buffer, so the
-        // callable-id dependency graph cannot see the edge (all iterations
-        // share one kernel id, and self-edges are suppressed). Chaining every
-        // loop-body item to the item before it pins the linear bytecode order
-        // through levelling, which would otherwise hoist a dependency-free
-        // body kernel's iterations into one level and run them back to back.
-        if !invocation.fixedvars.is_empty()
-            && let Some(previous) = schedule.len().checked_sub(1)
+        // A schedule loop is a recurrence: trip `t` reads what trip `t - 1`
+        // wrote, at a symbolic offset into the same buffer, so the callable-id
+        // dependency graph cannot see the edge (all trips share one kernel id,
+        // and self-edges are suppressed). Every item of a trip depends on every
+        // item of the previous trip, which levelling would otherwise hoist a
+        // dependency-free body kernel's trips into one wave.
+        let trip = loop_of_kernel
+            .get(&invocation.kernel_id)
+            .and_then(|(range, var)| Some((*range, *invocation.fixedvars.get(*var)?)));
+        if let Some((range, trip)) = trip
+            && let Some(previous) = trip_instances.get(&(range, trip - 1))
         {
-            instance_dependencies.insert(previous);
+            instance_dependencies.extend(previous.iter().copied());
         }
         let mut instance_dependencies: Vec<usize> = instance_dependencies.into_iter().collect();
         instance_dependencies.sort_unstable();
@@ -1231,6 +1234,9 @@ pub fn instantiate_schedule(
                 .entry(invocation.kernel_id)
                 .or_default()
                 .extend(first_schedule_index..schedule.len());
+        }
+        if let Some(slot) = trip {
+            trip_instances.entry(slot).or_default().extend(first_schedule_index..schedule.len());
         }
     }
 

@@ -672,7 +672,7 @@ fn schedule_result_from_sink_with_cache(
                 svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
             let (kernel_graph, _) =
                 svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
-            let kernel_graph = crate::scan::wrap_scan_loops(kernel_graph);
+            let kernel_graph = wrap_scan_loops_verified(kernel_graph)?;
             let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
             let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { pre_schedule: Arc::new(pre_schedule) });
             let guard = cache.guard();
@@ -702,7 +702,7 @@ fn schedule_result_from_sink_uncached(
     merge_var_vals_checked(&mut var_vals, &normalization.var_vals, "uncached schedule normalization")?;
     let rangeify_result = svod_schedule::rangeify_with_map(normalization.normalized.clone()).context(RangeifySnafu)?;
     let (kernel_graph, _) = svod_schedule::try_get_kernel_graph(rangeify_result.sink).context(KernelGraphSnafu)?;
-    let kernel_graph = crate::scan::wrap_scan_loops(kernel_graph);
+    let kernel_graph = wrap_scan_loops_verified(kernel_graph)?;
     let pre_schedule = crate::schedule::create_pre_schedule(kernel_graph)?;
     let restored_pre_schedule = restore_post_schedule_pre_schedule(&pre_schedule, &normalization);
     let input_buffers = build_schedule_input_buffers(&restored_pre_schedule);
@@ -715,12 +715,27 @@ fn schedule_result_from_sink_uncached(
     Ok(result)
 }
 
+/// Install the schedule-level scan loops and re-check the kernel-graph spec on
+/// the result: `try_get_kernel_graph` verified the graph before the loops
+/// existed, so the loop grammar (RANGE, BIND, END over CALL) is only exercised
+/// here.
+pub(crate) fn wrap_scan_loops_verified(kernel_graph: Arc<UOp>) -> Result<Arc<UOp>> {
+    let wrapped = crate::scan::wrap_scan_loops(kernel_graph.clone())?;
+    if !Arc::ptr_eq(&wrapped, &kernel_graph) && svod_schedule::spec::spec_enabled() {
+        svod_schedule::spec::verify_kernel_graph(&wrapped)
+            .map_err(|source| svod_schedule::KernelGraphError::Spec { source })
+            .context(KernelGraphSnafu)?;
+    }
+    Ok(wrapped)
+}
+
 /// Pre-schedule cache normalization result.
 ///
 /// - BUFFER -> PARAM
 /// - buffer identities normalized recursively through view metadata
 /// - strip runtime value from BIND(DEFINE_VAR, CONST)
 /// - normalize standalone UNIQUE identity -> LUNIQUE
+/// - renumber scan counters in graph order
 pub(crate) struct ScheduleCacheNormalization {
     pub normalized: Arc<UOp>,
     pub param_values: Vec<Arc<UOp>>,
@@ -836,6 +851,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
         RewriteResult::Rewritten(UOp::lunique(Some(slot)))
     });
     let normalized = graph_rewrite_preserve_calls(&unique_matcher, normalized, &mut unique_ctx);
+    let normalized = crate::scan::canonical_scan_names(&normalized);
 
     ctx.param_buffers.sort_unstable_by_key(|(id, _)| *id);
     ctx.param_buffers.dedup_by_key(|(id, _)| *id);
@@ -1413,12 +1429,11 @@ fn prepare_execution_plan(
         &schedule_result.output_uop_ids,
         schedule_result.alias_output_buffers.values(),
     );
-    // Reuse is keyed by execution LEVEL (computed from callable deps, matching
-    // the runtime's per-op leveling), so storage is only shared across the
-    // per-level barrier — no ordering edges are injected. This is why the
-    // planner never touches `instance_dependencies` (asserted below): the only
-    // former writer of it (reuse deps) is gone, which also makes the
-    // schedule-index ↔ op-index mapping a non-issue.
+    // Reuse is keyed by execution LEVEL (computed from callable deps plus the
+    // positional `instance_dependencies` a schedule loop chains between trips,
+    // matching the runtime's per-op leveling), so storage is only shared
+    // across the per-level barrier — the planner injects no ordering edges of
+    // its own.
     let item_levels = crate::memory_planner::compute_item_levels(&schedule_items)?;
     let planner_result =
         crate::memory_planner::memory_planner(&schedule_items, &item_levels, &output_buffer_ids, planner_mode);

@@ -6,7 +6,7 @@ use test_case::test_case;
 
 use crate::nn::{CoordinateTransformMode, ResizeMode};
 use crate::test::helpers::{RealizeTestExt, assert_close_f32, test_setup};
-use crate::{Tensor, Variable};
+use crate::{ErrorKind, Tensor, Variable};
 
 // =========================================================================
 // Helpers
@@ -111,6 +111,18 @@ fn test_narrow_with_a_symbolic_start_keeps_a_constant_extent() {
         .iter()
         .any(|n| matches!(n.op(), svod_ir::Op::Param(p) if p.arg.name.as_deref() == Some("t")));
     assert!(uses_t, "narrow lost the symbolic offset");
+}
+
+#[test_case(3, 10; "past_the_end")]
+#[test_case(10, 1; "start_out_of_range")]
+#[test_case(5, 1; "start_at_the_end")]
+fn test_narrow_out_of_bounds_is_an_error(start: usize, len: usize) {
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    let err = x.narrow(0, start, len).unwrap_err();
+    assert!(
+        matches!(err.kind(), ErrorKind::UOp { source: svod_ir::Error::ShrinkBoundsViolation { dim: 0, .. } }),
+        "unexpected error: {err}"
+    );
 }
 
 #[test_case(false; "concrete")]
