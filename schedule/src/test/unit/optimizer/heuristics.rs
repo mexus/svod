@@ -7,7 +7,7 @@ use test_case::test_case;
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{
     apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_local_dims, apply_matvec_fast_path,
-    apply_threading, try_tensor_cores,
+    apply_threading, try_grouped_reduction, try_tensor_cores, try_warp_row_reduction,
 };
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
 use crate::test::helpers::{create_conv_like_pattern, create_matmul_pattern_with, create_typed_matmul_pattern};
@@ -304,6 +304,162 @@ fn create_elementwise_pattern(shape: &[i64], axis_type: AxisType) -> Arc<UOp> {
     UOp::sink(std::iter::once(doubled).chain(ranges).collect())
 }
 
+/// `out[row] = sum_c x[row * row_stride + c * reduce_stride]`, so the layout a
+/// reduce axis is walked with is a parameter rather than a shape.
+fn create_laid_out_reduce(rows: i64, cols: i64, row_stride: i64, reduce_stride: i64, dtype: DType) -> Arc<UOp> {
+    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
+    let reduce = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Reduce);
+    let term = |rng: &Arc<UOp>, stride: i64| rng.try_mul(&UOp::index_const(stride)).expect("index mul");
+    let idx = term(&row, row_stride).try_add(&term(&reduce, reduce_stride)).expect("index add");
+
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, dtype);
+    let value = UOp::index().buffer(buffer).indices(vec![idx]).call().expect("index should build");
+    let sum = value.reduce(vec![reduce].into(), ReduceOp::Add);
+    UOp::sink(vec![sum, row])
+}
+
+/// A row reduce with many rows gets a wave split off its reduce axis, so one
+/// wave walks one row together, plus the unroll that widens each lane's burst.
+/// The gate is the layout, not the shape: an axis a buffer strides over, or
+/// one too short to leave a serial loop, stays a per-thread loop, and few
+/// enough rows still take the shared-block path (GROUPTOP 16).
+#[test_case(8192, 768, 768, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "many rows split a warp off the contiguous reduce")]
+#[test_case(8192, 3072, 3072, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a longer row keeps the same split")]
+#[test_case(131072, 1024, 1024, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a softmax row reduce splits too")]
+#[test_case(8192, 32, 32, 1, &[]; "a reduce shorter than one wave stays serial")]
+#[test_case(8192, 768, 1, 8192, &[]; "a strided reduce axis is left alone")]
+#[test_case(1024, 768, 768, 1, &[Opt::grouptop(0, 16)]; "few rows keep the shared-block path")]
+fn row_reduces_split_a_wave_off_a_contiguous_reduce(
+    rows: i64,
+    cols: i64,
+    row_stride: i64,
+    reduce_stride: i64,
+    expected: &[Opt],
+) {
+    let sink = create_laid_out_reduce(rows, cols, row_stride, reduce_stride, DType::Float16);
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+    let config = HeuristicsConfig::builder().build();
+
+    let grouped = try_grouped_reduction(&mut scheduler, &config);
+    assert_eq!(grouped || try_warp_row_reduction(&mut scheduler, &config), !expected.is_empty());
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// A CDNA wave is 64 lanes wide, so the split follows the renderer rather than
+/// a hard-coded 32.
+#[test]
+fn the_wave_split_follows_the_renderer_wave_width() {
+    let sink = create_laid_out_reduce(8192, 768, 768, 1, DType::Float16);
+    let mut scheduler = Scheduler::new(sink, Renderer::amd_cdna3());
+
+    assert!(try_warp_row_reduction(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert_eq!(scheduler.applied_opts, vec![Opt::group(0, 64), Opt::unroll(1, 4)]);
+}
+
+/// `out[r, c] = x[r, c] * s[r]`: a row-major elementwise kernel over `dtype`
+/// with a per-row broadcast operand, the shape of a layer-norm epilogue. The
+/// broadcast operand is what lets the upcast heuristic see a stride-0 buffer.
+fn create_row_scaled_pattern(rows: i64, cols: i64, dtype: DType) -> Arc<UOp> {
+    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
+    let col = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Global);
+    let idx = row.try_mul(&UOp::index_const(cols)).and_then(|r| r.try_add(&col)).expect("index should build");
+
+    let wide = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, dtype);
+    let value = UOp::index().buffer(wide).indices(vec![idx]).call().expect("index should build");
+    let rowwise = UOp::new_buffer(DeviceSpec::Cpu, rows as usize, DType::Float32);
+    let scale = UOp::index().buffer(rowwise).indices(vec![row.clone()]).call().expect("index should build");
+
+    let scaled = value.cast(DType::Float32).try_mul(&scale).expect("mul should succeed");
+    UOp::sink(vec![scaled, row, col])
+}
+
+/// An elementwise kernel vectorizes along the axis its buffers walk
+/// contiguously and hands that axis `lidx0`. The LOCAL *sizes* are the ones
+/// this heuristic always picked; what changed is which one is applied first,
+/// and therefore which becomes the fastest thread index — here the contiguous
+/// column axis rather than the row axis. The upcast width follows the element
+/// size: four halves and four floats are both a machine vector, three of
+/// either is not, and four doubles are too wide.
+#[test_case(DType::Float16, &[Opt::upcast(1, 4), Opt::local(1, 16), Opt::local(0, 8)]; "four halves vectorize")]
+#[test_case(DType::Float32, &[Opt::upcast(1, 4), Opt::local(1, 16), Opt::local(0, 8)]; "four floats vectorize")]
+#[test_case(DType::Float64, &[Opt::upcast(1, 3), Opt::local(1, 16), Opt::local(0, 8)]; "four doubles keep the ascending width order")]
+fn elementwise_kernels_vectorize_and_lane_along_the_contiguous_axis(dtype: DType, expected: &[Opt]) {
+    let mut scheduler = Scheduler::new(create_row_scaled_pattern(8192, 768, dtype), Renderer::cuda());
+    let config = HeuristicsConfig::builder().build();
+
+    assert!(apply_heuristic_upcasts(&mut scheduler));
+    assert!(apply_local_dims(&mut scheduler, &config));
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// `out[c, r] = x[r, c]`: a transposing copy, contiguous on one side of every
+/// axis and strided on the other.
+fn create_transpose_pattern(rows: i64, cols: i64) -> Arc<UOp> {
+    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
+    let col = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Global);
+    let at = |a: &Arc<UOp>, stride: i64, b: &Arc<UOp>| {
+        a.try_mul(&UOp::index_const(stride)).and_then(|a| a.try_add(b)).expect("index should build")
+    };
+    let load = |idx: Arc<UOp>| {
+        let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, DType::Float16);
+        UOp::index().buffer(buffer).indices(vec![idx]).call().expect("index should build")
+    };
+    let value = load(at(&row, cols, &col)).try_add(&load(at(&col, rows, &row))).expect("add should succeed");
+    UOp::sink(vec![value, row, col])
+}
+
+/// No axis of a transposing copy stays inside a sector in every buffer, so
+/// there is no lane axis to promote and the mapping is left as it was.
+#[test]
+fn a_transposing_copy_keeps_the_previous_local_order() {
+    let mut scheduler = Scheduler::new(create_transpose_pattern(8192, 768), Renderer::cuda());
+
+    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 8), Opt::local(1, 16)]);
+}
+
+/// `out[r, c] = sum_k x[(r * cols + c) * taps + k]`: a stencil whose column
+/// axis would qualify as the lane axis on its stride alone.
+fn create_stencil_reduce(rows: i64, cols: i64, taps: i64) -> Arc<UOp> {
+    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
+    let col = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Global);
+    let tap = UOp::range_axis(UOp::index_const(taps), AxisId::Renumbered(2), AxisType::Reduce);
+    let idx = row
+        .try_mul(&UOp::index_const(cols * taps))
+        .and_then(|r| r.try_add(&col.try_mul(&UOp::index_const(taps))?))
+        .and_then(|r| r.try_add(&tap))
+        .expect("index should build");
+
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols * taps) as usize, DType::Float16);
+    let value = UOp::index().buffer(buffer).indices(vec![idx]).call().expect("index should build");
+    let sum = value.reduce(vec![tap].into(), ReduceOp::Add);
+    UOp::sink(vec![sum, row, col])
+}
+
+/// Where a reduce loop sits inside the block, the block shape decides more than
+/// the thread mapping — a stencil's halo and the loop's own reuse ride on it
+/// too — and promoting the lane axis measured worse on GigaAM's convolution.
+/// Such a kernel keeps the order it had, even though its column axis spans only
+/// one sector.
+#[test]
+fn a_reducing_kernel_keeps_the_previous_local_order() {
+    let mut scheduler = Scheduler::new(create_stencil_reduce(8192, 768, 5), Renderer::cuda());
+
+    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
+    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 8), Opt::local(1, 16)]);
+}
+
+/// The vector-width preference is for lane-parallel backends only: a CPU
+/// kernel keeps the ascending amount order, so CPU code generation is
+/// untouched.
+#[test]
+fn the_vector_width_preference_is_gpu_only() {
+    let mut scheduler = Scheduler::new(create_row_scaled_pattern(8192, 768, DType::Float16), Renderer::cpu());
+
+    assert!(apply_heuristic_upcasts(&mut scheduler));
+    assert_eq!(scheduler.applied_opts, vec![Opt::upcast(1, 3)]);
+}
+
 /// A global axis none of the standard LOCAL sizes divides gets the largest
 /// divisor within the budget when that fills the warps better, and is
 /// padded to a real block size otherwise; divisible axes are unchanged.
@@ -336,14 +492,17 @@ fn local_fallback_scores_lanes_per_wave(renderer: Renderer, expected: &[Opt]) {
 
 /// The decoder logits shape `[2, 51865]`: the vocabulary axis is padded and
 /// localized, and the row axis still folds into the same block.
+///
+/// The vocabulary axis is the one the buffer walks contiguously, so it leads
+/// and lands on `lidx0` — a warp then reads 32 adjacent logits. The row axis
+/// costs a whole vocabulary row per lane and follows.
 #[test]
 fn local_dims_pad_the_vocabulary_axis_beside_the_row_local() {
     let mut scheduler = Scheduler::new(create_elementwise_pattern(&[2, 51865], AxisType::Global), Renderer::cuda());
 
     assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
-    // LOCAL 2 consumes axis 0 entirely, so the vocabulary axis becomes axis 0.
-    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 2), Opt::padto(0, 32), Opt::local(0, 32)]);
-    assert_eq!(scheduler.full_shape(), vec![1621, 2, 32]);
+    assert_eq!(scheduler.applied_opts, vec![Opt::padto(1, 32), Opt::local(1, 32), Opt::local(0, 2)]);
+    assert_eq!(scheduler.full_shape(), vec![1621, 32, 2]);
 }
 
 /// The matvec fast path pads a row axis the row tile does not divide when
