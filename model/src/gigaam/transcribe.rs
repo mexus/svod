@@ -295,8 +295,9 @@ impl GigaAmTranscriber {
                 // Decode lanes are independent of the encoder batch: wider
                 // waves amortize the per-step launch floor over more chunks
                 // (steps per wave = max frames in the wave, not the sum).
-                // State per lane is tiny; 32 lanes ≈ a chunked long file.
-                const DECODE_LANES: usize = 32;
+                // State per lane is tiny; 64 lanes cost 1.3x a 32-lane block
+                // for 2x the chunks (RTX 3060), halving the wave count.
+                const DECODE_LANES: usize = 64;
                 let subs_kernel = match model.config.subsampling_mode {
                     SubsamplingMode::Conv1d => model.config.subs_kernel_size,
                     SubsamplingMode::Conv2d => 3,

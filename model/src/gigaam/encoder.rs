@@ -20,14 +20,16 @@ const BN_EPS: f64 = 1e-5;
 /// RoPE cos/sin cache, `[max_encoder_frames, 1, 1, d_k/2]`. Upstream GigaAM
 /// passes `pos_emb_max_len` as both cache length and RoPE base, and rotates a
 /// position-major `[T, B, H, d_k]` tensor — hence the permute off
-/// [`Tensor::rope_table`]'s `[1, 1, L, d_k/2]`.
-fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
+/// [`Tensor::rope_table`]'s `[1, 1, L, d_k/2]`. Realized here, once: left
+/// lazy, every layer's RoPE kernel recomputes the pow/sin/cos of its slice.
+fn build_rope_cache(config: &GigaAmConfig) -> svod_tensor::error::Result<(Tensor, Tensor)> {
     let d_k = config.d_model / config.n_heads;
     let (cos, sin) =
-        Tensor::rope_table(config.max_encoder_frames as f64, config.max_encoder_frames, d_k, DType::Float32)
-            .expect("validated config: even head dim, non-empty cache");
-    let position_major = |t: Tensor| t.try_permute(&[2, 0, 1, 3]).expect("4-D rope table");
-    (position_major(cos), position_major(sin))
+        Tensor::rope_table(config.max_encoder_frames as f64, config.max_encoder_frames, d_k, DType::Float32)?;
+    let position_major = |t: Tensor| t.try_permute(&[2, 0, 1, 3]).expect("4-D rope table").contiguous();
+    let (cos, sin) = (position_major(cos), position_major(sin));
+    Tensor::realize_batch([&cos, &sin])?;
+    Ok((cos, sin))
 }
 
 type Result<T> = super::Result<T>;
@@ -320,7 +322,9 @@ impl ConvModule {
 
         let y = match &self.conv_norm {
             ConvNorm::LayerNorm(ln) => {
-                let y = y.try_transpose(-1, -2)?;
+                // Materialized in the activation dtype: otherwise the norm's f32
+                // cast fuses into the depthwise conv, which then stores f32.
+                let y = y.try_transpose(-1, -2)?.contiguous();
                 let y = scoped("conv_norm", || ln.forward(&y))?;
                 y.try_transpose(-1, -2)?
             }
@@ -581,9 +585,10 @@ impl ConformerLayer {
         let conv = scoped("conv", || self.conv.forward(&x, pad_valid))?;
         let x = x.try_add(&conv)?;
 
-        // FFN2 half-step
+        // FFN2 half-step. Materialized in the activation dtype: otherwise the
+        // final norm's f32 cast fuses into the FFN2 GEMM, which then stores f32.
         let ffn2 = scoped("ffn2", || self.ffn2.forward(&x))?;
-        let x = x.try_add(&ffn2.try_mul(0.5)?)?;
+        let x = x.try_add(&ffn2.try_mul(0.5)?)?.contiguous();
 
         // Final layer norm
         Ok(scoped("final_norm", || self.final_norm.forward(&x))?)
@@ -611,7 +616,8 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn with_random_weights(config: &GigaAmConfig) -> Self {
-        let (cos_cache, sin_cache) = build_rope_cache(config);
+        let (cos_cache, sin_cache) =
+            build_rope_cache(config).expect("validated config: even head dim, non-empty cache");
         let subsampling = StridingSubsampling::empty(config);
         let layers = (0..config.n_layers).map(|_| ConformerLayer::empty(config)).collect();
         Self {
@@ -717,7 +723,7 @@ impl Encoder {
     /// Construct an `Encoder` from an already-remapped state dict + config.
     /// Called from the unified [`crate::gigaam::GigaAm::from_state_dict`] loader.
     pub(crate) fn from_state_dict(sd: &StateDict, config: &GigaAmConfig) -> Result<Self> {
-        let (cos_cache, sin_cache) = build_rope_cache(config);
+        let (cos_cache, sin_cache) = build_rope_cache(config)?;
 
         let mut subsampling = StridingSubsampling::empty(config);
         subsampling.load_state_dict(sd, "subsampling")?;

@@ -10,7 +10,8 @@ use crate::jit::{BuildSnafu, InputSpec, JitError};
 
 use super::block::BLOCK_STEPS;
 use super::jit::{RnntBlockJit, RnntEncProjJit};
-use crate::gigaam::model::GigaAm;
+use super::joint::CLASS_ALIGN;
+use crate::gigaam::model::{GigaAm, Head};
 
 pub struct RnntBlockBackend {
     jit: RnntBlockJit,
@@ -49,7 +50,12 @@ pub struct BlockStats {
 impl RnntBlockBackend {
     /// `max_t` is the encoder-frame capacity (`max_t_sub`); the `enc` input is
     /// `[lanes, max_t, d_model]` and stays device-local across the wave.
-    pub fn from_model(model: GigaAm, lanes: usize, max_t: usize) -> crate::jit::Result<Self> {
+    pub fn from_model(mut model: GigaAm, lanes: usize, max_t: usize) -> crate::jit::Result<Self> {
+        // The block plan is the only consumer of the padded logits width; the
+        // caller's model keeps the checkpoint shapes.
+        if let Head::Rnnt { head, .. } = &mut model.head {
+            head.joint.pad_classes(CLASS_ALIGN).boxed().context(BuildSnafu)?;
+        }
         let (head, _) = model.head.expect_rnnt("RnntBlockBackend").boxed().context(BuildSnafu)?;
         let (layers, p) = (head.pred_rnn_layers, head.pred_hidden);
         let joint_hidden = head.joint_hidden;
@@ -85,6 +91,13 @@ impl RnntBlockBackend {
             frames_tape: vec![0; lanes * BLOCK_STEPS],
             stats: BlockStats::default(),
         })
+    }
+
+    /// Entry points of the block plan's kernels in dispatch order (structural
+    /// test pins).
+    #[cfg(test)]
+    pub(crate) fn kernel_names(&self) -> crate::jit::Result<Vec<String>> {
+        Ok(self.jit.prepared_kernels()?.iter().map(|k| k.kernel.entry_point.clone()).collect())
     }
 
     /// Stage the wave's encoder rows + valid frame counts. `frames[i]` is the

@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use svod_ir::uop::{reaching, reaching_each};
 use svod_ir::{AxisId, AxisType, BinaryOp, Op, TernaryOp, UOp};
 
-use crate::optimizer::config::HeuristicsConfig;
+use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::tc::matmul_operands;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 use svod_ir::ops;
@@ -1043,7 +1043,7 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
 /// Tensor core optimization for matmul patterns.
 ///
-/// - Guard: skip when >1 reduce axis unless tc_opt >= 1
+/// - Guard: skip when >1 reduce axis under [`TcOpt::Strict`]
 /// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
 /// - Post-TC: UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
@@ -1057,9 +1057,11 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    // Guard: require exactly one reduce axis unless TC_OPT >= 1.
+    // Strict keeps tinygrad's TC_OPT=0 rule: one reduce axis only. The default
+    // Relaxed level lets `tc::apply` pick a divisible reduce axis and leave the
+    // rest as loops, which is what a conv's (channels, taps) reduce needs.
     let reduce_count = scheduler.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len();
-    if reduce_count != 1 && config.tc_opt.as_usize() < 1 {
+    if reduce_count != 1 && config.tc_opt == TcOpt::Strict {
         return false;
     }
 

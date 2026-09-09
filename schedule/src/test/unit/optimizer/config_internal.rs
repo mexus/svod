@@ -63,8 +63,9 @@ fn test_thread_budget_parsing(raw: Option<&str>, expected: Option<usize>) {
 fn test_heuristics_config_default_and_builder() {
     let config = HeuristicsConfig::default();
     assert_eq!(config.tc_enabled, TcUsage::Enabled);
-    // tinygrad `helpers.py:238`: TC_OPT defaults to 0 on the heuristic path.
-    assert_eq!(config.tc_opt, TcOpt::Strict);
+    // One above tinygrad's `helpers.py:238` TC_OPT=0: multi-reduce kernels
+    // (convolutions) get the tensor core by default, padding stays opt-in.
+    assert_eq!(config.tc_opt, TcOpt::Relaxed);
     assert!(config.matvec_enabled);
     assert_eq!((config.threads_per_row, config.rows_per_thread, config.grouped_threshold), (8, 4, 256));
 

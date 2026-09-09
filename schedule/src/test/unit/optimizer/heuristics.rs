@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use svod_dtype::{AddrSpace, DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, Op, ParamArg, ReduceOp, UOp};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp};
 use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
@@ -10,7 +10,7 @@ use crate::optimizer::heuristics::{
     apply_threading, try_tensor_cores,
 };
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
-use crate::test::helpers::{create_matmul_pattern_with, create_typed_matmul_pattern};
+use crate::test::helpers::{create_conv_like_pattern, create_matmul_pattern_with, create_typed_matmul_pattern};
 use svod_ir::ops;
 
 /// Matvec-shaped `sum_k A[k] * B[k]` over `stored` buffers; with `wide`, both
@@ -88,6 +88,61 @@ fn try_tensor_cores_accepts_fused_operands() {
 
     assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()));
     assert!(scheduler.ast().toposort().iter().any(|u| matches!(u.op(), Op::Wmma(..))));
+}
+
+/// `(axis type, constant extent)` of a RANGE.
+fn range_axis(range: &Arc<UOp>) -> Option<(AxisType, i64)> {
+    let Op::Range(ops::Range { end, axis_type, .. }) = range.op() else { return None };
+    match end.op() {
+        Op::Const(c) => match c.0 {
+            ConstValue::Int(extent) => Some((*axis_type, extent)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A conv-shaped reduce over (channels, taps) takes the tensor core by default:
+/// one divisible reduce axis becomes the WMMA K (highest axis id first, so the
+/// taps when both divide) and the other survives as a reduce loop around it.
+/// `Strict` keeps tinygrad's single-reduce-axis rule.
+#[test_case(64, 5, TcOpt::Relaxed, Some(5); "wide channels with five taps")]
+#[test_case(16, 25, TcOpt::Relaxed, Some(25); "narrow channels with many taps")]
+#[test_case(64, 16, TcOpt::Relaxed, Some(64); "both reduce axes divisible")]
+#[test_case(12, 5, TcOpt::Relaxed, None; "no reduce axis divisible")]
+#[test_case(64, 5, TcOpt::Strict, None; "strict declines the second reduce axis")]
+fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_opt: TcOpt, leftover: Option<i64>) {
+    let sink = create_conv_like_pattern(32, 32, channels, taps, DType::Float16);
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+
+    let uses_tc = leftover.is_some();
+    assert_eq!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().tc_opt(tc_opt).build()), uses_tc);
+    assert_eq!(scheduler.ast().toposort().iter().any(|u| matches!(u.op(), Op::Wmma(..))), uses_tc);
+    let Some(leftover) = leftover else { return };
+
+    let loops: Vec<_> =
+        scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == leftover).collect();
+    assert_eq!(
+        loops,
+        vec![(AxisType::Reduce, leftover)],
+        "the other reduce axis must survive as a loop around the WMMA"
+    );
+}
+
+/// The default level changes nothing for a single-reduce matmul: the same
+/// opts land on the same axes (the recorded TC arg carries the level itself).
+#[test]
+fn try_tensor_cores_default_matches_strict_on_plain_matmul() {
+    let plan = |tc_opt: TcOpt| {
+        let sink = create_typed_matmul_pattern(64, 64, 64, DType::Float16, None);
+        let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+        assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().tc_opt(tc_opt).build()));
+        let opts: Vec<_> = scheduler.applied_opts.iter().map(|opt| (opt.op, opt.axis)).collect();
+        let axes: Vec<_> = scheduler.rngs().iter().map(range_axis).collect();
+        (opts, axes)
+    };
+    assert_eq!(HeuristicsConfig::default().tc_opt, TcOpt::Relaxed);
+    assert_eq!(plan(TcOpt::default()), plan(TcOpt::Strict));
 }
 
 /// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless
