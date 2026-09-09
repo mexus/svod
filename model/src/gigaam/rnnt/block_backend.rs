@@ -8,13 +8,16 @@ use svod_arch::rnnt::{BatchBlockStep, BlockTapes};
 
 use crate::jit::{BuildSnafu, InputSpec, JitError};
 
-use super::block::BLOCK_STEPS;
+use super::block::{BLOCK_STEPS, DECODE_WINDOW};
 use super::jit::{RnntBlockJit, RnntEncProjJit};
 use super::joint::CLASS_ALIGN;
 use crate::gigaam::model::{GigaAm, Head};
 
-pub struct RnntBlockBackend {
-    jit: RnntBlockJit,
+/// `W` is the WIND decode window (`super::block::forward_block`): a pure
+/// performance knob, so the default is the tuned production value and tests
+/// instantiate the other windows to pin that they decode identically.
+pub struct RnntBlockBackend<const W: usize = DECODE_WINDOW> {
+    jit: RnntBlockJit<W>,
     /// Per-wave encoder projection `[B, T, E] -> [B, T, J]` — one MFMA matmul
     /// replaces the per-step row projection inside the block.
     proj: RnntEncProjJit,
@@ -47,7 +50,7 @@ pub struct BlockStats {
     pub t_read: std::time::Duration,
 }
 
-impl RnntBlockBackend {
+impl<const W: usize> RnntBlockBackend<W> {
     /// `max_t` is the encoder-frame capacity (`max_t_sub`); the `enc` input is
     /// `[lanes, max_t, d_model]` and stays device-local across the wave.
     pub fn from_model(mut model: GigaAm, lanes: usize, max_t: usize) -> crate::jit::Result<Self> {
@@ -126,7 +129,7 @@ impl RnntBlockBackend {
     }
 }
 
-impl BatchBlockStep for RnntBlockBackend {
+impl<const W: usize> BatchBlockStep for RnntBlockBackend<W> {
     type Error = JitError;
 
     fn batch(&self) -> usize {

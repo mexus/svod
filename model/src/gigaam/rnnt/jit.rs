@@ -7,7 +7,7 @@ use svod_macros::jit_wrapper;
 use crate::gigaam::model::GigaAm;
 
 jit_wrapper! {
-    RnntBlockJit(GigaAm) {
+    RnntBlockJit<const W: usize>(GigaAm) {
         inputs { enc: Tensor, valid: Tensor }
         // The five carried states recycle in the JIT's own input buffers:
         // `execute()` stores each block's final value where the next block's
@@ -17,9 +17,10 @@ jit_wrapper! {
 
         build(enc, valid, time, prev, symbols, h, c) {
             // WIND decode window. Byte-identical output for any W>=1 (a pure
-            // perf knob, optimum is GPU-dependent); 4 is the validated default.
+            // perf knob, optimum is GPU-dependent); `DECODE_WINDOW` is the
+            // validated default this backend instantiates in production.
             let out: crate::gigaam::error::Result<_> =
-                crate::gigaam::rnnt::block::forward_block::<4>(model, enc, time, prev, symbols, valid, h, c);
+                crate::gigaam::rnnt::block::forward_block::<W>(model, enc, time, prev, symbols, valid, h, c);
             out
         }
     }

@@ -42,6 +42,11 @@ use crate::state::scoped;
 /// the unrolled plan (~40 kernels/step).
 pub(crate) const BLOCK_STEPS: usize = 16;
 
+/// Production WIND window: the `W` [`RnntBlockBackend`](super::RnntBlockBackend)
+/// defaults to. Any `W >= 1` decodes identically, so this is tuned, not
+/// load-bearing.
+pub const DECODE_WINDOW: usize = 4;
+
 /// `RnntBlockJit`'s build tuple: the four read-back tapes/flag followed by the
 /// five carried-state values, in the order its `outputs { .. }` and
 /// `state { .. }` blocks declare them.

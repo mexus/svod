@@ -128,25 +128,29 @@ fn param_call_item(count: usize) -> (crate::schedule::ScheduleItem, std::collect
     (item, params.iter().enumerate().map(|(position, param)| (param.id, 10 + position)).collect())
 }
 
-/// `globals` only tells the caller how many compact buffers the compiled
-/// PROGRAM expects — the slots are neither positions nor an ordering, so the
-/// buffer order always comes from the CALL's argument order.
-#[test_case(&[0, 1]; "dense slots")]
-#[test_case(&[1, 0]; "descending slots")]
-#[test_case(&[0, 5]; "sparse slots")]
-fn test_resolve_compiled_kernel_buffer_indices_follows_call_argument_order(globals: &[usize]) {
-    let (item, uop_id_to_idx) = param_call_item(2);
+/// A PARAM slot is its actual argument's CALL position, and `globals` is the
+/// sorted set of slots the optimized body kept. The launch tuple is therefore
+/// `globals` projected onto the CALL arguments: identity while every argument
+/// survives, and a compaction that skips the folded-away ones otherwise.
+#[test_case(2, &[0, 1], &[10, 11]; "every argument survives")]
+#[test_case(3, &[0, 2], &[10, 12]; "middle argument folded away")]
+#[test_case(4, &[1, 3], &[11, 13]; "every other argument folded away")]
+#[test_case(3, &[2], &[12]; "one argument survives")]
+fn test_resolve_compiled_kernel_buffer_indices_projects_globals(count: usize, globals: &[usize], expected: &[usize]) {
+    let (item, uop_id_to_idx) = param_call_item(count);
     let ordered =
         resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, globals).expect("compiled buffer ABI ordering");
-    assert_eq!(ordered, vec![10, 11]);
+    assert_eq!(ordered, expected);
 }
 
+/// Compaction never invents an argument: a slot past the CALL tuple is still a
+/// hard error, since the launch would otherwise bind the wrong buffer.
 #[test]
-fn test_resolve_compiled_kernel_buffer_indices_rejects_wrong_compact_count() {
+fn test_resolve_compiled_kernel_buffer_indices_rejects_slot_without_argument() {
     let (item, uop_id_to_idx) = param_call_item(1);
     let err = resolve_compiled_kernel_buffer_indices(&item, &uop_id_to_idx, &[0, 5])
-        .expect_err("wrong compact count should fail");
-    assert!(format!("{err}").contains("expected 2 compact buffers"), "unexpected error: {err}");
+        .expect_err("a global slot with no CALL argument should fail");
+    assert!(format!("{err}").contains("PROGRAM slot 5"), "unexpected error: {err}");
 }
 
 #[test]

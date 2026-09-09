@@ -1085,26 +1085,39 @@ fn resolve_item_buffer_indices(item: &ScheduleItem, uop_id_to_idx: &HashMap<u64,
     Ok(indices)
 }
 
+/// Buffer arguments in compiled ABI order.
+///
+/// A PARAM slot is the CALL tuple position of its actual argument
+/// (`svod_ir::shape::actual_for_formal`), and `ProgramSpec.globals` is the
+/// sorted set of storage slots the *optimized* body still reads or writes —
+/// which the renderers emit verbatim, gaps included. Folding can retire a slot
+/// (an RN-T decode window of one frame collapses `where(emit, 0, 0)` to `0`,
+/// orphaning the per-step token buffers), so the launch tuple is `globals`
+/// projected onto the CALL arguments, not the arguments verbatim. A slot with
+/// no argument to project onto stays a loud error.
 fn resolve_compiled_kernel_buffer_indices(
     item: &ScheduleItem,
     uop_id_to_idx: &HashMap<u64, usize>,
     globals: &[usize],
 ) -> Result<Vec<usize>> {
     let buffer_indices = resolve_item_buffer_indices(item, uop_id_to_idx)?;
-    if buffer_indices.len() != globals.len() {
-        return IrConstructionSnafu {
-            details: format!(
-                "PROGRAM expected {} compact buffers for slots {globals:?}, CALL {} supplied {} (buffer_uop_ids={:?})",
-                globals.len(),
-                item.kernel.id,
-                buffer_indices.len(),
-                item.buffer_uop_ids
-            ),
-        }
-        .fail()
-        .map_err(Into::into);
-    }
-    Ok(buffer_indices)
+    globals
+        .iter()
+        .map(|&slot| {
+            buffer_indices.get(slot).copied().ok_or_else(|| {
+                IrConstructionSnafu {
+                    details: format!(
+                        "PROGRAM slot {slot} of globals {globals:?} has no CALL argument: {} supplied {} buffers (buffer_uop_ids={:?})",
+                        item.kernel.id,
+                        buffer_indices.len(),
+                        item.buffer_uop_ids
+                    ),
+                }
+                .build()
+                .into()
+            })
+        })
+        .collect()
 }
 
 type OptKey = (u64, DeviceSpec, String, u64, u64);

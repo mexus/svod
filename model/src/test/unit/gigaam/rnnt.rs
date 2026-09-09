@@ -1,11 +1,12 @@
 //! GigaAM RN-T decode tests: the predictor's gather embedding, the joint's
 //! padded class axis, and the block plan's structure.
 
-use svod_arch::rnnt::BatchBlockStep;
+use svod_arch::rnnt::{BatchBlockStep, LaneDecode, RnntDecoder, RnntOpts};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::gigaam::rnnt::RnntBlockBackend;
+use crate::gigaam::rnnt::block::DECODE_WINDOW;
 use crate::gigaam::rnnt::joint::{CLASS_ALIGN, RnntJoint};
 use crate::gigaam::rnnt::predictor::RnntPredictor;
 use crate::gigaam::{GigaAm, TransducerConfig};
@@ -128,7 +129,7 @@ fn rnnt_block_plan_reduces_over_padded_classes_only() {
     });
     let d_model = cfg.d_model;
     let model = GigaAm::with_random_weights(cfg);
-    let mut backend = RnntBlockBackend::from_model(model, LANES, MAX_T).expect("block backend");
+    let mut backend: RnntBlockBackend = RnntBlockBackend::from_model(model, LANES, MAX_T).expect("block backend");
 
     let names = backend.kernel_names().expect("kernel names");
     let with_dim = |d: usize| names.iter().filter(|n| n.split('_').any(|dim| dim == d.to_string())).collect::<Vec<_>>();
@@ -158,4 +159,68 @@ fn rnnt_block_plan_reduces_over_padded_classes_only() {
         }
     }
     panic!("wave never finished");
+}
+
+/// The WIND window is a pure performance knob, so every `W >= 1` must produce
+/// the same emission stream. `W == 1` is the case that folds: the one-element
+/// window makes `first_nb` a constant 0, `emit.select(first_nb, 0)` collapses
+/// to `0`, and the per-step token buffers drop out of the frame-tape kernel's
+/// ABI — the plan then carries fewer compact buffers than the CALL has
+/// arguments, which used to fail `prepare`. The raw tapes are *not* comparable
+/// across windows (a wider window collapses a blank run into one step, so
+/// emissions land on different tape slots); the decoded `(token, frame)` stream
+/// is the invariant.
+#[test_case(1; "per-frame baseline")]
+#[test_case(2; "two-frame window")]
+#[test_case(8; "eight-frame window")]
+fn rnnt_block_decode_is_window_invariant(window: usize) {
+    const LANES: usize = 2;
+    const MAX_T: usize = 32;
+    const NUM_CLASSES: usize = 12;
+
+    let mut cfg = super::super::batch::test_config();
+    cfg.transducer = Some(TransducerConfig {
+        pred_hidden: 16,
+        pred_rnn_layers: 1,
+        joint_hidden: 16,
+        num_classes: NUM_CLASSES,
+        max_symbols_per_step: 3,
+        vocabulary: (0..NUM_CLASSES - 1).map(|i| i.to_string()).collect(),
+        sentencepiece: false,
+    });
+    let d_model = cfg.d_model;
+    let model = GigaAm::with_random_weights(cfg);
+    let decoder =
+        RnntDecoder::new((0..NUM_CLASSES - 1).map(|i| i.to_string()).collect(), RnntOpts { max_symbols_per_step: 3 });
+
+    let valid = [MAX_T, MAX_T - 9];
+    let frames: Vec<Vec<f32>> = valid
+        .iter()
+        .enumerate()
+        .map(|(lane, &n)| (0..n * d_model).map(|i| ((i + lane) % 11) as f32 * 0.07 - 0.35).collect())
+        .collect();
+
+    fn decode<const W: usize>(
+        model: GigaAm,
+        frames: &[Vec<f32>],
+        valid: &[usize],
+        decoder: &RnntDecoder,
+    ) -> Vec<LaneDecode> {
+        let mut backend = RnntBlockBackend::<W>::from_model(model, LANES, MAX_T).expect("block backend");
+        backend.bind_batch(frames, valid).expect("bind");
+        decoder.decode_batch_blocks(valid, &mut backend).expect("decode")
+    }
+
+    let reference = decode::<{ DECODE_WINDOW }>(model.clone(), &frames, &valid, &decoder);
+    assert!(
+        reference.iter().any(|(_, emissions)| !emissions.is_empty()),
+        "the fixture emitted nothing; the window comparison would be vacuous"
+    );
+    let under_test = match window {
+        1 => decode::<1>(model, &frames, &valid, &decoder),
+        2 => decode::<2>(model, &frames, &valid, &decoder),
+        8 => decode::<8>(model, &frames, &valid, &decoder),
+        w => panic!("unmapped window {w}"),
+    };
+    assert_eq!(under_test, reference, "W={window} decoded differently from W={DECODE_WINDOW}");
 }
