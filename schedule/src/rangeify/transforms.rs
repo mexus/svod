@@ -1314,19 +1314,17 @@ pub fn simplify_merge_adjacent(ctx: &mut SimplifyRangesContext, u: &Arc<UOp>) ->
             continue;
         }
 
-        if let Some(v) = const_uop_to_i64(r0_end)
-            && v <= 0
-        {
+        // Both ends must be constant. A symbolic end (a runtime-bound batch,
+        // say) buys nothing here — the divmod count is unchanged, since the
+        // decomposition trades two ranges for one plus a `// s1` and a `% s1`
+        // — while the `s0 * s1` end it produces is symbolic, so every
+        // downstream const-only opt filter (upcast, unroll, local dims, tensor
+        // cores) drops the merged axis and with it the const axis that was
+        // folded into it.
+        let (Some(s0), Some(s1)) = (const_uop_to_i64(r0_end), const_uop_to_i64(r1_end)) else {
             continue;
-        }
-        if let Some(v) = const_uop_to_i64(r1_end)
-            && v <= 0
-        {
-            continue;
-        }
-        if let (Some(s0), Some(s1)) = (const_uop_to_i64(r0_end), const_uop_to_i64(r1_end))
-            && s0.checked_mul(s1).is_none()
-        {
+        };
+        if s0 <= 0 || s1 <= 0 || s0.checked_mul(s1).is_none() {
             continue;
         }
 

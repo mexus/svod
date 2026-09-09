@@ -105,3 +105,35 @@ fn ungated_trailing_index_protects_its_range() {
     assert_eq!(narrowed_end(&result, 6), 16, "r is used ungated in the second index");
     assert_eq!(narrowed_end(&result, 7), 2, "q is gated everywhere it is used");
 }
+
+fn merge_adjacent(ranges: smallvec::SmallVec<[std::sync::Arc<UOp>; 4]>) -> Option<std::sync::Arc<UOp>> {
+    let ends = UOp::native_const(1.0f32).end(ranges);
+    crate::rangeify::transforms::simplify_merge_adjacent(&mut SimplifyRangesContext::default(), &ends)
+}
+
+/// `simplify_merge_adjacent` folds two adjacent constant ranges into one, which
+/// is what lets the indexer drop a divmod pair.
+#[test]
+fn adjacent_const_ranges_merge_into_one() {
+    let ranges = smallvec![UOp::range(UOp::index_const(10), 20), UOp::range(UOp::index_const(20), 21)];
+    let merged = merge_adjacent(ranges).expect("two constant ranges merge");
+
+    let Op::End(ops::End { ranges, .. }) = merged.op() else { panic!("expected END, got {}", merged.tree()) };
+    assert_eq!(ranges.as_slice().len(), 1);
+    let Op::Range(ops::Range { end, .. }) = ranges[0].op() else { panic!("expected RANGE") };
+    assert_eq!(end.vmax().try_int(), Some(200));
+}
+
+/// A symbolic range end must not be merged. The merge is a wash on divmod count
+/// but turns a constant axis into a symbolic one, and every downstream opt
+/// filter (upcast, unroll, local dims, tensor cores) is constant-only — so the
+/// merged kernel loses the tensor-core path the constant axis would have taken.
+#[test]
+fn a_symbolic_range_end_blocks_the_merge() {
+    let symbolic = UOp::range(UOp::define_var("b".into(), 1, 8), 22);
+    let constant = UOp::range(UOp::index_const(20), 23);
+
+    assert!(merge_adjacent(smallvec![symbolic.clone(), constant.clone()]).is_none());
+    assert!(merge_adjacent(smallvec![constant, symbolic.clone()]).is_none());
+    assert!(merge_adjacent(smallvec![symbolic.clone(), symbolic]).is_none());
+}
