@@ -1,6 +1,11 @@
 use svod_dtype::DType;
+use test_case::test_case;
 
 use crate::{SInt, UOp, sint_max, sint_min, sint_prod};
+
+fn var(name: &str) -> SInt {
+    SInt::from(UOp::define_var(name.to_string(), 0, 1000))
+}
 
 #[test]
 fn test_sint_const() {
@@ -159,6 +164,32 @@ fn test_sint_arithmetic_symbolic() {
     // Symbolic ceildiv Const → Symbolic
     let result = sym.ceildiv(&SInt::from(4usize));
     assert!(result.is_symbolic());
+}
+
+/// `a - b` folds to a constant when both sides carry the same varying terms.
+#[test_case(|t, _| &(t + 1usize) - t, 1; "t_plus_1_minus_t")]
+#[test_case(|t, _| &(1usize + t) - t, 1; "const_on_the_left")]
+#[test_case(|t, _| &(t + 3usize) - &(t + 1usize), 2; "shared_var_both_sides")]
+#[test_case(|t, _| &(t + 1usize) - &(t - 1usize), 2; "negated_const_in_rhs")]
+#[test_case(|t, _| &(&(t * 2usize) + 1usize) - &(t * 2usize), 1; "scaled_term")]
+#[test_case(|t, s| &(&(t + s) + 4usize) - &(s + t), 4; "terms_in_either_order")]
+fn test_sint_sub_cancels_shared_affine_terms(build: fn(&SInt, &SInt) -> SInt, expected: usize) {
+    assert_eq!(build(&var("t"), &var("s")), SInt::Const(expected));
+}
+
+#[test_case(|t, _| &(t + 4usize) - 1usize; "const_only_rhs")]
+#[test_case(|t, s| &(t + 1usize) - s; "different_variables")]
+#[test_case(|t, s| &(&(t + s) + 1usize) - t; "partial_overlap")]
+#[test_case(|t, _| &(&(t + t) + 1usize) - t; "multiplicity_differs")]
+fn test_sint_sub_keeps_unmatched_terms_symbolic(build: fn(&SInt, &SInt) -> SInt) {
+    assert!(build(&var("t"), &var("s")).is_symbolic());
+}
+
+#[test]
+#[should_panic(expected = "SInt subtraction underflow")]
+fn test_sint_sub_symbolic_underflow_panics() {
+    let t = var("t");
+    let _ = &t - &(&t + 1usize);
 }
 
 #[test]

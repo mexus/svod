@@ -185,6 +185,14 @@ pub struct PreparedKernel {
 }
 
 impl PreparedKernel {
+    /// Whether any dispatch argument still comes from `execute_with_vars`.
+    ///
+    /// A variable pinned in `fixedvars` is as constant as a literal:
+    /// `update_runtime_var_vals` refuses to overwrite it.
+    pub fn has_unbound_vars(&self) -> bool {
+        self.runtime_vars.iter().any(|var| !self.fixedvars.contains_key(&var.name))
+    }
+
     /// Hazard read-set positions: every buffer slot the kernel does not write.
     ///
     /// Tinygrad's `DepsTracker.access_resources` (`device.py:280-296`, called
@@ -758,6 +766,14 @@ impl ExecutionPlan {
         self.graph.get_or_init(|| self.build_graph().unwrap_or(None))
     }
 
+    /// Graph-capture gate: every op is a compiled kernel on the plan device
+    /// whose dispatch arguments are fixed.
+    pub(crate) fn all_static_kernels(&self) -> bool {
+        self.ops
+            .iter()
+            .all(|op| matches!(op, PreparedOp::CompiledProgram(k) if k.device == self.device && !k.has_unbound_vars()))
+    }
+
     fn build_graph(&self) -> Result<Option<Box<dyn svod_device::Graph>>> {
         // Graph capture is on by default: an all-static compiled-kernel plan on a
         // graphable device replays the whole chain as one backend submit, instead
@@ -767,16 +783,19 @@ impl ExecutionPlan {
         // (below). Non-graphable plans (runtime vars, no graph factory, chains the
         // backend declines to capture, mixed devices) fall back to per-call via
         // the `Ok(None)` returns below.
-        let all_static_kernels = self.ops.iter().all(
-            |op| matches!(op, PreparedOp::CompiledProgram(k) if k.runtime_vars.is_empty() && k.device == self.device),
-        );
-        if !all_static_kernels || self.ops.is_empty() {
+        // "Static" means the dispatch arguments never change between executes;
+        // a schedule-loop counter pinned to one slot qualifies, and without
+        // that a scan plan would pay per-kernel dispatch for every time step.
+        if !self.all_static_kernels() || self.ops.is_empty() {
             tracing::debug!(
                 target: "svod_runtime::graph",
                 ops = self.ops.len(),
                 compiled = self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(_))).count(),
-                with_runtime_vars =
-                    self.ops.iter().filter(|o| matches!(o, PreparedOp::CompiledProgram(k) if !k.runtime_vars.is_empty())).count(),
+                with_runtime_vars = self
+                    .ops
+                    .iter()
+                    .filter(|o| matches!(o, PreparedOp::CompiledProgram(k) if k.has_unbound_vars()))
+                    .count(),
                 custom = self.ops.iter().filter(|o| matches!(o, PreparedOp::CustomFunction(_))).count(),
                 copies = self.ops.iter().filter(|o| matches!(o, PreparedOp::BufferCopy(_))).count(),
                 "graph: per-call fallback (not all-static-compiled)"

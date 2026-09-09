@@ -350,12 +350,9 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
         _c @ Call { body, args, info: _ }
             if matches!(body.op(), Op::Sink(..) | Op::Program(..)) => {
             for arg in args {
-                let mut src = Arc::clone(arg);
-                while let Op::Reshape(ops::Reshape { src: inner, .. }) = src.op() {
-                    src = Arc::clone(inner);
-                }
-                if !is_always_contiguous(&src) {
-                    ctx.mark_realize_non_removable(&src);
+                let src = through_reshapes(arg);
+                if !is_always_contiguous(src) {
+                    ctx.mark_realize_non_removable(src);
                 }
             }
             None
@@ -379,8 +376,7 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             {
                 ctx.clear_realize(value);
             }
-            let index_base = index.base().id;
-            if value.any_in_subtree(|n| n.id == index_base) {
+            if !self_read_misses_store(index, value, index.base().id) {
                 ctx.mark_realize_non_removable(value);
             }
             None
@@ -413,6 +409,81 @@ pub(crate) fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<I
             None
         },
     }
+}
+
+/// `node` seen through any number of RESHAPEs; other movement ops stay.
+fn through_reshapes(node: &Arc<UOp>) -> &Arc<UOp> {
+    let mut cur = node;
+    while let Op::Reshape(ops::Reshape { src, .. }) = cur.op() {
+        cur = src;
+    }
+    cur
+}
+
+/// Whether two shrink windows over one buffer provably cover disjoint memory.
+///
+/// True when on some axis the offset gap, once simplified, clears the other
+/// window in either direction: `a` starts at or past the end of `b`, or ends
+/// at or before the start of `b`. That is the scan case, where step `t` reads
+/// slot `t` and writes slot `t + 1`, and its strided variants.
+fn windows_disjoint(a: (&[Arc<UOp>], &[Arc<UOp>]), b: (&[Arc<UOp>], &[Arc<UOp>])) -> bool {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
+
+    let ((a_off, a_size), (b_off, b_size)) = (a, b);
+    a_off.len() == b_off.len()
+        && a_off.iter().zip(b_off).zip(a_size.iter().zip(b_size)).any(|((ao, bo), (asz, bsz))| {
+            let (Some(asz), Some(bsz)) = (asz.vmax().try_int(), bsz.vmax().try_int()) else { return false };
+            let Ok(gap) = ao.try_sub(bo) else { return false };
+            let gap = crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), gap, &mut ());
+            let Some((min, max)) = *SoundVminVmaxProperty::get(&gap) else { return false };
+            min.try_int().is_some_and(|min| min >= bsz) || max.try_int().is_some_and(|max| max <= -asz)
+        })
+}
+
+/// The `(offsets, sizes, viewed shape)` of a SHRINK that windows `base`
+/// directly, seen through any number of reshapes.
+type ShrinkView = (Vec<Arc<UOp>>, Vec<Arc<UOp>>, Option<svod_ir::shape::Shape>);
+
+/// `None` for offsets without sound bounds: reading through their casts
+/// would miss a wrap-around, so such a SHRINK is not a window we can place.
+fn shrink_over_base(node: &Arc<UOp>, base: u64) -> Option<ShrinkView> {
+    use svod_ir::uop::cached_property::CachedProperty;
+    use svod_ir::uop::properties::SoundVminVmaxProperty;
+
+    let Op::Shrink(ops::Shrink { src, offsets, sizes }) = node.op() else { return None };
+    (through_reshapes(src).id == base && SoundVminVmaxProperty::get(offsets).is_some())
+        .then(|| (extract_shape_uops(offsets), extract_shape_uops(sizes), src.shape().ok().flatten().cloned()))
+}
+
+/// Whether every read of `base` inside a STORE's value misses the slot the
+/// STORE writes (vacuously, when the value never reads `base`).
+///
+/// The STORE rule's WAR temp exists for self-assigns that overlap; a scan
+/// reading slot `t` and writing slot `t + 1` does not, and paying for the temp
+/// there costs one extra kernel and one extra buffer round trip per time step.
+///
+/// Every unproven case keeps the temp: a STORE target that is not a SHRINK, a
+/// size whose bound exceeds the gap, a non-SHRINK read of the base, a movement
+/// op other than RESHAPE between the SHRINK and the base, or two windows viewed
+/// through different shapes.
+fn self_read_misses_store(index: &Arc<UOp>, value: &Arc<UOp>, base: u64) -> bool {
+    let store = shrink_over_base(index, base);
+    let mut aliasing: HashSet<u64> = HashSet::new();
+    for node in value.toposort() {
+        if node.id != base && !node.op().sources().iter().any(|src| aliasing.contains(&src.id)) {
+            continue;
+        }
+        if let Some((store_off, store_size, store_shape)) = &store
+            && let Some((off, size, shape)) = shrink_over_base(&node, base)
+            && shape == *store_shape
+            && windows_disjoint((store_off, store_size), (&off, &size))
+        {
+            continue;
+        }
+        aliasing.insert(node.id);
+    }
+    !aliasing.contains(&value.id)
 }
 
 /// Check if a UOp is always contiguous (doesn't need realization).

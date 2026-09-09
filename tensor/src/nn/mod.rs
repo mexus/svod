@@ -21,9 +21,11 @@ pub use layers::{BatchNorm2d, Conv2d, ConvTranspose2d, Embedding, LayerNorm, Rms
 pub use linear::Linear;
 pub use lstm_cell::{LSTMCell, LstmCell};
 pub use module::{Module, StateDict, get_tensor, prefixed};
+#[cfg(test)]
+pub(crate) use rnn::run_direction;
 pub use rnn::{
     GruCell, GruDirection, GruOutput, LinearBeforeReset, LstmOutput, RecurrentCell, RnnCell, RnnDirection, RnnLayout,
-    RnnOutput, RnnStack,
+    RnnOutput, RnnStack, ScanState,
 };
 pub use stft::Window;
 /// Derive [`Module`](trait@Module): the trait lives in the type namespace and

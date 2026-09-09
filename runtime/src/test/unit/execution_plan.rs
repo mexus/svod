@@ -589,6 +589,31 @@ fn execute_with_vars_updates_only_non_fixed_variables(profiled: bool) {
     assert_eq!(calls.load(Ordering::SeqCst), 2, "each kernel should execute exactly once");
 }
 
+/// Graph capture wants dispatch arguments that never change. A runtime
+/// variable pinned in `fixedvars` (a schedule-loop counter) is one; a free
+/// variable is not.
+#[test_case::test_case(true; "pinned variable is static")]
+#[test_case::test_case(false; "free variable is dynamic")]
+fn graph_capture_gate_treats_pinned_variables_as_static(pinned: bool) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+    let dst_idx = builder.add_buffer(920, f32_buffer(&[0.0; 4]));
+    let src_idx = builder.add_buffer(921, f32_buffer(&[0.0; 4]));
+
+    let mut kernel = cached(copy4f32(&calls), 2);
+    kernel.var_names = vec!["N".to_string()];
+    let mut kernel = prepared(920, kernel, vec![dst_idx, src_idx]);
+    kernel.vals = vec![7];
+    kernel.runtime_vars = vec![RuntimeVar { name: "N".to_string(), min_val: 0, max_val: 8 }];
+    kernel.fixedvars = if pinned { HashMap::from([("N".to_string(), 7)]) } else { HashMap::new() };
+    assert_eq!(kernel.has_unbound_vars(), !pinned);
+
+    builder.add_kernel(kernel);
+    builder.set_output_buffer(dst_idx);
+    let plan = builder.build().expect("build plan");
+    assert_eq!(plan.all_static_kernels(), pinned);
+}
+
 /// A symbolic `global_size` resolves against the rebound variable at dispatch,
 /// with no recompilation.
 #[test_case::test_case(false; "execute_with_vars")]

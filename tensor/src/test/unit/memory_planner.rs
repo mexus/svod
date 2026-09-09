@@ -167,6 +167,17 @@ fn test_compute_item_levels_chain() {
     assert_eq!(compute_item_levels(&items).expect("levels"), vec![0, 1, 2, 3]);
 }
 
+/// A schedule loop chains its trips by item index, not callable id: the
+/// positional edge alone must push the second trip into a later level.
+#[test]
+fn test_compute_item_levels_honours_instance_dependencies() {
+    let mut items: Vec<ScheduleItem> = (0..2).map(|i| make_sink_item(i, make_buffer(256))).collect();
+    assert_eq!(compute_item_levels(&items).expect("levels"), vec![0, 0]);
+
+    items[1].instance_dependencies = vec![0];
+    assert_eq!(compute_item_levels(&items).expect("levels"), vec![0, 1]);
+}
+
 #[test]
 fn test_compute_item_levels_errors_on_cycle() {
     // Two items depending on each other → no in-degree-0 node → cycle. The

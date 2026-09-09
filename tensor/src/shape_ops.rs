@@ -858,10 +858,12 @@ impl Tensor {
         let ndim = self.ndim()?;
         let dim = Self::normalize_axis(dim, ndim)?;
         let start: SInt = start.into();
-        let end = &start + len.into();
-        let ranges: Vec<Option<(SInt, SInt)>> =
-            (0..ndim).map(|d| (d == dim).then(|| (start.clone(), end.clone()))).collect();
-        self.try_shrink(ranges)
+        let len: SInt = len.into();
+        let shape = self.shape()?;
+        let ranges: Vec<(SInt, SInt)> = (0..ndim)
+            .map(|d| if d == dim { (start.clone(), &start + &len) } else { (SInt::Const(0), shape[d].clone()) })
+            .collect();
+        self.uop().try_shrink(&ranges).map(Self::new).context(UOpSnafu).map_err(Into::into)
     }
 
     /// Center-crop or center-pad each specified axis to the target size.

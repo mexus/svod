@@ -6,7 +6,7 @@ use test_case::test_case;
 
 use crate::nn::{CoordinateTransformMode, ResizeMode};
 use crate::test::helpers::{RealizeTestExt, assert_close_f32, test_setup};
-use crate::{Tensor, Variable};
+use crate::{ErrorKind, Tensor, Variable};
 
 // =========================================================================
 // Helpers
@@ -90,6 +90,39 @@ fn test_narrow_symbolic_passthrough(sym: bool) {
     let x = input(sym, &[6, 5]);
     assert_eq!(dims_opt(&x.narrow(1, 1usize, 3usize).unwrap()), vec![head(sym), Some(3), Some(5)]);
     assert_eq!(dims_opt(&x.narrow(-1, 2usize, 2usize).unwrap()), vec![head(sym), Some(6), Some(2)]);
+}
+
+/// A symbolic `start` narrows to a *constant* extent: the offset becomes a
+/// runtime index, not a runtime axis length. Spelling the size as `end - begin`
+/// would leave `(t + 1) + t * -1` behind, turning the axis symbolic and
+/// stopping the optimizer from upcasting it.
+#[test]
+fn test_narrow_with_a_symbolic_start_keeps_a_constant_extent() {
+    let t = crate::Variable::new("t", 0, 5);
+    let x = Tensor::empty(&[6, 5], svod_dtype::DType::Float32);
+    let slot = x.narrow(0, t.as_sint(), 1usize).unwrap();
+    assert_eq!(dims_opt(&slot), vec![Some(1), Some(5)]);
+    assert_eq!(dims_opt(&slot.try_squeeze(Some(0)).unwrap()), vec![Some(5)]);
+
+    // The offset really is the variable, not a folded constant.
+    let uses_t = slot
+        .uop()
+        .toposort()
+        .iter()
+        .any(|n| matches!(n.op(), svod_ir::Op::Param(p) if p.arg.name.as_deref() == Some("t")));
+    assert!(uses_t, "narrow lost the symbolic offset");
+}
+
+#[test_case(3, 10; "past_the_end")]
+#[test_case(10, 1; "start_out_of_range")]
+#[test_case(5, 1; "start_at_the_end")]
+fn test_narrow_out_of_bounds_is_an_error(start: usize, len: usize) {
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    let err = x.narrow(0, start, len).unwrap_err();
+    assert!(
+        matches!(err.kind(), ErrorKind::UOp { source: svod_ir::Error::ShrinkBoundsViolation { dim: 0, .. } }),
+        "unexpected error: {err}"
+    );
 }
 
 #[test_case(false; "concrete")]

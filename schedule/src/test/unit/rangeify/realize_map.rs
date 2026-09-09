@@ -6,7 +6,8 @@ use std::sync::Arc;
 use smallvec::smallvec;
 use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, CallInfo, Op, UOp};
+use svod_ir::{AxisId, AxisType, CallInfo, Op, SInt, UOp};
+use test_case::test_case;
 
 use crate::rangeify::IndexingContext;
 use crate::rangeify::indexing::pm_generate_realize_map;
@@ -101,4 +102,108 @@ fn slice_source_keeps_its_realize_entry_behind_a_movement_op() {
     run(store, &mut ctx);
 
     assert!(ctx.should_realize(&slice), "a moved destination does not line up with the SLICE");
+}
+
+/// The scan counter: a loop variable over `[0, 100]` used as a window offset.
+fn t() -> Arc<UOp> {
+    UOp::define_var("t".to_string(), 0, 100)
+}
+
+/// `src[offset : offset + size]`, the way `narrow` windows a scan slot.
+fn window(src: &Arc<UOp>, offset: Arc<UOp>, size: SInt) -> Arc<UOp> {
+    let begin = SInt::Symbolic(offset);
+    let end = &begin + &size;
+    src.try_shrink(&[(begin, end)]).expect("shrink")
+}
+
+/// `src[offset : offset + 1, 0 : 1]` over a `[n, 1]` view.
+fn column_window(src: &Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
+    let begin = SInt::Symbolic(offset);
+    let end = &begin + 1;
+    src.try_shrink(&[(begin, end), (0.into(), 1.into())]).expect("shrink")
+}
+
+/// `STORE(target, read * read)`: whether the WAR temp on the value survives.
+fn self_assign_keeps_temp(target: Arc<UOp>, read: Arc<UOp>) -> bool {
+    let value = read.try_mul(&read).expect("mul");
+    let mut ctx = IndexingContext::new();
+    run(target.store(Arc::clone(&value)), &mut ctx);
+    ctx.is_non_removable_realize(&value)
+}
+
+/// Windows of one buffer that are provably disjoint drop the WAR temp; every
+/// unproven pair keeps it. Offsets are in units of the scan counter `t`.
+#[test_case(|t| t.add(&t.const_like(1)), 1, |t| t.clone(), 1, false ; "the next slot misses the current one")]
+#[test_case(|t| t.clone(), 1, |t| t.add(&t.const_like(1)), 1, false ; "the current slot misses the next one")]
+#[test_case(|t| t.const_like(2).mul(&t.add(&t.const_like(1))), 2, |t| t.const_like(2).mul(t), 2, false ; "a stride distributed over the offset")]
+#[test_case(|t| t.add(&t.const_like(1)).mul(&t.const_like(3)), 3, |t| t.mul(&t.const_like(3)), 3, false ; "a stride applied after the offset")]
+#[test_case(|t| t.add(&t.const_like(1)), 2, |t| t.clone(), 1, false ; "a wider write past a narrower read")]
+#[test_case(|t| t.clone(), 1, |t| t.add(&t.const_like(1)), 2, false ; "a narrower write before a wider read")]
+#[test_case(|t| t.clone(), 1, |t| t.clone(), 1, true ; "the same slot overlaps")]
+#[test_case(|t| t.const_like(2).mul(&t.add(&t.const_like(1))), 2, |t| t.const_like(2).mul(t).add(&t.const_like(2)), 2, true ; "equal offsets spelled differently overlap")]
+#[test_case(|t| t.add(&t.const_like(2)), 1, |t| t.const_like(1).add(&t.add(&t.const_like(1))), 1, true ; "equal offsets nested differently overlap")]
+#[test_case(|t| t.add(&t.const_like(1)), 1, |t| t.clone(), 2, true ; "a wider read reaches into the write")]
+#[test_case(|t| t.clone(), 2, |t| t.add(&t.const_like(1)), 1, true ; "a wider write reaches into the read")]
+#[test_case(|t| t.add(&t.const_like(200)).cast(DType::Int8), 100, |t| t.cast(DType::Int8), 100, true ; "a narrowing cast may wrap the gap away")]
+fn self_assign_windows(
+    write: fn(&Arc<UOp>) -> Arc<UOp>,
+    write_size: usize,
+    read: fn(&Arc<UOp>) -> Arc<UOp>,
+    read_size: usize,
+    keeps_temp: bool,
+) {
+    let (base, t) = (buffer(512), t());
+    let target = window(&base, write(&t), write_size.into());
+    let read = window(&base, read(&t), read_size.into());
+    assert_eq!(self_assign_keeps_temp(target, read), keeps_temp);
+}
+
+#[test]
+fn self_assign_keeps_temp_for_a_symbolically_sized_window() {
+    let (base, t) = (buffer(8), t());
+    let size = SInt::Symbolic(UOp::define_var("s".to_string(), 1, 4));
+    let target = window(&base, t.add(&t.const_like(1)), size.clone());
+    assert!(self_assign_keeps_temp(target, window(&base, t, size)), "the size bound exceeds the gap");
+}
+
+#[test]
+fn self_assign_keeps_temp_for_a_read_that_is_not_a_shrink() {
+    let (base, t) = (buffer(8), t());
+    let target = window(&base, t.add(&t.const_like(1)), 1.into());
+    assert!(self_assign_keeps_temp(target, base), "reading the whole buffer covers the written slot");
+}
+
+#[test]
+fn self_assign_keeps_temp_behind_a_movement_op_other_than_reshape() {
+    let (base, t) = (buffer(8), t());
+    let target = window(&base, t.add(&t.const_like(1)), 1.into());
+    let read = window(&base.try_flip(vec![true]).expect("flip"), t, 1.into());
+    assert!(self_assign_keeps_temp(target, read), "a flipped window is not addressed like the target");
+}
+
+#[test]
+fn self_assign_keeps_temp_for_windows_viewed_through_different_shapes() {
+    let (base, t) = (buffer(8), t());
+    let target = window(&base, t.add(&t.const_like(1)), 1.into());
+    let column = base.try_reshape(&smallvec![8usize.into(), 1usize.into()]).expect("reshape");
+    let read = column_window(&column, t);
+    assert!(self_assign_keeps_temp(target, read), "windows over different views are not compared");
+}
+
+#[test]
+fn self_assign_drops_temp_for_windows_viewed_through_the_same_reshape() {
+    let (base, t) = (buffer(8), t());
+    let column = base.try_reshape(&smallvec![8usize.into(), 1usize.into()]).expect("reshape");
+    let target = column_window(&column, t.add(&t.const_like(1)));
+    let read = column_window(&column, t);
+    assert!(!self_assign_keeps_temp(target, read), "the reshape is transparent to the window comparison");
+}
+
+#[test]
+fn self_assign_keeps_temp_when_the_target_is_not_a_shrink() {
+    let (base, t) = (buffer(8), t());
+    assert!(
+        self_assign_keeps_temp(Arc::clone(&base), window(&base, t, 1.into())),
+        "an unwindowed target covers every read"
+    );
 }

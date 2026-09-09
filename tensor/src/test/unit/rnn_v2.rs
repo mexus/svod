@@ -8,8 +8,8 @@ use svod_ir::{Op, SInt, UOp};
 use test_case::test_case;
 
 use crate::error::ErrorKind;
-use crate::nn::{GruCell, LstmCell, RnnDirection, RnnLayout, RnnStack};
-use crate::{Tensor, Variable};
+use crate::nn::{GruCell, LstmCell, RecurrentCell, RnnDirection, RnnLayout, RnnStack, ScanState, run_direction};
+use crate::{Result, Tensor, Variable};
 
 const TOL: f32 = 2e-5;
 
@@ -540,6 +540,101 @@ fn rnn_stack_matches_the_manual_predictor_loop() {
     assert_close(&realized(&c), &realized(&want_c), "stack c");
 }
 
+/// A cell whose emitted output is not its hidden state: `h' = tanh(x + h)`,
+/// `y' = 2 h'`, and the runner must emit `y`.
+#[derive(Clone)]
+struct Doubling;
+
+#[derive(Clone)]
+struct HiddenAndTwice {
+    h: Tensor,
+    y: Tensor,
+}
+
+impl ScanState for HiddenAndTwice {
+    type Parts = [Tensor; 2];
+
+    fn parts(&self) -> Self::Parts {
+        [self.h.clone(), self.y.clone()]
+    }
+
+    fn try_map(&self, mut f: impl FnMut(&Tensor) -> Result<Tensor>) -> Result<Self> {
+        Ok(Self { h: f(&self.h)?, y: f(&self.y)? })
+    }
+
+    fn output(&self) -> &Tensor {
+        &self.y
+    }
+}
+
+impl RecurrentCell for Doubling {
+    type State = HiddenAndTwice;
+
+    fn hidden_size(&self) -> usize {
+        H
+    }
+
+    fn project_input(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(x.clone())
+    }
+
+    fn step_projected(&self, gx: &Tensor, state: &Self::State) -> Result<Self::State> {
+        let h = gx.try_add(&state.h)?.tanh()?;
+        Ok(HiddenAndTwice { y: h.try_add(&h)?, h })
+    }
+}
+
+/// `(y[t][b][h] in input order, final h[b][h])` for [`Doubling`].
+fn doubling_ref(x: &[Vec<Vec<f32>>], h0: &[f32], reverse: bool) -> (Seq3, Seq2) {
+    let (t_len, batch) = (x.len(), x[0].len());
+    let mut h: Seq2 = (0..batch).map(|b| h0[b * H..(b + 1) * H].to_vec()).collect();
+    let mut ys = vec![vec![vec![0.0f32; H]; batch]; t_len];
+    for step in 0..t_len {
+        let t = if reverse { t_len - 1 - step } else { step };
+        for b in 0..batch {
+            h[b] = (0..H).map(|k| (x[t][b][k] + h[b][k]).tanh()).collect();
+            ys[t][b] = h[b].iter().map(|v| 2.0 * v).collect();
+        }
+    }
+    (ys, h)
+}
+
+/// The sequence runner emits the history of the state's `output` part, which
+/// need not be the hidden state, and hands back the whole final state.
+#[test_case(false; "forward")]
+#[test_case(true; "reverse")]
+fn the_sequence_runner_emits_the_output_part(reverse: bool) {
+    let x_f = seq(T * B * H, 0.31);
+    let x_host: Vec<Vec<Vec<f32>>> =
+        (0..T).map(|t| (0..B).map(|b| x_f[(t * B + b) * H..(t * B + b + 1) * H].to_vec()).collect()).collect();
+    let x = Tensor::from_slice(&x_f).try_reshape([T as isize, B as isize, H as isize]).unwrap();
+    let h0_f = seq(B * H, 0.71);
+    let h0 = Tensor::from_slice(&h0_f).try_reshape([B as isize, H as isize]).unwrap();
+    let init = HiddenAndTwice { h: h0.clone(), y: h0 };
+
+    let (ys, last) = run_direction(&Doubling, &x, T, init, reverse).unwrap();
+    let (want_ys, want_h) = doubling_ref(&x_host, &h0_f, reverse);
+    assert_close(&realized(&ys), &flat_output(&[want_ys], RnnLayout::SeqFirst), "output part history");
+    let want_y: Seq2 = want_h.iter().map(|row| row.iter().map(|v| 2.0 * v).collect()).collect();
+    assert_close(&realized(&last.h), &flat_state(&[want_h]), "final h");
+    assert_close(&realized(&last.y), &flat_state(&[want_y]), "final y");
+}
+
+/// `RnnStack::step` feeds each layer the one below's `output` part.
+#[test]
+fn the_stack_feeds_the_output_part_upwards() {
+    let x = Tensor::from_slice(seq(B * H, 0.37)).try_reshape([B as isize, H as isize]).unwrap();
+    let zero = || Tensor::full(&[B, H], 0.0f32, DType::Float32);
+    let states = vec![HiddenAndTwice { h: zero(), y: zero() }, HiddenAndTwice { h: zero(), y: zero() }];
+
+    let (y, next) = RnnStack::new(vec![Doubling, Doubling]).step(&x, &states).unwrap();
+    let h0: Vec<f32> = realized(&x).iter().map(|v| v.tanh()).collect();
+    let h1: Vec<f32> = h0.iter().map(|v| (2.0 * v).tanh()).collect();
+    assert_close(&realized(&next[0].h), &h0, "layer 0 h");
+    assert_close(&realized(&next[1].h), &h1, "layer 1 h");
+    assert_close(&realized(&y), &h1.iter().map(|v| 2.0 * v).collect::<Vec<_>>(), "stack output");
+}
+
 /// An explicit `h0`/`c0` must be threaded in per direction.
 #[test]
 fn initial_state_is_honoured() {
@@ -652,28 +747,121 @@ fn count_kernels(t: &Tensor) -> (usize, usize) {
     (bodies.len(), distinct.len())
 }
 
-/// Host-unrolling a `T`-step GRU costs `1 + 2*T` kernels: one hoisted input
-/// projection over the whole sequence, then two per step (the `r`/`z` matmul
-/// and the `n` matmul, each fused with its elementwise tail).
-///
-/// The bodies are *not* deduped: every step's input slice carries a distinct
-/// constant time offset, so the `(ast_id, device)` kernel cache sees `2*T`
-/// different ASTs. Sharing one compiled step needs the schedule-level
-/// `END(CALL, [RANGE])` loop from the recurrence spike, which is out of scope
-/// for this phase. Pinned so a regression that stops hoisting the projection
-/// (or that starts emitting a third matmul per step) is visible.
-#[test]
-fn t8_gru_kernel_count() {
-    let x = Tensor::empty(&[8, 2, I], DType::Float32);
+fn gru_graph(t_len: usize, batch: usize) -> Tensor {
+    let x = Tensor::empty(&[t_len, batch, I], DType::Float32);
     let w_ih = Tensor::empty(&[3 * H, I], DType::Float32);
     let w_hh = Tensor::empty(&[3 * H, H], DType::Float32);
-    let out = x.gru().weight_ih(&w_ih).weight_hh(&w_hh).call().unwrap();
-    let (launches, distinct) = count_kernels(&out.output);
+    x.gru().weight_ih(&w_ih).weight_hh(&w_hh).call().unwrap().output
+}
+
+/// A `T`-step GRU costs a fixed five kernels whatever `T` is: the zeroed
+/// initial state, the hoisted input projection over the whole sequence, the
+/// two step kernels (the `r`/`z` matmul and the `n` matmul, each fused with
+/// its elementwise tail), and the copy that hands back the hidden history as
+/// the output sequence. The step pair is *one* compiled body each, re-launched
+/// per time slot by the schedule-level `END(CALL, [RANGE])` loop with the time
+/// index bound as a scalar kernel argument.
+///
+/// Pinned so a regression that stops hoisting the projection, that starts
+/// emitting a third step kernel (the WAR temp `self_read_misses_store` avoids),
+/// or that re-unrolls the loop is visible.
+#[test]
+fn t8_gru_kernel_count() {
+    // Pinned against the CPU splitter: how many kernels a device needs is the
+    // backend's business, but the loop structure is not.
+    let graph = svod_dtype::default_device::with_default_device(svod_dtype::DeviceSpec::Cpu, || gru_graph(8, 2));
+    let (launches, distinct) = count_kernels(&graph);
     assert_eq!((launches, distinct), T8_GRU_KERNELS, "T=8 GRU kernel count moved: {launches}/{distinct}");
 }
 
 /// Measured `(launches, distinct bodies)`; see [`t8_gru_kernel_count`].
-const T8_GRU_KERNELS: (usize, usize) = (17, 17);
+const T8_GRU_KERNELS: (usize, usize) = (5, 5);
+
+/// `(compiled programs, step kernels, per-step launch bindings)` for a GRU of
+/// `t_len` steps. The program count is device-dependent; its *independence*
+/// from `t_len` is not.
+fn scan_plan_shape(t_len: usize) -> (usize, usize, Vec<Vec<i64>>) {
+    let plan = gru_graph(t_len, 2).prepare().unwrap();
+    let launches = plan.prepared_kernels();
+    let programs: std::collections::HashSet<*const _> =
+        launches.iter().map(|k| std::sync::Arc::as_ptr(&k.kernel)).collect();
+
+    let mut slots: std::collections::BTreeMap<&str, Vec<i64>> = std::collections::BTreeMap::new();
+    for kernel in &launches {
+        let Some(value) = kernel.fixedvars.values().next() else { continue };
+        slots.entry(&kernel.kernel.entry_point).or_default().push(*value);
+    }
+    let mut bindings: Vec<Vec<i64>> = slots.into_values().collect();
+    for bound in &mut bindings {
+        bound.sort_unstable();
+    }
+    (programs.len(), bindings.len(), bindings)
+}
+
+/// The compiled inventory must not grow with the sequence length, and each
+/// step kernel must be launched once per time slot with a distinct binding.
+#[test]
+fn the_step_kernel_is_compiled_once_and_launched_per_slot() {
+    let (short_programs, short_steps, short_bindings) = scan_plan_shape(8);
+    let (long_programs, long_steps, long_bindings) = scan_plan_shape(19);
+
+    assert_eq!(short_programs, long_programs, "compiled programs grew with the sequence length");
+    assert_eq!((short_steps, long_steps), (2, 2), "expected exactly two looped step kernels");
+    for bound in &short_bindings {
+        assert_eq!(*bound, (0..8).collect::<Vec<i64>>(), "T=8 launch bindings");
+    }
+    for bound in &long_bindings {
+        assert_eq!(*bound, (0..19).collect::<Vec<i64>>(), "T=19 launch bindings");
+    }
+}
+
+/// The distinct rendered sources of the looped step kernels. The entry point
+/// carries a process-wide dedup suffix; everything else in the rendering is
+/// kept.
+fn step_sources(graph: &Tensor) -> Vec<String> {
+    let plan = graph.prepare().unwrap();
+    let mut sources: Vec<String> = plan
+        .prepared_kernels()
+        .iter()
+        .filter(|k| !k.fixedvars.is_empty())
+        .map(|k| k.kernel.code.replace(&k.kernel.entry_point, "step"))
+        .collect();
+    sources.sort();
+    sources.dedup();
+    sources
+}
+
+/// The step kernel's rendered source must not mention the time slot: the only
+/// thing that changes between launches is the value of a scalar argument, so
+/// the source is byte-identical across sequence lengths.
+#[test]
+fn the_looped_step_source_carries_no_per_step_constant() {
+    let short = step_sources(&gru_graph(8, 2));
+    assert_eq!(short.len(), 2, "two distinct step kernels");
+    assert_eq!(short, step_sources(&gru_graph(31, 2)), "step source changed with the sequence length");
+
+    // The bound time index reaches the kernel as a scalar argument, not a
+    // literal — that is what lets one program serve every slot.
+    let plan = gru_graph(8, 2).prepare().unwrap();
+    for kernel in plan.prepared_kernels().iter().filter(|k| !k.fixedvars.is_empty()) {
+        let name = kernel.fixedvars.keys().next().expect("a bound loop variable");
+        assert!(kernel.kernel.var_names.contains(name), "{name} is not a kernel argument");
+    }
+}
+
+/// ONNX-ordered weights reach the step through a loop-invariant gate `cat`
+/// that `reorder_gates` materializes. Left as a view, rangeify sinks the `cat`
+/// into the step body and splits its gate axis (`r_2_5_2_5`, 102 lines, in
+/// place of `r_2_10_5`, 79 lines); materialized, the step kernels are the
+/// PyTorch-ordered ones byte for byte.
+#[test]
+fn onnx_gate_order_leaves_the_step_kernels_untouched() {
+    let x = Tensor::empty(&[8, 2, I], DType::Float32);
+    let w = Tensor::empty(&[1, 3 * H, I], DType::Float32);
+    let r = Tensor::empty(&[1, 3 * H, H], DType::Float32);
+    let onnx = x.gru().w(&w).r_weights(&r).hidden_size(H).linear_before_reset(true).call().unwrap().output;
+    assert_eq!(step_sources(&onnx), step_sources(&gru_graph(8, 2)), "ONNX gate order changed the step kernels");
+}
 
 // =========================================================================
 // Downstream call shapes

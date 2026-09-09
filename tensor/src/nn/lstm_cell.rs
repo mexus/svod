@@ -71,7 +71,7 @@ impl LstmCell {
     #[track_caller]
     pub fn step(&self, x: &Tensor, h: &Tensor, c: &Tensor) -> Result<(Tensor, Tensor)> {
         origin_call!("LstmCell::step");
-        Ok(self.step_state(x, &(h.clone(), c.clone()))?.1)
+        self.step_state(x, &(h.clone(), c.clone()))
     }
 }
 
@@ -86,7 +86,7 @@ impl RecurrentCell for LstmCell {
         x.linear().weight(&self.weight_ih).bias(&self.bias_ih).call()
     }
 
-    fn step_projected(&self, gx: &Tensor, (h, c): &Self::State) -> Result<(Tensor, Self::State)> {
+    fn step_projected(&self, gx: &Tensor, (h, c): &Self::State) -> Result<Self::State> {
         let gates = gx.try_add(&h.linear().weight(&self.weight_hh).bias(&self.bias_hh).call()?)?;
 
         let hs = self.hidden_size;
@@ -105,8 +105,7 @@ impl RecurrentCell for LstmCell {
         if let Some((_, _, p_o)) = &self.peepholes {
             go = go.try_add(&new_c.try_mul(p_o)?)?;
         }
-        let new_h = go.sigmoid()?.try_mul(&new_c.tanh()?)?;
-        Ok((new_h.clone(), (new_h, new_c)))
+        Ok((go.sigmoid()?.try_mul(&new_c.tanh()?)?, new_c))
     }
 }
 

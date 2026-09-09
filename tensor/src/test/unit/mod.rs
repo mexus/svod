@@ -41,6 +41,7 @@ mod module;
 mod nn_affine;
 mod reduce_symbolic;
 mod rnn_v2;
+mod scan;
 pub mod scatter_debug;
 pub mod schedule;
 pub mod schedule_cache;

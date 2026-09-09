@@ -7,6 +7,7 @@ use std::f64::consts::PI;
 use smallvec::smallvec;
 
 use svod_dtype::DType;
+use test_case::test_case;
 
 use crate::ops;
 use crate::{ConstValue, Op, SInt, UOp, error::Error, shape::Shape};
@@ -125,6 +126,24 @@ fn test_shrink_stores_offset_and_independent_size() {
     assert!(matches!(offsets.op(), Op::Const(value) if value.0 == ConstValue::Int(2)));
     assert!(matches!(sizes.op(), Op::Const(value) if value.0 == ConstValue::Int(3)));
     assert_eq!(result.shape().unwrap().unwrap()[0].as_const(), Some(3));
+}
+
+/// A symbolic offset with a one-apart end keeps a constant extent, so the
+/// optimizer can still upcast the axis.
+#[test_case(1, 4; "unit_axis_and_wide_axis")]
+#[test_case(6, 1; "wide_axis_and_unit_axis")]
+fn test_shrink_symbolic_offset_keeps_constant_extent(rows: usize, cols: usize) {
+    let t = SInt::from(UOp::define_var("t".to_string(), 0, 3));
+    let src = UOp::native_const(1.0f32)
+        .try_reshape(&smallvec![SInt::from(1), SInt::from(1)])
+        .unwrap()
+        .try_expand(&smallvec![SInt::from(rows), SInt::from(cols)])
+        .unwrap();
+    let result = src.try_shrink(&[(t.clone(), &t + 1usize), (SInt::from(0), SInt::from(cols))]).unwrap();
+    let Op::Shrink(ops::Shrink { offsets, sizes, .. }) = result.op() else { panic!("expected SHRINK") };
+    assert_eq!(result.shape().unwrap().unwrap().as_slice(), &[SInt::Const(1), SInt::Const(cols)]);
+    assert!(matches!(sizes.op(), Op::Stack(_)));
+    assert!(offsets.toposort().iter().any(|n| n.id == t.as_symbolic().unwrap().id), "symbolic offset dropped");
 }
 
 // =========================================================================

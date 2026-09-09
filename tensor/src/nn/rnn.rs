@@ -2,12 +2,13 @@
 //!
 //! One core drives everything: a [`RecurrentCell`] hoists its input projection
 //! out of the time loop (`x @ W_ih^T + b_ih` for the whole sequence in a single
-//! matmul) and then contributes one graph per step. [`Tensor::rnn`],
-//! [`Tensor::gru`] and [`Tensor::lstm`] unroll that loop over a *concrete* `T`;
-//! the batch extent may stay symbolic. A symbolic `T` is out of scope for this
-//! phase — the IR can express a runtime-trip `RANGE`, but the tensor scheduler
-//! materializes step boundaries at `prepare()` time, so `T` must be a constant
-//! (see the recurrence spike: no `Op::Scan`, no data-dependent trip count).
+//! matmul) and then contributes **one** step graph, indexed by a scan variable.
+//! [`Tensor::rnn`], [`Tensor::gru`] and [`Tensor::lstm`] compile that step once
+//! and re-launch it per time slot through the schedule-level loop in
+//! [`crate::scan`]; the batch extent may stay symbolic. `T` must still be a
+//! constant: the scheduler unrolls the loop eagerly at `prepare()` time, so a
+//! runtime trip count needs the IR-level `while` the recurrence spike found
+//! missing (no `Op::Scan`, no data-dependent termination).
 //!
 //! # Two weight spellings
 //!
@@ -29,6 +30,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 
 use crate::error::{ExclusiveParamsSnafu, NdimExactSnafu, NonConstDimSnafu, ParamRangeSnafu};
+use crate::scan::ScanVar;
 
 use super::*;
 
@@ -149,26 +151,79 @@ pub struct LstmOutput {
 // Cells
 // =========================================================================
 
+/// A recurrent state: a fixed set of `[B, H]` tensors, one of which is the
+/// step output.
+///
+/// The scan runner parks each part in its own history buffer, so it needs to
+/// rebuild a state part-by-part without knowing its shape; the history of the
+/// [`output`](Self::output) part doubles as the output sequence.
+pub trait ScanState: Clone {
+    /// The parts in a fixed order — `[Tensor; N]` for the in-tree states.
+    type Parts: AsRef<[Tensor]>;
+
+    fn parts(&self) -> Self::Parts;
+
+    /// The state with `f` applied to every part, in [`parts`](Self::parts) order.
+    fn try_map(&self, f: impl FnMut(&Tensor) -> Result<Tensor>) -> Result<Self>;
+
+    /// The part a sequence runner emits per step; must be one of
+    /// [`parts`](Self::parts). `h` for every in-tree cell.
+    fn output(&self) -> &Tensor;
+}
+
+impl ScanState for Tensor {
+    type Parts = [Tensor; 1];
+
+    fn parts(&self) -> Self::Parts {
+        [self.clone()]
+    }
+
+    fn try_map(&self, mut f: impl FnMut(&Tensor) -> Result<Tensor>) -> Result<Self> {
+        f(self)
+    }
+
+    fn output(&self) -> &Tensor {
+        self
+    }
+}
+
+/// `(h, c)`: the hidden state is the output.
+impl ScanState for (Tensor, Tensor) {
+    type Parts = [Tensor; 2];
+
+    fn parts(&self) -> Self::Parts {
+        [self.0.clone(), self.1.clone()]
+    }
+
+    fn try_map(&self, mut f: impl FnMut(&Tensor) -> Result<Tensor>) -> Result<Self> {
+        Ok((f(&self.0)?, f(&self.1)?))
+    }
+
+    fn output(&self) -> &Tensor {
+        &self.0
+    }
+}
+
 /// One time step of a recurrent layer over an owned state.
 ///
-/// The input projection is separated from the recurrence so a sequence runner
-/// can hoist it: `project_input` sees `[T, B, I]` once, `step_projected` sees
-/// `[B, G*H]` per step.
+/// A step returns only the next state; its output is the state's
+/// [`ScanState::output`] part. The input projection is separated from the
+/// recurrence so a sequence runner can hoist it: `project_input` sees
+/// `[T, B, I]` once, `step_projected` sees `[B, G*H]` per step.
 pub trait RecurrentCell {
     /// State carried across steps: `Tensor` for RNN/GRU, `(h, c)` for LSTM.
-    type State: Clone;
+    type State: ScanState;
 
     fn hidden_size(&self) -> usize;
 
     /// `x @ W_ih^T + b_ih` over any leading axes: `[.., I] -> [.., G*H]`.
     fn project_input(&self, x: &Tensor) -> Result<Tensor>;
 
-    /// One step from an already-projected row `[B, G*H]`, returning
-    /// `(output, next_state)`.
-    fn step_projected(&self, gx: &Tensor, state: &Self::State) -> Result<(Tensor, Self::State)>;
+    /// One step from an already-projected row `[B, G*H]`.
+    fn step_projected(&self, gx: &Tensor, state: &Self::State) -> Result<Self::State>;
 
     /// One step from a raw input row `[B, I]`.
-    fn step_state(&self, x: &Tensor, state: &Self::State) -> Result<(Tensor, Self::State)> {
+    fn step_state(&self, x: &Tensor, state: &Self::State) -> Result<Self::State> {
         self.step_projected(&self.project_input(x)?, state)
     }
 }
@@ -198,7 +253,7 @@ impl RnnCell {
     #[track_caller]
     pub fn step(&self, x: &Tensor, h: &Tensor) -> Result<Tensor> {
         origin_call!("RnnCell::step");
-        Ok(self.step_state(x, &h.clone())?.1)
+        self.step_state(x, h)
     }
 }
 
@@ -213,10 +268,9 @@ impl RecurrentCell for RnnCell {
         x.linear().weight(&self.weight_ih).maybe_bias(self.bias_ih.as_ref()).call()
     }
 
-    fn step_projected(&self, gx: &Tensor, h: &Self::State) -> Result<(Tensor, Self::State)> {
+    fn step_projected(&self, gx: &Tensor, h: &Self::State) -> Result<Self::State> {
         let gh = h.linear().weight(&self.weight_hh).maybe_bias(self.bias_hh.as_ref()).call()?;
-        let next = gx.try_add(&gh)?.tanh()?;
-        Ok((next.clone(), next))
+        gx.try_add(&gh)?.tanh()
     }
 }
 
@@ -285,7 +339,7 @@ impl GruCell {
     #[track_caller]
     pub fn step(&self, x: &Tensor, h: &Tensor) -> Result<Tensor> {
         origin_call!("GruCell::step");
-        Ok(self.step_state(x, &h.clone())?.1)
+        self.step_state(x, h)
     }
 }
 
@@ -300,7 +354,7 @@ impl RecurrentCell for GruCell {
         x.linear().weight(&self.weight_ih).maybe_bias(self.bias_ih.as_ref()).call()
     }
 
-    fn step_projected(&self, gx: &Tensor, h: &Self::State) -> Result<(Tensor, Self::State)> {
+    fn step_projected(&self, gx: &Tensor, h: &Self::State) -> Result<Self::State> {
         let hs = self.hidden_size;
         let gh_rz = h.linear().weight(&self.w_hh_rz).maybe_bias(self.b_hh_rz.as_ref()).call()?;
         let r = gx.narrow(-1, 0usize, hs)?.try_add(&gh_rz.narrow(-1, 0usize, hs)?)?.sigmoid()?;
@@ -316,8 +370,7 @@ impl RecurrentCell for GruCell {
         };
 
         // (1 - z) * n + z * h, written to reuse `n` once.
-        let next = n.try_add(&z.try_mul(&h.try_sub(&n)?)?)?;
-        Ok((next.clone(), next))
+        n.try_add(&z.try_mul(&h.try_sub(&n)?)?)
     }
 }
 
@@ -360,8 +413,8 @@ impl<C: RecurrentCell> RnnStack<C> {
         let mut layer_in = x.clone();
         let mut next = Vec::with_capacity(self.cells.len());
         for (cell, state) in self.cells.iter().zip(states) {
-            let (y, s) = cell.step_state(&layer_in, state)?;
-            layer_in = y;
+            let s = cell.step_state(&layer_in, state)?;
+            layer_in = s.output().clone();
             next.push(s);
         }
         Ok((layer_in, next))
@@ -374,29 +427,49 @@ impl<C: RecurrentCell> RnnStack<C> {
 
 /// Run one direction over a pre-projected sequence `gx [T, B, G*H]`.
 ///
-/// Every step builds a structurally identical graph, differing only in the
-/// constant time offset of its input slice.
-fn run_direction<C: RecurrentCell>(
+/// The step graph is built **once**, with the time index a
+/// [`ScanVar`](crate::scan::ScanVar) that appears only as an additive offset
+/// into `gx` and into the state history, so every axis extent stays constant
+/// and the compiled step is re-launched `t_len` times by the schedule loop
+/// [`wrap_scan_loops`](crate::scan::wrap_scan_loops) installs.
+///
+/// Each state part lives in its own `[T + 1, B, H]` history buffer: slot `0`
+/// is the initial state, slot `i + 1` the state after step `i`. Reading slot
+/// `t` and writing slot `t + 1` keeps the recurrence inside one buffer, and
+/// the history of the [`ScanState::output`] part doubles as the output
+/// sequence.
+pub(crate) fn run_direction<C: RecurrentCell>(
     cell: &C,
     gx: &Tensor,
     t_len: usize,
     init: C::State,
     reverse: bool,
 ) -> Result<(Tensor, C::State)> {
-    let mut state = init;
-    let mut outs = Vec::with_capacity(t_len);
-    for i in 0..t_len {
-        let t = if reverse { t_len - 1 - i } else { i };
-        let gx_t = gx.narrow(0, t, 1usize)?.try_squeeze(Some(0))?;
-        let (y, next) = cell.step_projected(&gx_t, &state)?;
-        state = next;
-        outs.push(y);
+    let scan = ScanVar::new(t_len);
+    let t = scan.index();
+    let device = gx.device();
+    // The histories live where the sequence does, whatever the process default
+    // is; a state supplied on another device is copied in.
+    let hist = init.try_map(|p| {
+        let mut dims = vec![SInt::Const(t_len + 1)];
+        dims.extend(p.shape()?);
+        let buf =
+            svod_dtype::default_device::with_default_device(device.clone(), || Tensor::empty_dynamic(&dims, p.dtype()));
+        buf.narrow(0, 0usize, 1usize)?.try_assign(&p.to(device.clone()).try_unsqueeze(0)?)?;
+        Ok(buf)
+    })?;
+    let state_at = |at: SInt| hist.try_map(|buf| buf.narrow(0, at.clone(), 1usize)?.try_squeeze(Some(0)));
+
+    let gx = if reverse { gx.flip(&[0])? } else { gx.clone() };
+    let gx_t = gx.narrow(0, t.clone(), 1usize)?.try_squeeze(Some(0))?;
+    let next = cell.step_projected(&gx_t, &state_at(t.clone())?)?;
+    for (buf, part) in hist.parts().as_ref().iter().zip(next.parts().as_ref()) {
+        buf.narrow(0, &t + 1usize, 1usize)?.try_assign(&part.try_unsqueeze(0)?)?;
     }
-    if reverse {
-        outs.reverse();
-    }
-    let refs: Vec<&Tensor> = outs.iter().collect();
-    Ok((Tensor::stack(&refs, 0)?, state))
+
+    let seq = hist.output().narrow(0, 1usize, t_len)?;
+    let seq = if reverse { seq.flip(&[0])? } else { seq };
+    Ok((seq, state_at(SInt::Const(t_len))?))
 }
 
 /// Drive `cells` (one per direction) over `x [T, B, I]`, returning
@@ -416,7 +489,11 @@ fn run_sequence<C: RecurrentCell>(
     let mut seqs = Vec::with_capacity(cells.len());
     let mut finals = Vec::with_capacity(cells.len());
     for (d, cell) in cells.iter().enumerate() {
-        let gx = cell.project_input(x)?;
+        // Materialize the projection: with the time index symbolic there is only
+        // one slice expression, and rangeify would otherwise sink `x @ W_ih^T`
+        // into the step, fissioning it into `T` one-row launches that lose the
+        // cross-time tiling (same FLOPs, 1.4-1.6x slower at I = H = 256).
+        let gx = cell.project_input(x)?.contiguous();
         let (seq, state) = run_direction(cell, &gx, t_len, init[d].clone(), direction.is_reverse(d))?;
         seqs.push(seq);
         finals.push(state);
@@ -460,12 +537,15 @@ struct RnnWeights {
 }
 
 /// Reorder gate blocks along dim 0: `order[j]` is the source block for slot `j`.
+///
+/// Materialized: the reordered weight is loop-invariant, and as a bare `cat`
+/// rangeify would sink it into the step body and split the gate axis there.
 fn reorder_gates(t: &Tensor, block: usize, order: &[usize]) -> Result<Tensor> {
     if order.iter().enumerate().all(|(j, &i)| j == i) {
         return Ok(t.clone());
     }
     let parts = order.iter().map(|&i| t.narrow(0, i * block, block)).collect::<Result<Vec<_>>>()?;
-    Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)
+    Ok(Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)?.contiguous())
 }
 
 /// Split a `[D, ...]`-normalized tensor into its per-direction slices.
