@@ -10,6 +10,7 @@ use svod_ir::uop::{reaching, reaching_each};
 use svod_ir::{AxisId, AxisType, BinaryOp, Op, TernaryOp, UOp};
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
+use crate::optimizer::renderer::{TcTilePolicy, TensorCore};
 use crate::optimizer::tc::matmul_operands;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 use svod_ir::ops;
@@ -52,6 +53,11 @@ fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
         Op::Range(ops::Range { end, .. }) => const_int(end).filter(|&size| size > 0).map(|size| size as usize),
         _ => None,
     }
+}
+
+/// Product of the constant extents of every axis of `axis_type`.
+fn extent_product(scheduler: &Scheduler, axis_type: AxisType) -> usize {
+    scheduler.ranges_of(&[axis_type]).iter().filter_map(const_extent).product::<usize>().max(1)
 }
 
 /// LOCAL size for a global axis none of the standard sizes divides, with the
@@ -1257,11 +1263,139 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
     applied
 }
 
+/// Factors a post-TC UPCAST may grow the warp tile by, best first.
+///
+/// Tinygrad's `[5, 4, 3, 2]` ladder extended to 8, the widest UPCAST a GPU
+/// renderer accepts, so a lane can reach a square tile on an `m16n8` core.
+const TC_GROWTH_FACTORS: [usize; 5] = [8, 5, 4, 3, 2];
+
+/// Warp tiles a grid keeps before a wider per-warp tile stops paying for
+/// itself. Doubling the tile halves the warps, and a grid that no longer covers
+/// the device's multiprocessors loses more than the operand traffic the wider
+/// tile saves. The heuristic cannot see the multiprocessor count, so this is a
+/// floor and not a target: it only bites on outputs small enough that the full
+/// register budget would leave a few dozen warps for the whole GPU.
+const TC_MIN_WARP_TILES: usize = 192;
+
+/// Post-TC growth `(m, n)` for the per-warp output tile, in tensor-core tiles.
+///
+/// [`tc::apply`](crate::optimizer::tc) leaves one warp computing the
+/// instruction's own `dims.1 x dims.0` (M x N) tile with `tc.lane_tile()`
+/// accumulators per lane. The post-TC UPCASTs multiply that tile; three limits
+/// bound how far, and the tightest wins:
+///
+/// * `budget` — accumulators a lane may hold ([`TcTilePolicy::LaneBudget`]);
+/// * `tiles / TC_MIN_WARP_TILES` — a wider tile means fewer warps, and a grid
+///   that no longer covers the multiprocessors costs more than it saves;
+/// * `k_tiles` — the accumulator is set up and written back once per K loop, so
+///   a reduction with few steps cannot amortise a lane full of them.
+///
+/// `upcast_max` then caps each single UPCAST, which also keeps the recorded
+/// [`Opt`] replayable.
+///
+/// Within those the growth is split so the warp tile comes out square: a
+/// `Wm x Wn` tile reads `(Wm + Wn) * K` operand elements for `Wm * Wn * K`
+/// MACs, and here the operands are read straight from global memory — there is
+/// no shared-memory stage to amortise a lopsided tile — so the square tile
+/// moves the least memory per flop. M is grown first, so the remainder left by
+/// an M extent that does not divide is spent on N.
+fn tc_warp_tile_growth(
+    tc: &TensorCore,
+    budget: usize,
+    upcast_max: usize,
+    tiles: usize,
+    [m_tiles, n_tiles, k_tiles]: [usize; 3],
+) -> (usize, usize) {
+    let growth = (budget / tc.lane_tile()).min(tiles / TC_MIN_WARP_TILES).min(k_tiles).max(1);
+    // Square tile: dims.1 * m == dims.0 * n with m * n == growth, so
+    // m == sqrt(growth * dims.0 / dims.1), rounded up (M is the longer side of
+    // an `m16n8` tile, so rounding down would spend the whole budget on N).
+    let square = (growth * tc.dims.0).div_ceil(tc.dims.1);
+    let m_cap = square.isqrt() + usize::from(square.isqrt().pow(2) < square);
+    let grow = |extent: usize, cap: usize| {
+        TC_GROWTH_FACTORS.into_iter().find(|&f| f <= cap && extent.is_multiple_of(f)).unwrap_or(1)
+    };
+    let m = grow(m_tiles, m_cap.min(upcast_max));
+    (m, grow(n_tiles, (growth / m).min(upcast_max)))
+}
+
+/// Split `rngs[dim]` (`0` = N, `1` = M) by `sz`, recording the opt.
+fn tc_split(scheduler: &mut Scheduler, rngs: &mut [Arc<UOp>; 2], dim: usize, sz: usize, new_type: AxisType) {
+    let Some(idx) = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &rngs[dim])) else { return };
+    let Ok((replaced, _)) = scheduler.shift_to(rngs[dim].clone(), sz, new_type, false, None) else { return };
+    scheduler.applied_opts.push(if new_type == AxisType::Upcast { Opt::upcast(idx, sz) } else { Opt::local(idx, sz) });
+    rngs[dim] = replaced;
+}
+
+/// Whether `rng`'s extent divides by `sz`.
+fn divides(rng: &Arc<UOp>, sz: usize) -> bool {
+    matches!(rng.op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
+}
+
+/// Tile the matmul left over by [`tc::apply`](crate::optimizer::tc) across
+/// warps and blocks, following the renderer's [`TcTilePolicy`]. `axes` is the
+/// `[N, M, K]` the tensor core returned.
+fn apply_tc_tiling(scheduler: &mut Scheduler, axes: &[Arc<UOp>; 3]) {
+    let mut rngs = [axes[0].clone(), axes[1].clone()];
+    let tc = scheduler.renderer().tensor_cores[scheduler.selected_tc_index.unwrap_or(0)].clone();
+
+    match scheduler.renderer().tc_tile_policy() {
+        TcTilePolicy::FixedStep => {
+            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2].
+            for dim in [1usize, 0] {
+                for &sz in &[5usize, 4, 3, 2] {
+                    if divides(&rngs[dim], sz) {
+                        tc_split(scheduler, &mut rngs, dim, sz, AxisType::Upcast);
+                        break;
+                    }
+                }
+            }
+            // LOCAL N (dim=0) with factors [4,2].
+            if scheduler.renderer().has_local {
+                for &sz in &[4usize, 2] {
+                    if divides(&rngs[0], sz) {
+                        tc_split(scheduler, &mut rngs, 0, sz, AxisType::Local);
+                        break;
+                    }
+                }
+            }
+        }
+        TcTilePolicy::LaneBudget { accum_max } => {
+            let (m_grow, n_grow) = tc_warp_tile_growth(
+                &tc,
+                accum_max,
+                scheduler.renderer().upcast_max,
+                extent_product(scheduler, AxisType::Global),
+                [
+                    const_extent(&rngs[1]).unwrap_or(1),
+                    const_extent(&rngs[0]).unwrap_or(1),
+                    const_extent(&axes[2]).unwrap_or(1),
+                ],
+            );
+            for (dim, sz) in [(1usize, m_grow), (0, n_grow)] {
+                if sz > 1 {
+                    tc_split(scheduler, &mut rngs, dim, sz, AxisType::Upcast);
+                }
+            }
+
+            // Stack warps into a block only up to one wave: the fragments come
+            // straight from global memory, so past the wave a block of several
+            // warps shares nothing and the split only coarsens the grid. A
+            // tensor core narrower than the wave (Intel Xe issues its DPAS
+            // across 8 lanes) still needs its warps stacked to fill one.
+            let per_block = scheduler.renderer().wave_size() / tc.threads.max(1);
+            if scheduler.renderer().has_local && per_block > 1 && divides(&rngs[0], per_block) {
+                tc_split(scheduler, &mut rngs, 0, per_block, AxisType::Local);
+            }
+        }
+    }
+}
+
 /// Tensor core optimization for matmul patterns.
 ///
 /// - Guard: skip when >1 reduce axis under [`TcOpt::Strict`]
 /// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
-/// - Post-TC: UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
+/// - Post-TC: tile across warps and blocks ([`apply_tc_tiling`])
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use crate::optimizer::config::TcUsage;
     use crate::optimizer::tc;
@@ -1339,42 +1473,7 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         );
         trial.applied_opts.push(opt);
 
-        // Post-TC extras: UPCAST M/N then LOCAL N.
-        {
-            let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
-
-            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
-            for tc_dim in [1usize, 0] {
-                for &sz in &[5usize, 4, 3, 2] {
-                    if matches!(tc_rngs[tc_dim].op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
-                    {
-                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
-                            && let Ok((replaced, _)) =
-                                trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
-                        {
-                            trial.applied_opts.push(Opt::upcast(rng_idx, sz));
-                            tc_rngs[tc_dim] = replaced;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // LOCAL N (dim=0) with factors [4,2]
-            if trial.renderer().has_local {
-                for &sz in &[4usize, 2] {
-                    if matches!(tc_rngs[0].op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
-                    {
-                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
-                            && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
-                        {
-                            trial.applied_opts.push(Opt::local(rng_idx, sz));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        apply_tc_tiling(&mut trial, &axes);
 
         *scheduler = trial;
         return true;

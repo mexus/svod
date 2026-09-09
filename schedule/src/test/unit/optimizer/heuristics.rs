@@ -9,6 +9,7 @@ use crate::optimizer::heuristics::{
     apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_local_dims, apply_matvec_fast_path,
     apply_threading, try_grouped_reduction, try_tensor_cores, try_warp_row_reduction,
 };
+use crate::optimizer::renderer::TcTilePolicy;
 use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
 use crate::test::helpers::{create_conv_like_pattern, create_matmul_pattern_with, create_typed_matmul_pattern};
 use svod_ir::ops;
@@ -127,6 +128,157 @@ fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_op
         vec![(AxisType::Reduce, leftover)],
         "the other reduce axis must survive as a loop around the WMMA"
     );
+}
+
+/// `C[m,n] = sum_k f32(A[m,k] * B[k,n])` over f16 buffers — the mixed-precision
+/// shape every tensor-core renderer offers (CDNA and Intel Xe offer only that).
+fn create_mixed_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
+    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+    let load = |numel: i64, row: &Arc<UOp>, stride: i64, col: &Arc<UOp>| {
+        let buffer = UOp::new_buffer(DeviceSpec::Cpu, numel as usize, DType::Float16);
+        let index = row.try_mul(&UOp::index_const(stride)).and_then(|x| x.try_add(col)).expect("index should build");
+        UOp::index().buffer(buffer).indices(vec![index]).call().expect("load should build")
+    };
+    let a = load(m * k, &m_range, k, &k_range);
+    let b = load(k * n, &k_range, n, &n_range);
+    let product = a.try_mul(&b).expect("mul should succeed").cast(DType::Float32);
+    let reduce = product.reduce(smallvec::smallvec![k_range], ReduceOp::Add);
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
+/// The post-TC opt sequence a matmul gets on `renderer`, as `(op, axis, arg)`.
+fn tc_plan(m: i64, n: i64, k: i64, renderer: Renderer) -> Vec<(OptOps, Option<usize>, svod_ir::OptArg)> {
+    let sink = create_mixed_matmul_pattern(m, n, k);
+    let mut scheduler = Scheduler::new(sink, renderer);
+    assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()));
+    scheduler
+        .applied_opts
+        .iter()
+        .filter(|opt| opt.op != OptOps::TC)
+        .map(|opt| (opt.op, opt.axis, opt.arg.clone()))
+        .collect()
+}
+
+/// `(op, arg)` shorthand for a post-TC UPCAST/LOCAL on axis `axis`.
+fn opt(op: OptOps, axis: usize, arg: usize) -> (OptOps, Option<usize>, svod_ir::OptArg) {
+    (op, Some(axis), svod_ir::OptArg::Int(arg))
+}
+
+/// The CUDA `m16n8k16` core holds four accumulators per lane, and the lane
+/// budget is 128, so a GEMM with work to spare grows its warp tile 32-fold —
+/// split 4 (M) by 8 (N) to land on a square 64x64 tile — and stops there. Axis
+/// 0 is the leftover M range, axis 1 the leftover N range; a warp already fills
+/// a CUDA block, so no LOCAL follows.
+#[test_case(8192, 3072, 768, &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 8)]; "gigaam 768 to 3072 projection")]
+#[test_case(8192, 768, 3072, &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 8)]; "gigaam 3072 to 768 projection")]
+#[test_case(8192, 48, 768, &[(OptOps::UPCAST, 0, 2), (OptOps::UPCAST, 1, 3)]; "narrow output spends the budget on M")]
+#[test_case(8192, 768, 320, &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4)]; "short reduce cannot amortise a wider tile")]
+#[test_case(256, 768, 768, &[(OptOps::UPCAST, 0, 2), (OptOps::UPCAST, 1, 4)]; "small output keeps warps over the tile")]
+#[test_case(64, 64, 64, &[]; "an output of 32 warp tiles is not worth growing")]
+fn cuda_tensor_core_warp_tile(m: i64, n: i64, k: i64, expected: &[(OptOps, usize, usize)]) {
+    let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
+    assert_eq!(tc_plan(m, n, k, Renderer::cuda()), expected);
+}
+
+/// Every target off CUDA keeps [`TcTilePolicy::FixedStep`], tinygrad's step:
+/// UPCAST M then N by the first of `[5, 4, 3, 2]` that divides, then LOCAL N by
+/// the first of `[4, 2]`. This pins the AMD and Metal codegen, which cannot be
+/// measured here, byte for byte against the sequence that shipped.
+#[test_case(Renderer::amd_rdna3(); "rdna3 wmma")]
+#[test_case(Renderer::amd_rdna4(); "rdna4 wmma")]
+#[test_case(Renderer::amd_cdna3(); "cdna3 mfma")]
+#[test_case(Renderer::amd_cdna4(); "cdna4 mfma")]
+#[test_case(Renderer::metal(); "metal simdgroup")]
+#[test_case(Renderer::intel_xe(); "intel xe dpas")]
+fn non_cuda_tensor_core_tiling_is_the_fixed_step(renderer: Renderer) {
+    assert_eq!(renderer.tc_tile_policy(), TcTilePolicy::FixedStep);
+    let expected = [opt(OptOps::UPCAST, 0, 4), opt(OptOps::UPCAST, 1, 4), opt(OptOps::LOCAL, 1, 4)];
+    assert_eq!(tc_plan(8192, 3072, 768, renderer), expected);
+}
+
+/// The post-TC sequence as it stood before [`TcTilePolicy`] existed,
+/// transcribed from that code: UPCAST M then N by the first of `[5, 4, 3, 2]`
+/// that divides the leftover tile count, then LOCAL N by the first of
+/// `[4, 2]`. Axis numbering follows `rngs()`, which drops an axis the moment it
+/// collapses to one tile — so N slides to index 0 once M is fully consumed.
+fn fixed_step_reference(
+    m: i64,
+    n: i64,
+    dims: (usize, usize),
+    has_local: bool,
+) -> Vec<(OptOps, Option<usize>, svod_ir::OptArg)> {
+    let first = |extent: usize, ladder: &[usize]| ladder.iter().copied().find(|f| extent.is_multiple_of(*f));
+    let (mut m_tiles, mut n_tiles) = (m as usize / dims.1, n as usize / dims.0);
+    let mut plan = Vec::new();
+    if m_tiles > 1
+        && let Some(factor) = first(m_tiles, &[5, 4, 3, 2])
+    {
+        plan.push(opt(OptOps::UPCAST, 0, factor));
+        m_tiles /= factor;
+    }
+    let n_axis = usize::from(m_tiles > 1);
+    if n_tiles > 1
+        && let Some(factor) = first(n_tiles, &[5, 4, 3, 2])
+    {
+        plan.push(opt(OptOps::UPCAST, n_axis, factor));
+        n_tiles /= factor;
+    }
+    if has_local
+        && n_tiles > 1
+        && let Some(factor) = first(n_tiles, &[4, 2])
+    {
+        plan.push(opt(OptOps::LOCAL, n_axis, factor));
+    }
+    plan
+}
+
+/// Every non-CUDA renderer reproduces [`fixed_step_reference`] exactly, on
+/// every shape — including the ones where the ladder's odd 5 and 3 win and the
+/// ones where an axis collapses and renumbers the next. This is the guard that
+/// the lane-budget rule left AMD, Metal and Intel codegen untouched.
+#[test_case(Renderer::amd_rdna3(), (16, 16); "rdna3 wmma")]
+#[test_case(Renderer::amd_rdna4(), (16, 16); "rdna4 wmma")]
+#[test_case(Renderer::amd_cdna3(), (16, 16); "cdna3 mfma")]
+#[test_case(Renderer::amd_cdna4(), (16, 16); "cdna4 mfma")]
+#[test_case(Renderer::metal(), (8, 8); "metal simdgroup")]
+#[test_case(Renderer::intel_xe(), (8, 8); "intel xe dpas")]
+fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usize, usize)) {
+    assert_eq!(renderer.tc_tile_policy(), TcTilePolicy::FixedStep);
+    for m in [256i64, 1024, 8192] {
+        for n in [48i64, 320, 768, 1536, 3072] {
+            for k in [320i64, 768, 3072] {
+                assert_eq!(
+                    tc_plan(m, n, k, renderer.clone()),
+                    fixed_step_reference(m, n, dims, renderer.has_local),
+                    "{m}x{n}x{k}"
+                );
+            }
+        }
+    }
+}
+
+/// A wider warp tile must never record an UPCAST the renderer would refuse to
+/// replay: beam's cache and `opts_to_apply` both re-apply the recorded list
+/// through `apply_opt`, which rejects an amount over `upcast_max`.
+///
+/// Only [`TcTilePolicy::LaneBudget`] is held to this. The fixed step opens its
+/// ladder at 5 without consulting `upcast_max`, so a 320-wide N already records
+/// an unreplayable `UPCAST 5` on Metal (`upcast_max` 4); that predates this
+/// policy and fixing it would change Metal codegen this machine cannot measure.
+#[test_case(8192, 3072, 768; "gigaam projection")]
+#[test_case(8192, 768, 3072; "wide reduce")]
+#[test_case(1024, 320, 768; "an N the odd factors reach for")]
+#[test_case(256, 768, 768; "small output")]
+fn lane_budget_warp_tile_stays_replayable(m: i64, n: i64, k: i64) {
+    let renderer = Renderer::cuda();
+    assert!(matches!(renderer.tc_tile_policy(), TcTilePolicy::LaneBudget { .. }));
+    let upcast_max = renderer.upcast_max;
+    for (op, _, arg) in tc_plan(m, n, k, renderer) {
+        let svod_ir::OptArg::Int(amount) = arg else { panic!("post-TC opts carry Int args") };
+        assert!(op != OptOps::UPCAST || amount <= upcast_max, "{m}x{n}x{k}: UPCAST {amount} > {upcast_max}");
+    }
 }
 
 /// The default level changes nothing for a single-reduce matmul: the same
