@@ -48,6 +48,16 @@ fn padded_encoder_plan_has_one_flash_attention_per_block() {
     assert_eq!(out.dims().unwrap(), [1, 1500, 128]);
 
     let plan = out.prepare().unwrap();
-    let flash_attention = plan.kernels().filter(|kernel| kernel.entry_point == "flash_attention").count();
+    // `unique_kernel_name` suffixes the n-th kernel sharing a name with `n{n-1}`
+    // from a PROCESS-wide counter, so whether these dispatches are named
+    // `flash_attention` or `flash_attentionn7` depends on what else the test
+    // binary compiled first. Match the base name, not the whole entry point.
+    let is_flash_attention = |entry: &str| {
+        entry.strip_prefix("flash_attention").is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.strip_prefix('n').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+    };
+    let flash_attention = plan.kernels().filter(|kernel| is_flash_attention(&kernel.entry_point)).count();
     assert_eq!(flash_attention, 32, "expected one handwritten flash-attention dispatch per encoder block");
 }
