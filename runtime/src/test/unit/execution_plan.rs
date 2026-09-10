@@ -1441,3 +1441,62 @@ fn declare_input_rejects_out_of_range_index() {
     let err = plan.declare_input(99).expect_err("out-of-range input index must fail loud");
     assert!(err.to_string().contains("out of range"), "{err}");
 }
+
+// ── graph hazard analysis ──────────────────────────────────────────────────
+
+/// The whole point of [`GraphHazards`]: buffers that share an allocation are
+/// distinguished by their *address*, so a producer covering a whole arena and a
+/// consumer reading a 12-byte view inside it compare unequal. Keying the walk on
+/// the address alone emitted no edge, and the captured graph — which runs
+/// unordered nodes concurrently — then raced them.
+#[test]
+fn overlapping_views_of_one_allocation_are_ordered() {
+    let arena = 0x1000usize;
+    let whole = arena..arena + 4096;
+    let view = arena + 512..arena + 524;
+    let mut hazards = GraphHazards::default();
+
+    // 0: fills the whole arena.
+    assert!(hazards.record(0, &[], std::slice::from_ref(&whole)).is_empty());
+    // 1: reads a 12-byte view inside 0's write, at a different address.
+    assert_eq!(hazards.record(1, std::slice::from_ref(&view), &[]), vec![0], "RAW inside a covering write");
+    // 2: overwrites that same view — WAW against 0, WAR against 1.
+    assert_eq!(hazards.record(2, &[], std::slice::from_ref(&view)), vec![0, 1], "WAW/WAR inside a covering write");
+    // 3: re-reads the whole arena — sees both the covering write and the patch.
+    assert_eq!(hazards.record(3, std::slice::from_ref(&whole), &[]), vec![0, 2], "a covering read sees every writer");
+}
+
+#[test]
+fn disjoint_views_of_one_allocation_stay_independent() {
+    let arena = 0x1000usize;
+    let (low, high) = (arena..arena + 64, arena + 64..arena + 128);
+    let mut hazards = GraphHazards::default();
+    assert!(hazards.record(0, &[], std::slice::from_ref(&low)).is_empty());
+    let adjacent = hazards.record(1, &[], std::slice::from_ref(&high));
+    assert!(adjacent.is_empty(), "adjacent ranges must not serialize");
+    assert_eq!(hazards.record(2, std::slice::from_ref(&high), &[]), vec![1]);
+}
+
+/// A write that fully covers an earlier access supersedes it: later overlapping
+/// accesses reach the dropped kernel through the covering write.
+#[test]
+fn a_covering_write_supersedes_the_accesses_beneath_it() {
+    let base = 0x2000usize;
+    let (small, large) = (base..base + 16, base..base + 64);
+    let mut hazards = GraphHazards::default();
+    hazards.record(0, &[], std::slice::from_ref(&small));
+    hazards.record(1, std::slice::from_ref(&small), &[]);
+    let covering = hazards.record(2, &[], std::slice::from_ref(&large));
+    assert_eq!(covering, vec![0, 1], "the covering write depends on both");
+    assert_eq!(hazards.record(3, std::slice::from_ref(&small), &[]), vec![2], "and then stands in for them");
+}
+
+/// Zero-length views touch no bytes, so they never conflict.
+#[test]
+fn empty_ranges_never_conflict() {
+    let base = 0x3000usize;
+    let (live, empty) = (base..base + 32, base..base);
+    let mut hazards = GraphHazards::default();
+    hazards.record(0, &[], std::slice::from_ref(&live));
+    assert!(hazards.record(1, std::slice::from_ref(&empty), &[]).is_empty());
+}

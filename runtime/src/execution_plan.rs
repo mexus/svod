@@ -26,6 +26,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -209,6 +210,69 @@ impl PreparedKernel {
             self.buffer_indices.len()
         );
         (0..self.buffer_indices.len()).filter(|position| !self.output_indices.contains(position))
+    }
+}
+
+/// The RAW/WAW/WAR dependencies a captured graph's kernel nodes need, over the
+/// BYTE RANGES its kernels touch.
+///
+/// A captured graph exists to overlap the kernels its edges leave unordered, so
+/// it is the edges — not the submission order — that keep a producer ahead of
+/// its consumer. Buffer *identity* cannot supply them: the memory planner packs
+/// level-disjoint buffers into one allocation, and a view carries its offset in
+/// its address, so one storage backs many differently-addressed views.
+///
+/// The invariant this type exists to hold is therefore: **two accesses conflict
+/// when their byte ranges intersect, not when their addresses are equal.** A
+/// 12-byte view at offset 512 of an arena and the 40 KiB write that covers the
+/// whole arena compare unequal but overlap completely; keying on the address
+/// alone emitted no edge between them, and the graph then ran the writer and the
+/// reader concurrently. That corrupted only the FIRST execute of a plan (a
+/// replay finds the buffer already holding the value the racing writer produces)
+/// and only when the device was busy enough for the two to actually overlap —
+/// a rare, load-dependent divergence that vanished on replay.
+///
+/// Records are pruned by a write that fully covers them: a later access
+/// overlapping a dropped range also overlaps that write, so it still reaches the
+/// dropped kernel transitively. With exactly-aliased ranges the whole walk
+/// reduces to a last-writer table plus a reader list per address.
+#[derive(Default)]
+struct GraphHazards {
+    /// `(range, kernel)` of every write not yet fully covered by a later one.
+    writers: Vec<(Range<usize>, usize)>,
+    /// `(range, kernel)` of every read since the write that last covered it.
+    readers: Vec<(Range<usize>, usize)>,
+}
+
+impl GraphHazards {
+    fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+        a.start < b.end && b.start < a.end
+    }
+
+    /// The sorted, deduplicated predecessors of kernel `e`, which then becomes
+    /// the recorded reader of `reads` and writer of `writes`.
+    fn record(&mut self, e: usize, reads: &[Range<usize>], writes: &[Range<usize>]) -> Vec<usize> {
+        let mut deps: HashSet<usize> = HashSet::new();
+        // RAW for a read, WAW for a write.
+        for touched in reads.iter().chain(writes) {
+            deps.extend(self.writers.iter().filter(|(range, _)| Self::overlaps(range, touched)).map(|&(_, w)| w));
+        }
+        for written in writes {
+            deps.extend(self.readers.iter().filter(|(range, _)| Self::overlaps(range, written)).map(|&(_, r)| r));
+        }
+        deps.remove(&e);
+
+        self.readers.extend(reads.iter().cloned().map(|range| (range, e)));
+        for written in writes {
+            let covered = |(range, _): &(Range<usize>, usize)| written.start <= range.start && range.end <= written.end;
+            self.writers.retain(|access| !covered(access));
+            self.readers.retain(|access| !covered(access));
+            self.writers.push((written.clone(), e));
+        }
+
+        let mut deps: Vec<usize> = deps.into_iter().collect();
+        deps.sort_unstable();
+        deps
     }
 }
 
@@ -813,19 +877,13 @@ impl ExecutionPlan {
         // (e.g. multi-kernel decompositions like QR).
         // Walk the emission order (level-by-level, intra-level index order) once,
         // building the GraphKernel list AND a parallel hazard-dependency list in
-        // lock-step. Hazards are keyed on the RESOLVED buffer GVA (`buffer_ptrs`),
-        // not buffer ids: the memory planner aliases distinct logical buffers onto
-        // one GVA, so a GVA-keyed walk catches the WAR/WAW the logical
-        // `dependencies` field misses. For each emitted kernel `e`:
-        //   reads  = buffer_ptrs[j] for j NOT in output_indices
-        //   writes = buffer_ptrs[j] for j     in output_indices
-        //   deps   = last_writer[read]  (RAW)
-        //          ∪ last_writer[write] (WAW) ∪ readers[write] (WAR)
-        // then update: readers[read].push(e); for each write set last_writer=e and
-        // clear readers (a fresh writer; future readers depend on it via RAW).
+        // lock-step ([`GraphHazards`], which documents the analysis). Reads are
+        // the buffers outside `output_indices`, writes those inside it; both are
+        // resolved to the byte range the kernel actually touches
+        // (`device_address() .. + size()`).
         //
         // Soundness rests on `output_indices` being the COMPLETE write-set: a
-        // missed write would leave no last_writer and (BARRIER stripped) race a
+        // missed write would leave no writer and (BARRIER stripped) race a
         // later reader. That holds here by construction — `output_indices` is
         // derived from the kernel's STORE targets (`ProgramSpec.outs`) and a
         // compiled kernel writes only via STOREs, and this walk only processes
@@ -833,8 +891,7 @@ impl ExecutionPlan {
         // functions / copies are not graphed, so the invariant is not relied on
         // for them.
         let mut kernels = Vec::with_capacity(self.ops.len());
-        let mut last_writer: HashMap<usize, usize> = HashMap::new();
-        let mut readers: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut hazards = GraphHazards::default();
         for level in &self.op_levels {
             for &idx in level {
                 let PreparedOp::CompiledProgram(k) = &self.ops[idx] else { return Ok(None) };
@@ -851,36 +908,15 @@ impl ExecutionPlan {
                             .map(|address| address as usize)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let writes: Vec<usize> =
-                    k.output_indices.iter().filter_map(|&j| current_addresses.get(j).copied()).collect();
-                let reads: Vec<usize> = k.read_positions().filter_map(|j| current_addresses.get(j).copied()).collect();
-
-                let mut deps: std::collections::HashSet<usize> = std::collections::HashSet::new();
-                for &b in &reads {
-                    if let Some(&w) = last_writer.get(&b) {
-                        deps.insert(w); // RAW
-                    }
-                }
-                for &b in &writes {
-                    if let Some(&w) = last_writer.get(&b) {
-                        deps.insert(w); // WAW
-                    }
-                    if let Some(rs) = readers.get(&b) {
-                        deps.extend(rs.iter().copied()); // WAR
-                    }
-                }
-                deps.remove(&e);
-                let mut deps: Vec<usize> = deps.into_iter().collect();
-                deps.sort_unstable();
-
-                // Commit this kernel's effect on the hazard state.
-                for &b in &reads {
-                    readers.entry(b).or_default().push(e);
-                }
-                for &b in &writes {
-                    last_writer.insert(b, e);
-                    readers.insert(b, Vec::new());
-                }
+                // A zero-length view touches no bytes and can race with nothing.
+                let range_at = |j: usize| -> Option<Range<usize>> {
+                    let address = current_addresses.get(j).copied()?;
+                    let size = self.buffers[*k.buffer_indices.get(j)?].size();
+                    (size > 0).then(|| address..address + size)
+                };
+                let writes: Vec<Range<usize>> = k.output_indices.iter().filter_map(|&j| range_at(j)).collect();
+                let reads: Vec<Range<usize>> = k.read_positions().filter_map(range_at).collect();
+                let deps = hazards.record(e, &reads, &writes);
 
                 kernels.push(svod_device::GraphKernel {
                     program: k.kernel.program.as_ref(),
