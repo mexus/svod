@@ -733,6 +733,85 @@ fn test_matmul_bench_cuda() {
     }
 }
 
+/// Per-dispatch time and TFLOP/s of the resolved arch's bf16 matmul config at
+/// N = 2048 / 4096 — the roofline reference for "is our GEMM leaving anything on the
+/// table". Unlike [`test_matmul_bench_cuda`] this runs on whatever fragment device is
+/// selected, and every [`MatmulCfg`] field is env-overridable (`MM_BLOCK`, `MM_WR`,
+/// `MM_WC`, `MM_ACC`, `MM_SWZ`, `MM_VEC`, `MM_K`) so a config can be swept without a
+/// rebuild — how `METAL_CFG`'s `k_step` was tuned. Prefer N=4096: smaller sizes are
+/// cache-resident and show clock-state bimodality, so they read several TFLOP/s apart
+/// run to run.
+/// `MM_K=16 SVOD_DEVICE=METAL:0 cargo test -p svod-tk --lib matmul::test_matmul_bench_gpu -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn test_matmul_bench_gpu() {
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip test_matmul_bench_gpu: no fragment device");
+        return;
+    };
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_bench_gpu: matmul unsupported here");
+        return;
+    }
+    let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    for n in [2048usize, 4096] {
+        let base = cfg_for_arch(caps.arch, n);
+        let cfg = crate::kernels::matmul::MatmulCfg {
+            block: envu("MM_BLOCK", base.block),
+            wave_rows: envu("MM_WR", base.wave_rows),
+            wave_cols: envu("MM_WC", base.wave_cols),
+            n_accum: envu("MM_ACC", base.n_accum),
+            l2_swizzle: envu("MM_SWZ", base.l2_swizzle as usize) != 0,
+            vec_load: envu("MM_VEC", base.vec_load as usize) != 0,
+            k_step: envu("MM_K", base.k_step),
+        };
+        let (a, b) = matmul_inputs(n);
+        let mut c = Tensor::empty(&[n, n], DType::Float32);
+        let compiled = crate::compile_kernel(
+            "matmul_bench",
+            cfg.grid_dims(n),
+            cfg.threads(caps.wave_size),
+            &mut [&mut c],
+            &[&a, &b],
+            |ker| {
+                build_matmul_cfg(ker, n, cfg);
+                ker.finish(cfg.n_accum)
+            },
+        )
+        .expect("compile");
+        // GPU stamps need the graph-replay path; a lone dispatch may be unstamped
+        // (Metal), so fall back to host wall time — these kernels are ms-scale.
+        for _ in 0..3 {
+            unsafe { compiled.dispatch(true) }.expect("warmup");
+        }
+        let mut us: Vec<f64> = (0..12)
+            .map(|_| match compiled.dispatch_gpu_ns().expect("dispatch") {
+                Some(ns) => ns as f64 / 1e3,
+                None => {
+                    let t = std::time::Instant::now();
+                    unsafe { compiled.dispatch(true) }.expect("dispatch");
+                    t.elapsed().as_secs_f64() * 1e6
+                }
+            })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        let median = us[us.len() / 2];
+        let tflops = 2.0 * (n as f64).powi(3) / (median * 1e-6) / 1e12;
+        println!(
+            "matmul[{}] N={n} blk={} wr={} wc={} acc={} k={} vec={}: median {median:.1} us = {tflops:.2} TFLOP/s (best {:.1} us = {:.2})",
+            caps.arch.target_name(),
+            cfg.block,
+            cfg.wave_rows,
+            cfg.wave_cols,
+            cfg.n_accum,
+            cfg.k_step,
+            cfg.vec_load,
+            us[0],
+            2.0 * (n as f64).powi(3) / (us[0] * 1e-6) / 1e12
+        );
+    }
+}
+
 /// `mma_AB` reads B as a `[k,n]` (`Col`) tile; a `Row` tile would be
 /// multiplied transposed, so the plan refuses it at build time. GPU-free.
 #[test]

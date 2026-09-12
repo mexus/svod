@@ -137,11 +137,17 @@ pub const SM80_SMALL_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
 /// Apple7+ (`simdgroup_matrix`, SIMD-group 32) config: 64x64 block, 2x2 waves
-/// (128 threads), one 32x32 accumulator/wave, `k_step = 32`. `vec_load` is **off**:
+/// (128 threads), one 32x32 accumulator/wave, `k_step = 16`. `vec_load` is **off**:
 /// the 128-bit fill is an 8-lane bf16 vector and MSL has no vector wider than 4
-/// lanes. The two 64x32 bf16 strips are 8 KiB of Apple's 32 KiB threadgroup budget.
+/// lanes. The two 64x16 bf16 strips are 4 KiB of Apple's 32 KiB threadgroup budget.
+///
+/// `k_step = 16` is measured, not inherited: at N=4096 the 8/16/32/64/128 sweep gives
+/// 11.11 / **11.63** / 6.95 / 8.36 / 4.66 TFLOP/s. Each WMMA operand replicates all
+/// `k_step / K` sub-steps per lane, so on Apple's 2-elements-per-lane fragment the
+/// live operand registers — and with them occupancy — move much faster with `k_step`
+/// than on a 16x16 fragment. Inheriting the AMD/CUDA `32` cost 1.67x.
 pub const METAL_CFG: MatmulCfg =
-    MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: 32 };
+    MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: 16 };
 
 /// Size-adaptive config selection: small N (where the 256×256/8-wave grid
 /// starves the machine) uses [`SMALL_CFG`]; everything else keeps [`M1_CFG`].
@@ -329,7 +335,11 @@ pub fn gemm_core(
 ) {
     assert_eq!(m % cfg.block, 0, "gemm M={m} must be a multiple of the {} block", cfg.block);
     assert_eq!(n % cfg.block, 0, "gemm N={n} must be a multiple of the {} block", cfg.block);
-    assert_eq!(k_step % 16, 0, "k_step={k_step} must be a multiple of 16 (the WMMA K-edge)");
+    // The K-edge is the A fragment's column count, which is the matrix core's K —
+    // 16 on MFMA/`mma.sync`, but **8** on Apple's `simdgroup_matrix`. Hardcoding 16
+    // here silently excluded the Apple-native `k_step = 8`.
+    let wmma_k = ker.caps.frag(crate::arch::FragRole::Operand).expect("matrix-core fragment").base.cols;
+    assert_eq!(k_step % wmma_k, 0, "k_step={k_step} must be a multiple of {wmma_k} (this arch's WMMA K-edge)");
     assert_eq!(k % k_step, 0, "gemm K={k} must be a multiple of k_step={k_step}");
     assert_eq!(cfg.wave_cols, cfg.wave_rows * cfg.n_accum, "config invariant wave_cols == wave_rows*n_accum");
     let reg = cfg.reg();
