@@ -375,3 +375,21 @@ fn malformed_var_bounds_are_rejected() {
     });
     assert!(err.contains("expected bounds as (min, max)"), "{err}");
 }
+
+/// Wrapper generics land on the struct and its impl and stay in scope inside
+/// `build`, so one wrapper can be instantiated at several compile-time shapes
+/// (`RnntBlockJit<const W: usize>` traces a different decode window per `W`).
+#[test]
+fn wrapper_generics_reach_the_struct_and_impl() {
+    let out = expand(quote! {
+        WindowJit<const W: usize>(M) {
+            inputs { x: Tensor }
+            build(x) { model.forward::<W>(x) }
+        }
+    });
+    assert!(out.contains("pubstructWindowJit<constW:usize>"), "{out}");
+    assert!(out.contains("impl<constW:usize>WindowJit<W>"), "{out}");
+    assert!(out.contains("model.forward::<W>(x)"), "{out}");
+    // The state struct carries no wrapper generics — it holds only buffers.
+    assert!(out.contains("structWindowJitState{"), "{out}");
+}

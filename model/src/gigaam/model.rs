@@ -264,6 +264,7 @@ impl GigaAm {
         if is_pytorch {
             sd_owned = remap::remap_pytorch(sd_owned, &config)?;
         }
+        let mut casts = Vec::new();
         for (key, tensor) in &mut sd_owned {
             if (key.starts_with("subsampling.") || key.starts_with("layers."))
                 && tensor.dtype().is_float()
@@ -272,9 +273,12 @@ impl GigaAm {
                 // (FFN) and `<x>_weight_scale` (MHSA/conv), matching `prepare_scaled_weights`.
                 && !key.ends_with("weight_scale")
             {
-                *tensor = tensor.cast(encoder_dtype.clone());
+                *tensor = tensor.cast(encoder_dtype.clone()).contiguous();
+                casts.push(tensor.clone());
             }
         }
+        // Realized once: a lazy cast is re-run by every encoder call that reads the weight.
+        svod_tensor::Tensor::realize_batch(&casts)?;
         let sd = &sd_owned;
 
         let encoder = Encoder::from_state_dict(sd, &config)?;

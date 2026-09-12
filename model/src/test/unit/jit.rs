@@ -104,6 +104,47 @@ jit_wrapper! {
     }
 }
 
+/// `[B, T, K] @ [K, N]` + an RMS-norm — a matmul whose M axis is the
+/// `(batch, time)` pair. That is where `simplify_merge_adjacent` used to fold
+/// the symbolic batch range into the constant time range, which cost the kernel
+/// every constant-axis opt (upcast/unroll/local/tensor cores).
+struct LinearNormModel;
+
+const LN_T: usize = 8;
+const LN_K: usize = 16;
+const LN_N: usize = 32;
+const LN_MAX_B: usize = 4;
+
+impl LinearNormModel {
+    fn forward(&self, x: &Tensor, w: &Tensor) -> Result<Tensor> {
+        x.matmul(w).and_then(|y| y.rms_norm(-1, 1e-5)).map_err(tensor_err)
+    }
+}
+
+jit_wrapper! {
+    SymBatchJit(LinearNormModel) {
+        inputs {
+            x: Tensor,
+            #[unbatched] w: Tensor,
+        }
+        batch_var b: (1, LN_MAX_B),
+        outputs { y }
+
+        build(x, w) { model.forward(x, w) }
+    }
+}
+
+jit_wrapper! {
+    ConstBatchJit(LinearNormModel) {
+        x: Tensor,
+        w: Tensor,
+
+        outputs { y }
+
+        build(x, w) { model.forward(x, w) }
+    }
+}
+
 /// Array-valued input and output slots: N buffers behind one name.
 struct FanModel;
 
@@ -300,6 +341,65 @@ fn test_jit_batch_var_shrinks_and_rebinds() {
     assert_eq!(jit.scaled_shape().unwrap(), vec![2, 2]);
     assert_eq!(jit.scaled_view::<f32>().unwrap().shape(), &[2, 2]);
     assert_eq!(jit.scaled_to_vec::<f32>().unwrap(), vec![101.0, 202.0, 103.0, 204.0]);
+}
+
+fn ramp(n: usize, scale: f32) -> Tensor {
+    Tensor::from_slice((0..n).map(|i| ((i % 7) as f32 - 3.0) * scale).collect::<Vec<f32>>())
+}
+
+/// One plan for every batch size: the results must match a plan compiled for
+/// that batch exactly, and the batch must stay its own kernel axis (it shows up
+/// as a kernel variable, not folded into a merged `b*T` extent).
+#[test]
+fn test_jit_symbolic_batch_matches_const_batch() {
+    let w = ramp(LN_K * LN_N, 0.05).try_reshape([LN_K, LN_N]).unwrap();
+    let x_full = ramp(LN_MAX_B * LN_T * LN_K, 0.1).try_reshape([LN_MAX_B, LN_T, LN_K]).unwrap();
+
+    let mut sym = SymBatchJit::new(LinearNormModel);
+    sym.prepare(InputSpec::f32(&[LN_MAX_B, LN_T, LN_K]), InputSpec::f32(&[LN_K, LN_N])).unwrap();
+    copy_tensor_to_buffer(&x_full, sym.x_mut().unwrap());
+    copy_tensor_to_buffer(&w, sym.w_mut().unwrap());
+
+    // The batch reaches the kernels as a runtime variable rather than being
+    // baked into (or merged away with) a constant axis.
+    let kernels = sym.prepared_kernels().unwrap();
+    assert!(
+        kernels.iter().any(|k| k.kernel.var_names.iter().any(|n| n == "b")),
+        "no kernel takes `b` as a variable: {:?}",
+        kernels.iter().map(|k| &k.kernel.entry_point).collect::<Vec<_>>()
+    );
+
+    for b in 1..=LN_MAX_B {
+        sym.execute_bound(b as i64).unwrap();
+        assert_eq!(sym.y_shape().unwrap(), vec![b, LN_T, LN_N]);
+        let got = sym.y_to_vec::<f32>().unwrap();
+
+        let mut fixed = ConstBatchJit::new(LinearNormModel);
+        fixed.prepare(InputSpec::f32(&[b, LN_T, LN_K]), InputSpec::f32(&[LN_K, LN_N])).unwrap();
+        let rows = x_full.try_shrink([Some((0isize, b as isize)), None, None]).unwrap();
+        rows.realize().unwrap();
+        copy_tensor_to_buffer(&rows.contiguous(), fixed.x_mut().unwrap());
+        copy_tensor_to_buffer(&w, fixed.w_mut().unwrap());
+        fixed.execute().unwrap();
+
+        if b == 1 {
+            // The kernel name spells out the opt schedule (one token per axis
+            // extent). At b=1 the symbolic plan must reach the *same* schedule
+            // as the constant one, with the batch added as a symbolic axis
+            // (`3F`) — not a merged `b*T` extent that drops the const-axis opts.
+            let names = |ks: Vec<&svod_runtime::PreparedKernel>| {
+                ks.iter().map(|k| k.kernel.entry_point.clone()).collect::<Vec<_>>()
+            };
+            let want: Vec<String> =
+                names(fixed.prepared_kernels().unwrap()).iter().map(|n| n.replacen('_', "_3F_", 1)).collect();
+            assert_eq!(names(sym.prepared_kernels().unwrap()), want);
+        }
+        let want = fixed.y_to_vec::<f32>().unwrap();
+        assert_eq!(got.len(), want.len(), "b={b}");
+        for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+            assert!((g - e).abs() < 1e-5, "b={b} elem {i}: {g} != {e}");
+        }
+    }
 }
 
 #[test]

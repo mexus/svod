@@ -73,6 +73,28 @@ impl std::fmt::Display for SwizzleAxis {
     }
 }
 
+/// How the hand heuristic sizes the per-warp output tile after a tensor core.
+///
+/// See [`Renderer::tc_tile_policy`] for which target picks which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TcTilePolicy {
+    /// Tinygrad's fixed step, and the default: UPCAST M then N by the first of
+    /// `[5, 4, 3, 2]` that divides the leftover extent, then LOCAL N by the
+    /// first of `[4, 2]`.
+    FixedStep,
+    /// Grow the warp tile towards square until the lane holds `accum_max`
+    /// output elements, until the grid runs out of warp tiles, or until the K
+    /// loop is too short to amortise the accumulator — whichever binds first —
+    /// and stack warps into a block only up to one wave.
+    LaneBudget {
+        /// Output elements one lane may hold as tensor-core accumulators. The
+        /// post-TC warp tile is register-resident (one accumulator per output
+        /// element per lane, on top of the A/B fragments, the operand addresses
+        /// and the K-loop pipeline), so this is what bounds the tile.
+        accum_max: usize,
+    },
+}
+
 /// Backend renderer capabilities.
 ///
 /// Describes what features and optimizations a particular backend supports.
@@ -178,6 +200,25 @@ impl Renderer {
         match self.device {
             RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4 => 64,
             _ => 32,
+        }
+    }
+
+    /// How the hand heuristic sizes the per-warp output tile once a tensor core
+    /// has landed.
+    ///
+    /// [`TcTilePolicy::LaneBudget`] is the measured policy and only the CUDA
+    /// families opt in: 128 accumulators per lane — half of the 255 registers
+    /// an NVIDIA lane addresses — is the optimum on GA106 (RTX 3060, f16 in /
+    /// f32 out `mma.sync`), where it runs GigaAM's 768->3072 projection at
+    /// 20.8 TFLOPS against 15.9 for the fixed step. Every other target keeps
+    /// [`TcTilePolicy::FixedStep`] until its register file can be measured on
+    /// hardware.
+    pub fn tc_tile_policy(&self) -> TcTilePolicy {
+        match self.device {
+            RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => {
+                TcTilePolicy::LaneBudget { accum_max: 128 }
+            }
+            _ => TcTilePolicy::FixedStep,
         }
     }
 
@@ -952,6 +993,15 @@ pub const INTEL_XE_8816: TcConfig = TcConfig {
 };
 
 impl TensorCore {
+    /// Output elements one lane accumulates for a single tensor-core tile.
+    ///
+    /// The instruction's `dims.1 x dims.0` (M x N) tile is spread over
+    /// `threads` lanes, so this is the register cost of the accumulator before
+    /// the scheduler grows the tile with post-TC UPCASTs.
+    pub fn lane_tile(&self) -> usize {
+        (self.dims.0 * self.dims.1 / self.threads.max(1)).max(1)
+    }
+
     // ===== Helper Methods =====
 
     /// Get the axes for reduction unrolling.

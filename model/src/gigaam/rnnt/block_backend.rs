@@ -8,12 +8,16 @@ use svod_arch::rnnt::{BatchBlockStep, BlockTapes};
 
 use crate::jit::{BuildSnafu, InputSpec, JitError};
 
-use super::block::BLOCK_STEPS;
+use super::block::{BLOCK_STEPS, DECODE_WINDOW};
 use super::jit::{RnntBlockJit, RnntEncProjJit};
-use crate::gigaam::model::GigaAm;
+use super::joint::CLASS_ALIGN;
+use crate::gigaam::model::{GigaAm, Head};
 
-pub struct RnntBlockBackend {
-    jit: RnntBlockJit,
+/// `W` is the WIND decode window (`super::block::forward_block`): a pure
+/// performance knob, so the default is the tuned production value and tests
+/// instantiate the other windows to pin that they decode identically.
+pub struct RnntBlockBackend<const W: usize = DECODE_WINDOW> {
+    jit: RnntBlockJit<W>,
     /// Per-wave encoder projection `[B, T, E] -> [B, T, J]` — one MFMA matmul
     /// replaces the per-step row projection inside the block.
     proj: RnntEncProjJit,
@@ -46,10 +50,15 @@ pub struct BlockStats {
     pub t_read: std::time::Duration,
 }
 
-impl RnntBlockBackend {
+impl<const W: usize> RnntBlockBackend<W> {
     /// `max_t` is the encoder-frame capacity (`max_t_sub`); the `enc` input is
     /// `[lanes, max_t, d_model]` and stays device-local across the wave.
-    pub fn from_model(model: GigaAm, lanes: usize, max_t: usize) -> crate::jit::Result<Self> {
+    pub fn from_model(mut model: GigaAm, lanes: usize, max_t: usize) -> crate::jit::Result<Self> {
+        // The block plan is the only consumer of the padded logits width; the
+        // caller's model keeps the checkpoint shapes.
+        if let Head::Rnnt { head, .. } = &mut model.head {
+            head.joint.pad_classes(CLASS_ALIGN).boxed().context(BuildSnafu)?;
+        }
         let (head, _) = model.head.expect_rnnt("RnntBlockBackend").boxed().context(BuildSnafu)?;
         let (layers, p) = (head.pred_rnn_layers, head.pred_hidden);
         let joint_hidden = head.joint_hidden;
@@ -87,6 +96,13 @@ impl RnntBlockBackend {
         })
     }
 
+    /// Entry points of the block plan's kernels in dispatch order (structural
+    /// test pins).
+    #[cfg(test)]
+    pub(crate) fn kernel_names(&self) -> crate::jit::Result<Vec<String>> {
+        Ok(self.jit.prepared_kernels()?.iter().map(|k| k.kernel.entry_point.clone()).collect())
+    }
+
     /// Stage the wave's encoder rows + valid frame counts. `frames[i]` is the
     /// tight `[valid[i], enc_hidden]` block; unused rows stay stale (clamped
     /// gather + emit mask keep them inert).
@@ -113,7 +129,7 @@ impl RnntBlockBackend {
     }
 }
 
-impl BatchBlockStep for RnntBlockBackend {
+impl<const W: usize> BatchBlockStep for RnntBlockBackend<W> {
     type Error = JitError;
 
     fn batch(&self) -> usize {

@@ -215,6 +215,9 @@ pub fn cached_patterns(input: TokenStream) -> TokenStream {
 ///   outputs.
 /// - The build tuple has one element per declared output slot plus one per
 ///   state slot — and no tuple at all when there is exactly one of them.
+/// - `MyModelJit<const W: usize>(MyModel)` — generics after the name land on
+///   the struct and its impl and stay in scope inside `build`, so one wrapper
+///   traces a different graph per instantiation.
 ///
 /// # Generated API
 ///

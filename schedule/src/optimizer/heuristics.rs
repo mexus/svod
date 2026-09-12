@@ -9,7 +9,8 @@ use smallvec::SmallVec;
 use svod_ir::uop::{reaching, reaching_each};
 use svod_ir::{AxisId, AxisType, BinaryOp, Op, TernaryOp, UOp};
 
-use crate::optimizer::config::HeuristicsConfig;
+use crate::optimizer::config::{HeuristicsConfig, TcOpt};
+use crate::optimizer::renderer::{TcTilePolicy, TensorCore};
 use crate::optimizer::tc::matmul_operands;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 use svod_ir::ops;
@@ -35,18 +36,28 @@ fn padded_extent(size: usize, align: usize) -> Option<usize> {
     ((padded - size) * 20 <= size).then_some(padded)
 }
 
-/// The constant extent of a RANGE, if it has one.
-fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
-    match rng.op() {
-        Op::Range(ops::Range { end, .. }) => match end.op() {
-            Op::Const(cv) => match cv.0 {
-                svod_ir::ConstValue::Int(size) if size > 0 => Some(size as usize),
-                _ => None,
-            },
+/// The value of an integer CONST, if that is what this is.
+fn const_int(uop: &Arc<UOp>) -> Option<i64> {
+    match uop.op() {
+        Op::Const(cv) => match cv.0 {
+            svod_ir::ConstValue::Int(value) => Some(value),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// The constant extent of a RANGE, if it has one.
+fn const_extent(rng: &Arc<UOp>) -> Option<usize> {
+    match rng.op() {
+        Op::Range(ops::Range { end, .. }) => const_int(end).filter(|&size| size > 0).map(|size| size as usize),
+        _ => None,
+    }
+}
+
+/// Product of the constant extents of every axis of `axis_type`.
+fn extent_product(scheduler: &Scheduler, axis_type: AxisType) -> usize {
+    scheduler.ranges_of(&[axis_type]).iter().filter_map(const_extent).product::<usize>().max(1)
 }
 
 /// LOCAL size for a global axis none of the standard sizes divides, with the
@@ -115,8 +126,11 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
         return;
     }
 
-    // 3. Grouped reduction
-    try_grouped_reduction(scheduler, config);
+    // 3. Grouped reduction: few outputs share a block, many outputs get a wave
+    // per row.
+    if !try_grouped_reduction(scheduler, config) {
+        try_warp_row_reduction(scheduler, config);
+    }
 
     // Guard: no more opts if we are grouping.
     if scheduler.group_for_reduces() > 0 {
@@ -259,6 +273,94 @@ fn strides_of(
         }
     }
     (num_strides, sum_strides)
+}
+
+/// The smallest stride any buffer addresses `target_rng` with, in elements.
+///
+/// This is the quantity both memory rules key off: it is how far apart in
+/// memory two neighbouring values of the axis land, so it decides whether a
+/// wave walking the axis covers one contiguous run and whether a vector load
+/// along it is one transaction. It is read off the linearized index — a bare
+/// `target_rng` term is stride 1, `target_rng * c` is stride `c` — never off
+/// the shape. `None` when no buffer's index moves with the axis at all.
+fn min_stride(indices: &[Arc<UOp>], target_rng: &Arc<UOp>) -> Option<usize> {
+    indices
+        .iter()
+        .flat_map(|idx| idx.split_uop(BinaryOp::Add))
+        .filter_map(|term| {
+            if Arc::ptr_eq(&term, target_rng) {
+                return Some(1);
+            }
+            let Op::Binary(BinaryOp::Mul, lhs, rhs) = term.op() else { return None };
+            let stride = if Arc::ptr_eq(lhs, target_rng) {
+                const_int(rhs)
+            } else if Arc::ptr_eq(rhs, target_rng) {
+                const_int(lhs)
+            } else {
+                None
+            };
+            stride.filter(|&stride| stride > 0).map(|stride| stride as usize)
+        })
+        .min()
+}
+
+/// The memory transaction a lane's access is rounded up to, in bytes.
+const SECTOR_BYTES: usize = 32;
+
+/// Each buffer access as `(linearized index, element size in bytes)`.
+fn buffer_accesses(bufs: &[Arc<UOp>]) -> Vec<(Arc<UOp>, usize)> {
+    bufs.iter()
+        .filter_map(|buf| match buf.op() {
+            Op::Index(ops::Index { indices, .. }) => {
+                Some((indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone()), buf.dtype().base().bytes()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The furthest apart, in bytes, two neighbouring lanes stepping `rng` land in
+/// any one buffer. A buffer whose index ignores the axis contributes nothing.
+///
+/// This is what decides where `lidx0` belongs. Lanes at a stride below one
+/// [`SECTOR_BYTES`] share their transactions; past that each lane pays a whole
+/// sector, so the axis to hand the fastest thread index is one *every* buffer
+/// keeps within a sector — the worst buffer is what a wave waits for, which is
+/// why this is a maximum and not a sum. When no axis manages it (a transposing
+/// kernel, contiguous on one side and strided on the other) there is nothing to
+/// win and the older ranking stands.
+fn lane_span_bytes(accesses: &[(Arc<UOp>, usize)], rng: &Arc<UOp>) -> usize {
+    accesses
+        .iter()
+        .map(|(idx, bytes)| min_stride(std::slice::from_ref(idx), rng).unwrap_or(0).saturating_mul(*bytes))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether every buffer's index moves with `rng`.
+///
+/// An output axis some buffer ignores is a reuse axis: each of its values
+/// re-reads that buffer, and spending a whole wave on one of its elements
+/// throws the reuse away.
+fn addressed_everywhere(accesses: &[(Arc<UOp>, usize)], rng: &Arc<UOp>) -> bool {
+    accesses.iter().all(|(idx, _)| min_stride(std::slice::from_ref(idx), rng).is_some())
+}
+
+/// Widths a single memory access moves, in bytes. Anything else lowers to a
+/// run of narrow accesses whatever the axis looks like.
+fn is_vector_width(bytes: usize) -> bool {
+    matches!(bytes, 4 | 8 | 16)
+}
+
+/// The widest element some buffer walks contiguously along `rng`, in bytes.
+/// `None` when no buffer addresses the axis with stride 1, in which case no
+/// upcast width along it can become a single access.
+fn contiguous_element_bytes(accesses: &[(Arc<UOp>, usize)], rng: &Arc<UOp>) -> Option<usize> {
+    accesses
+        .iter()
+        .filter(|(idx, _)| min_stride(std::slice::from_ref(idx), rng) == Some(1))
+        .map(|&(_, bytes)| bytes)
+        .max()
 }
 
 // ============================================================================
@@ -476,6 +578,21 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
+/// Reduce axes long enough that a wave-wide split still leaves a serial loop.
+const MIN_WARP_REDUCE: usize = 64;
+
+/// The product of the output extents a reduce kernel writes.
+fn output_count(scheduler: &Scheduler) -> i64 {
+    let full_shape = scheduler.full_shape();
+    scheduler.upcastable_dims().iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product()
+}
+
+/// Output count up to which [`try_grouped_reduction`] takes the kernel; above
+/// it [`try_warp_row_reduction`] gets its chance, so the two never compete.
+fn grouped_output_threshold(config: &HeuristicsConfig) -> i64 {
+    if config.disable_locals { 240 } else { 2048 }
+}
+
 /// Grouped reduction for small output dimensions.
 ///
 /// When the product of upcastable output dimensions is small (<= 2048,
@@ -486,13 +603,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
         return false;
     }
 
-    // prod(output_shape[i] for i in upcastable_dims) <= threshold
-    let upcastable = scheduler.upcastable_dims();
-    let full_shape = scheduler.full_shape();
-    let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
-
-    let threshold: i64 = if config.disable_locals { 240 } else { 2048 };
-    if group_for_reduces > threshold {
+    if output_count(scheduler) > grouped_output_threshold(config) {
         return false;
     }
 
@@ -503,6 +614,81 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
         }
     }
     false
+}
+
+/// One wave per output row, for reductions with many rows.
+///
+/// [`try_grouped_reduction`] declines a kernel whose output count exceeds its
+/// threshold, so a row reduce with thousands of rows falls through to the
+/// generic path and ends up with one *thread* per row: the reduce stays a
+/// serial loop and neighbouring lanes address memory a whole row apart, which
+/// on a 128-byte sector is a near-total waste of every fetch.
+///
+/// Splitting a wave off the reduce axis instead makes the lanes of one wave
+/// walk one row together. The gate is a memory-layout question, not a shape
+/// one: the axis must be addressed with stride 1 by some buffer (so the lanes
+/// of a wave are contiguous), and long enough after the split to keep a serial
+/// loop over whole waves ([`MIN_WARP_REDUCE`]). The output axes stay in the
+/// grid, so the block is exactly one wave and the two-stage reduction shares a
+/// single wave's worth of scratch.
+///
+/// The trailing UNROLL is what turns the per-lane loads into a strided burst
+/// the coalescer can merge across the wave; without it each iteration issues
+/// one narrow load.
+pub fn try_warp_row_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use tracing::debug;
+
+    if !scheduler.renderer().has_local || !scheduler.renderer().has_shared || config.disable_locals {
+        return false;
+    }
+    // Few outputs: `try_grouped_reduction` owns that case, and its narrower
+    // split leaves more of the reduce in the grid where the parallelism is.
+    if output_count(scheduler) <= grouped_output_threshold(config) {
+        return false;
+    }
+
+    let wave = scheduler.renderer().wave_size();
+    let accesses = buffer_accesses(scheduler.bufs());
+    let rngs = scheduler.rngs();
+    // A wave per row spends the whole reduce on one output element, which only
+    // pays when every output element reads its own data. An output axis some
+    // buffer ignores is a reuse axis — a matmul's N, a projection's output
+    // column — and amortizing the shared operand over it is worth more than the
+    // coalescing.
+    if !scheduler
+        .axes_of(&[AxisType::Global, AxisType::Weak])
+        .iter()
+        .all(|&a| addressed_everywhere(&accesses, &rngs[a]))
+    {
+        return false;
+    }
+
+    // Innermost first: the last reduce axis is the one a row-major layout makes
+    // contiguous, and grouping it leaves the outer reduces as plain loops.
+    let axis = scheduler.axes_of(&[AxisType::Reduce]).into_iter().enumerate().rev().find(|&(_, axis)| {
+        const_extent(&rngs[axis]).is_some_and(|extent| extent >= MIN_WARP_REDUCE && extent.is_multiple_of(wave))
+            && (1..=SECTOR_BYTES).contains(&lane_span_bytes(&accesses, &rngs[axis]))
+    });
+    let Some((logical_axis, _)) = axis else { return false };
+
+    let mut trial = scheduler.clone();
+    if apply_opt(&mut trial, &Opt::group(logical_axis, wave), true).is_err() {
+        return false;
+    }
+
+    // Each lane now walks its row in strides of `wave`; unrolling the remainder
+    // issues the loads of several strides together, so the wave covers one
+    // contiguous run per instruction instead of one element per lane.
+    if let Some(remaining) = trial.unrollable_dims().last().copied()
+        && const_extent(&trial.rngs()[remaining]).is_some_and(|extent| extent.is_multiple_of(DEFAULT_UPCAST_FACTOR))
+    {
+        let logical = trial.unrollable_dims().len() - 1;
+        let _ = apply_opt(&mut trial, &Opt::unroll(logical, DEFAULT_UPCAST_FACTOR), true);
+    }
+
+    debug!(logical_axis, wave, "try_warp_row_reduction: applied");
+    *scheduler = trial;
+    true
 }
 
 /// Apply matmul-specific 2D output tiling (register blocking).
@@ -835,6 +1021,10 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 
     let mut applied = false;
     let mut upcasted_axes: Vec<usize> = Vec::new();
+    // Only a lane-parallel backend cares which width lands in one access: a CPU
+    // kernel's UPCAST becomes a loop the vectorizer re-widths anyway, and
+    // changing it there would move code generation for no measured reason.
+    let prefer_vector_width = scheduler.renderer().has_local;
 
     loop {
         // While prod(output_shape[upcastable_dims]) >= 1024 and upcast_size() < 32:
@@ -870,9 +1060,9 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             break;
         }
 
-        // Build choices: (num_strides, sum_strides, axis, upcast_amount)
+        // Build choices: (num_strides, sum_strides, axis, vector_rank, amount)
         // for axis × upcast_amount in upcastable_dims × [3, 4].
-        let mut choices: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut choices: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
 
         // One walk over the buffer indices records which of the existing
         // UPCAST/UNROLL ranges and candidate axes each node reaches, so every
@@ -884,7 +1074,8 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             upcast_and_unroll_ranges.iter().chain(candidates.iter().map(|&axis| &rngs[axis])).cloned().collect();
         let mut reach = reaching_each(&targets);
         let bufs = scheduler.bufs();
-        let indices = linearized_indices(bufs);
+        let accesses = buffer_accesses(bufs);
+        let indices: Vec<Arc<UOp>> = accesses.iter().map(|(idx, _)| idx.clone()).collect();
 
         // Stride-0 check: an axis must be NOT in some buffer's index backward
         // slice in which all existing UPCAST/UNROLL ranges ARE, so only those
@@ -923,7 +1114,15 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 
             let (num_strides, sum_strides) =
                 strides_of(&indices, rng, |idx| reach.get(idx).iter().any(|target| target.id == rng.id));
-            choices.extend(amounts.into_iter().map(|amount| (num_strides, sum_strides, axis_idx, amount)));
+            let vectorizable = contiguous_element_bytes(&accesses, rng).filter(|_| prefer_vector_width);
+            choices.extend(amounts.into_iter().map(|amount| {
+                // A width that fills a machine vector on a contiguous axis wins
+                // its axis: the upcast then lowers to one wide access instead
+                // of `amount` narrow ones. Everything else keeps the ascending
+                // order, so a non-contiguous axis is unaffected.
+                let rank = usize::from(!vectorizable.is_some_and(|bytes| is_vector_width(amount * bytes)));
+                (num_strides, sum_strides, axis_idx, rank, amount)
+            }));
         }
 
         if choices.is_empty() {
@@ -933,7 +1132,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 
         // Sort ascending by (num_strides, sum_strides) — fewest strides wins
         choices.sort();
-        let (_, _, best_axis, best_amount) = choices[0];
+        let (_, _, best_axis, _, best_amount) = choices[0];
 
         debug!(best_axis, best_amount, "apply_heuristic_upcasts: applying upcast");
         if apply_opt(scheduler, &Opt::upcast(best_axis, best_amount), true).is_ok() {
@@ -949,46 +1148,65 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 
 /// Stride-ranked LOCAL workgroup configuration.
 ///
-/// Prioritizes expand axes (stride-0 in some buffer = broadcast) for LOCAL,
-/// then higher axis indices. Tries sizes [32, 16, 8, 4, 3, 2] for axis 0
-/// and [16, 8, 4, 3, 2] for others, with cumulative LOCAL size ≤ 128. An
-/// axis none of them divides (Whisper's 51865 = 5·11·23·41 vocabulary) falls
-/// back to [`local_fallback`] instead of running one thread per block.
+/// In a kernel that is nothing but its memory traffic, `lidx0` — the
+/// fastest-moving thread index — goes to the axis every buffer keeps within one
+/// [`SECTOR_BYTES`] ([`lane_span_bytes`]), so the lanes of a wave cover one
+/// contiguous run of memory instead of landing one row apart. It only reorders:
+/// the sizes are the ones this heuristic always picked, and a kernel with no
+/// such axis — a transposing copy, strided on one side whichever axis leads —
+/// is untouched, as is any kernel carrying a reduce. The rest keep the
+/// expand-first ranking (stride-0
+/// in some buffer = broadcast, then higher axis indices), with sizes from
+/// [32, 16, 8, 4, 3, 2] for axis 0 and [16, 8, 4, 3, 2] for the others and a
+/// cumulative LOCAL size ≤ 128. An axis none of the sizes divides (Whisper's
+/// 51865 = 5·11·23·41 vocabulary) falls back to [`local_fallback`] instead of
+/// running one thread per block.
 pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     if !scheduler.renderer().has_local || config.disable_locals {
         return false;
     }
     let budget = LOCAL_BUDGET.min(scheduler.renderer().local_max.unwrap_or(LOCAL_BUDGET));
 
-    // Rank axes by (has_expand_pattern, axis_index) — expand axes (stride-0 in
-    // some buffer = broadcast) first, then higher axis indices.
     let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Weak]);
     let full_shape = scheduler.full_shape();
+    let accesses = buffer_accesses(scheduler.bufs());
 
-    let mut local_axis_ranking: Vec<(bool, usize)> = Vec::new();
+    // Rank by (is_lane_axis, has_expand_pattern, axis_index) descending. An axis
+    // no buffer moves with spans nothing and would make every lane read one
+    // address, so a lane axis has to actually move (span >= 1).
+    let mut candidates: Vec<(usize, bool, usize)> = Vec::new();
     for &axis in &eligible_axes {
         let rngs = scheduler.rngs();
-        if axis >= rngs.len() {
+        if axis >= rngs.len()
+            || !matches!(rngs[axis].op(), Op::Range(ops::Range { end, .. }) if matches!(end.op(), Op::Const(..)))
+        {
             continue;
         }
-        // Only CONST-end ranges (no symbolic dims)
-        if let Op::Range(ops::Range { end, .. }) = rngs[axis].op() {
-            if !matches!(end.op(), Op::Const(..)) {
-                continue;
-            }
-        } else {
-            continue;
-        }
-        let is_expand = has_broadcast_pattern(scheduler, axis);
-        local_axis_ranking.push((is_expand, axis));
+        candidates.push((lane_span_bytes(&accesses, &rngs[axis]), has_broadcast_pattern(scheduler, axis), axis));
     }
+    // Only for a kernel that is nothing but its memory traffic. Where a reduce
+    // loop sits inside the block the thread mapping is no longer the only thing
+    // the block shape decides — a stencil's halo and the loop's own reuse both
+    // ride on it — and the reordering measured worse.
+    let lane_axis = scheduler
+        .reduceop()
+        .is_none()
+        .then(|| {
+            candidates
+                .iter()
+                .filter(|&&(span, ..)| (1..=SECTOR_BYTES).contains(&span))
+                .min_by_key(|&&(span, _, axis)| (span, axis))
+                .map(|&(_, _, axis)| axis)
+        })
+        .flatten();
 
-    // Sort descending by (is_expand, axis) — expand axes first, higher index first
+    let mut local_axis_ranking: Vec<(bool, bool, usize)> =
+        candidates.into_iter().map(|(_, is_expand, axis)| (Some(axis) == lane_axis, is_expand, axis)).collect();
     local_axis_ranking.sort_by(|a, b| b.cmp(a));
 
     // Collect LOCAL candidates with cumulative size constraint: (axis, size, padto).
     let mut to_local: Vec<(usize, usize, Option<usize>)> = Vec::new();
-    for &(_, axis) in &local_axis_ranking {
+    for &(_, _, axis) in &local_axis_ranking {
         let cumulative_local: usize = to_local.iter().map(|(_, sz, _)| *sz).product::<usize>().max(1);
         let axis_size = full_shape[axis];
         if axis_size <= 0 {
@@ -1013,39 +1231,171 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         }
     }
 
-    // Apply at most 3 LOCALs, sorted by axis (ascending)
-    // Track deleted shapes: if local_sz == full_shape[axis], axis merges and shifts indices
+    // Apply at most 3 LOCALs, the lane axis first: `lidx0` is handed to the
+    // LOCAL range created first, so application order *is* the thread mapping.
+    // Each target is re-found by its axis id, because a split renumbers the
+    // list and the lane axis is applied out of index order.
     let mut to_apply: Vec<(usize, usize, Option<usize>)> = to_local.into_iter().take(3).collect();
-    to_apply.sort();
+    to_apply.sort_by_key(|&(axis, ..)| (Some(axis) != lane_axis, axis));
+    let targets: Vec<(Option<AxisId>, usize, Option<usize>)> = to_apply
+        .into_iter()
+        .map(|(axis, local_sz, padto)| {
+            let id = scheduler.rngs().get(axis).and_then(|rng| match rng.op() {
+                Op::Range(ops::Range { axis_id, .. }) => Some(axis_id.clone()),
+                _ => None,
+            });
+            (id, local_sz, padto)
+        })
+        .collect();
 
     let mut applied = false;
-    let mut deleted_shape = 0usize;
-    for (axis, local_sz, padto) in to_apply {
-        let adjusted_axis = axis - deleted_shape;
-        let mut axis_size = full_shape[axis] as usize;
+    for (axis_id, local_sz, padto) in targets {
+        let Some(axis) = axis_id.and_then(|id| find_axis_by_axis_id(scheduler, id)) else { continue };
         let mut trial = scheduler.clone();
-        if let Some(align) = padto {
-            if apply_opt(&mut trial, &Opt::padto(adjusted_axis, align), true).is_err() {
-                continue;
-            }
-            axis_size = axis_size.div_ceil(align) * align;
+        if padto.is_some_and(|align| apply_opt(&mut trial, &Opt::padto(axis, align), true).is_err()) {
+            continue;
         }
-        if apply_opt(&mut trial, &Opt::local(adjusted_axis, local_sz), true).is_ok() {
+        if apply_opt(&mut trial, &Opt::local(axis, local_sz), true).is_ok() {
             *scheduler = trial;
             applied = true;
-            if local_sz == axis_size {
-                deleted_shape += 1;
-            }
         }
     }
     applied
 }
 
+/// Factors a post-TC UPCAST may grow the warp tile by, best first.
+///
+/// Tinygrad's `[5, 4, 3, 2]` ladder extended to 8, the widest UPCAST a GPU
+/// renderer accepts, so a lane can reach a square tile on an `m16n8` core.
+const TC_GROWTH_FACTORS: [usize; 5] = [8, 5, 4, 3, 2];
+
+/// Warp tiles a grid keeps before a wider per-warp tile stops paying for
+/// itself. Doubling the tile halves the warps, and a grid that no longer covers
+/// the device's multiprocessors loses more than the operand traffic the wider
+/// tile saves. The heuristic cannot see the multiprocessor count, so this is a
+/// floor and not a target: it only bites on outputs small enough that the full
+/// register budget would leave a few dozen warps for the whole GPU.
+const TC_MIN_WARP_TILES: usize = 192;
+
+/// Post-TC growth `(m, n)` for the per-warp output tile, in tensor-core tiles.
+///
+/// [`tc::apply`](crate::optimizer::tc) leaves one warp computing the
+/// instruction's own `dims.1 x dims.0` (M x N) tile with `tc.lane_tile()`
+/// accumulators per lane. The post-TC UPCASTs multiply that tile; three limits
+/// bound how far, and the tightest wins:
+///
+/// * `budget` — accumulators a lane may hold ([`TcTilePolicy::LaneBudget`]);
+/// * `tiles / TC_MIN_WARP_TILES` — a wider tile means fewer warps, and a grid
+///   that no longer covers the multiprocessors costs more than it saves;
+/// * `k_tiles` — the accumulator is set up and written back once per K loop, so
+///   a reduction with few steps cannot amortise a lane full of them.
+///
+/// `upcast_max` then caps each single UPCAST, which also keeps the recorded
+/// [`Opt`] replayable.
+///
+/// Within those the growth is split so the warp tile comes out square: a
+/// `Wm x Wn` tile reads `(Wm + Wn) * K` operand elements for `Wm * Wn * K`
+/// MACs, and here the operands are read straight from global memory — there is
+/// no shared-memory stage to amortise a lopsided tile — so the square tile
+/// moves the least memory per flop. M is grown first, so the remainder left by
+/// an M extent that does not divide is spent on N.
+fn tc_warp_tile_growth(
+    tc: &TensorCore,
+    budget: usize,
+    upcast_max: usize,
+    tiles: usize,
+    [m_tiles, n_tiles, k_tiles]: [usize; 3],
+) -> (usize, usize) {
+    let growth = (budget / tc.lane_tile()).min(tiles / TC_MIN_WARP_TILES).min(k_tiles).max(1);
+    // Square tile: dims.1 * m == dims.0 * n with m * n == growth, so
+    // m == sqrt(growth * dims.0 / dims.1), rounded up (M is the longer side of
+    // an `m16n8` tile, so rounding down would spend the whole budget on N).
+    let square = (growth * tc.dims.0).div_ceil(tc.dims.1);
+    let m_cap = square.isqrt() + usize::from(square.isqrt().pow(2) < square);
+    let grow = |extent: usize, cap: usize| {
+        TC_GROWTH_FACTORS.into_iter().find(|&f| f <= cap && extent.is_multiple_of(f)).unwrap_or(1)
+    };
+    let m = grow(m_tiles, m_cap.min(upcast_max));
+    (m, grow(n_tiles, (growth / m).min(upcast_max)))
+}
+
+/// Split `rngs[dim]` (`0` = N, `1` = M) by `sz`, recording the opt.
+fn tc_split(scheduler: &mut Scheduler, rngs: &mut [Arc<UOp>; 2], dim: usize, sz: usize, new_type: AxisType) {
+    let Some(idx) = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &rngs[dim])) else { return };
+    let Ok((replaced, _)) = scheduler.shift_to(rngs[dim].clone(), sz, new_type, false, None) else { return };
+    scheduler.applied_opts.push(if new_type == AxisType::Upcast { Opt::upcast(idx, sz) } else { Opt::local(idx, sz) });
+    rngs[dim] = replaced;
+}
+
+/// Whether `rng`'s extent divides by `sz`.
+fn divides(rng: &Arc<UOp>, sz: usize) -> bool {
+    matches!(rng.op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
+}
+
+/// Tile the matmul left over by [`tc::apply`](crate::optimizer::tc) across
+/// warps and blocks, following the renderer's [`TcTilePolicy`]. `axes` is the
+/// `[N, M, K]` the tensor core returned.
+fn apply_tc_tiling(scheduler: &mut Scheduler, axes: &[Arc<UOp>; 3]) {
+    let mut rngs = [axes[0].clone(), axes[1].clone()];
+    let tc = scheduler.renderer().tensor_cores[scheduler.selected_tc_index.unwrap_or(0)].clone();
+
+    match scheduler.renderer().tc_tile_policy() {
+        TcTilePolicy::FixedStep => {
+            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2].
+            for dim in [1usize, 0] {
+                for &sz in &[5usize, 4, 3, 2] {
+                    if divides(&rngs[dim], sz) {
+                        tc_split(scheduler, &mut rngs, dim, sz, AxisType::Upcast);
+                        break;
+                    }
+                }
+            }
+            // LOCAL N (dim=0) with factors [4,2].
+            if scheduler.renderer().has_local {
+                for &sz in &[4usize, 2] {
+                    if divides(&rngs[0], sz) {
+                        tc_split(scheduler, &mut rngs, 0, sz, AxisType::Local);
+                        break;
+                    }
+                }
+            }
+        }
+        TcTilePolicy::LaneBudget { accum_max } => {
+            let (m_grow, n_grow) = tc_warp_tile_growth(
+                &tc,
+                accum_max,
+                scheduler.renderer().upcast_max,
+                extent_product(scheduler, AxisType::Global),
+                [
+                    const_extent(&rngs[1]).unwrap_or(1),
+                    const_extent(&rngs[0]).unwrap_or(1),
+                    const_extent(&axes[2]).unwrap_or(1),
+                ],
+            );
+            for (dim, sz) in [(1usize, m_grow), (0, n_grow)] {
+                if sz > 1 {
+                    tc_split(scheduler, &mut rngs, dim, sz, AxisType::Upcast);
+                }
+            }
+
+            // Stack warps into a block only up to one wave: the fragments come
+            // straight from global memory, so past the wave a block of several
+            // warps shares nothing and the split only coarsens the grid. A
+            // tensor core narrower than the wave (Intel Xe issues its DPAS
+            // across 8 lanes) still needs its warps stacked to fill one.
+            let per_block = scheduler.renderer().wave_size() / tc.threads.max(1);
+            if scheduler.renderer().has_local && per_block > 1 && divides(&rngs[0], per_block) {
+                tc_split(scheduler, &mut rngs, 0, per_block, AxisType::Local);
+            }
+        }
+    }
+}
+
 /// Tensor core optimization for matmul patterns.
 ///
-/// - Guard: skip when >1 reduce axis unless tc_opt >= 1
+/// - Guard: skip when >1 reduce axis under [`TcOpt::Strict`]
 /// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
-/// - Post-TC: UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
+/// - Post-TC: tile across warps and blocks ([`apply_tc_tiling`])
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use crate::optimizer::config::TcUsage;
     use crate::optimizer::tc;
@@ -1057,9 +1407,11 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    // Guard: require exactly one reduce axis unless TC_OPT >= 1.
+    // Strict keeps tinygrad's TC_OPT=0 rule: one reduce axis only. The default
+    // Relaxed level lets `tc::apply` pick a divisible reduce axis and leave the
+    // rest as loops, which is what a conv's (channels, taps) reduce needs.
     let reduce_count = scheduler.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len();
-    if reduce_count != 1 && config.tc_opt.as_usize() < 1 {
+    if reduce_count != 1 && config.tc_opt == TcOpt::Strict {
         return false;
     }
 
@@ -1121,42 +1473,7 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         );
         trial.applied_opts.push(opt);
 
-        // Post-TC extras: UPCAST M/N then LOCAL N.
-        {
-            let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
-
-            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
-            for tc_dim in [1usize, 0] {
-                for &sz in &[5usize, 4, 3, 2] {
-                    if matches!(tc_rngs[tc_dim].op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
-                    {
-                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
-                            && let Ok((replaced, _)) =
-                                trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
-                        {
-                            trial.applied_opts.push(Opt::upcast(rng_idx, sz));
-                            tc_rngs[tc_dim] = replaced;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // LOCAL N (dim=0) with factors [4,2]
-            if trial.renderer().has_local {
-                for &sz in &[4usize, 2] {
-                    if matches!(tc_rngs[0].op(), Op::Range(ops::Range { end, .. }) if end.divides(sz as i64).is_some())
-                    {
-                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
-                            && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
-                        {
-                            trial.applied_opts.push(Opt::local(rng_idx, sz));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        apply_tc_tiling(&mut trial, &axes);
 
         *scheduler = trial;
         return true;

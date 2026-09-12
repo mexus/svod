@@ -62,18 +62,21 @@ impl RnntPredictor {
         let l = self.lstm.len() as isize;
         let b = h_in.dim_const(1)? as isize;
 
-        // Embed lookup: prev_token [B, 1] -> emb [B, 1, P].
-        // Squeeze the seq-len axis to feed the LSTM cell shape [B, P].
-        let emb = scoped("embed", || -> Result<Tensor> { Ok(self.embed.embedding(prev_token)?) })?;
-        let layer_in = emb.try_squeeze(Some(1))?; // [B, P]
+        // Embed lookup as a row gather: prev_token [B, 1] broadcast to [B, P]
+        // indexes dim 0 of the table. `Tensor::embedding` would lower to a
+        // one-hot mask summed over the whole vocab per lane (the block's
+        // single most expensive kernel); the gather lowers to indexed loads.
+        let idx = prev_token.try_expand([b, p])?;
+        let layer_in = scoped("embed", || -> Result<Tensor> { Ok(self.embed.gather(0, &idx)?) })?; // [B, P]
 
         let (top, new_h, new_c) =
             scoped("lstm", || -> Result<_> { Ok(self.lstm.step_stacked(&layer_in, h_in, c_in)?) })?;
 
         // g = last layer output [B, P] → [B, 1, P]; state [L, B, P] → batch-major
-        // [B, 1, L * P].
+        // [B, 1, L * P]. `g` is materialized: left lazy, the joint's pred
+        // projection re-evaluates the gate sigmoid/tanh inside its reduce loop.
         let flat = |s: Tensor| -> Result<Tensor> { Ok(s.try_permute(&[1, 0, 2])?.try_reshape([b, 1, l * p])?) };
-        Ok((top.try_unsqueeze(1)?, flat(new_h)?, flat(new_c)?))
+        Ok((top.contiguous().try_unsqueeze(1)?, flat(new_h)?, flat(new_c)?))
     }
 
     /// Zero the blank-id embedding row — matches Python's

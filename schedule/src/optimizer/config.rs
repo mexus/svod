@@ -103,14 +103,15 @@ impl TcUsage {
 /// Tensor core optimization level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TcOpt {
-    /// Strict matching (TC_OPT=0, default).
-    #[default]
+    /// Single-reduce-axis kernels only (TC_OPT=0).
     Strict,
 
-    /// Relaxed matching (TC_OPT=1).
+    /// Any reduce-axis count: the tensor core takes one divisible reduce axis
+    /// and the others stay loops around the WMMA (TC_OPT=1, default).
+    #[default]
     Relaxed,
 
-    /// Padded matching (TC_OPT=2).
+    /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2).
     Padded,
 }
 
@@ -307,12 +308,15 @@ pub struct HeuristicsConfig {
     pub tc_enabled: TcUsage,
     /// Tensor core optimization level.
     ///
-    /// Defaults to [`TcOpt::Strict`] (`TC_OPT=0`), matching tinygrad
-    /// `helpers.py:238` (`ContextVar("TC_OPT", 0)`), which `heuristic.py:28-32`
-    /// reads on the hand-coded path. `TC_OPT=2` is only the *BEAM action space*
-    /// default (`search.py:22`), so the heuristic path must not inherit it —
-    /// tensor cores would silently PADTO a shape the author did not ask to pad.
-    /// Benchmarks that want the padded behaviour set it explicitly.
+    /// Defaults to [`TcOpt::Relaxed`] (`TC_OPT=1`), one step above tinygrad's
+    /// heuristic default (`helpers.py:238`): convolutions lower to a reduce
+    /// over (channels, taps), and a scalar path there runs at 1-3 TFLOPS where
+    /// the tensor core on the channel axis with the taps as an outer loop runs
+    /// at 4-18 TFLOPS on every measured shape (RTX 3060, f16). `TC_OPT=2` is
+    /// only the *BEAM action space* default (`search.py:22`), so the heuristic
+    /// path must not inherit it — tensor cores would silently PADTO a shape the
+    /// author did not ask to pad. Benchmarks that want the padded behaviour
+    /// set it explicitly.
     pub tc_opt: TcOpt,
     /// Tensor core selection mode.
     pub tc_select: TcSelect,
@@ -414,10 +418,10 @@ impl HeuristicsConfig {
             Some("2") => TcUsage::ShapeOnly,
             _ => TcUsage::Enabled,
         };
-        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 0) {
-            1 => TcOpt::Relaxed,
+        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 1) {
+            0 => TcOpt::Strict,
             2 => TcOpt::Padded,
-            _ => TcOpt::Strict,
+            _ => TcOpt::Relaxed,
         };
         let tc_select = ["SVOD_TC_SELECT", "TC_SELECT"]
             .iter()
@@ -447,7 +451,7 @@ impl Default for HeuristicsConfig {
     fn default() -> Self {
         Self {
             tc_enabled: TcUsage::Enabled,
-            tc_opt: TcOpt::Strict,
+            tc_opt: TcOpt::Relaxed,
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
             matvec_blocksize: 4,

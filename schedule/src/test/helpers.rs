@@ -171,6 +171,30 @@ pub fn create_matmul_pattern_with(
     UOp::sink(vec![reduce, m_range, n_range])
 }
 
+/// Conv-shaped `C[m,n] = sum_{k,t} A[m,k,t] * B[k,t,n]` over `stored` buffers:
+/// a matmul whose reduce spans two axes, channels `k` and taps `t`.
+pub fn create_conv_like_pattern(m: i64, n: i64, k: i64, taps: i64, stored: DType) -> Arc<UOp> {
+    use smallvec::smallvec;
+
+    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+    let t_range = UOp::range_axis(UOp::index_const(taps), AxisId::Renumbered(3), AxisType::Reduce);
+    let load = |numel: i64, outer: &Arc<UOp>, mid_stride: i64, mid: &Arc<UOp>, inner_stride: i64, inner: &Arc<UOp>| {
+        let buffer = UOp::new_buffer(DeviceSpec::Cpu, numel as usize, stored.clone());
+        let index = outer
+            .try_mul(&UOp::index_const(mid_stride))
+            .and_then(|x| x.try_add(&mid.try_mul(&UOp::index_const(inner_stride)).expect("index should build")))
+            .and_then(|x| x.try_add(inner))
+            .expect("index should build");
+        UOp::index().buffer(buffer).indices(vec![index]).call().expect("load should build")
+    };
+    let a = load(m * k * taps, &m_range, k * taps, &k_range, taps, &t_range);
+    let b = load(k * taps * n, &k_range, taps * n, &t_range, n, &n_range);
+    let reduce = a.try_mul(&b).expect("mul should succeed").reduce(smallvec![k_range, t_range], ReduceOp::Add);
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
 /// Creates a double reduction pattern (reduce two axes).
 ///
 /// Generates:

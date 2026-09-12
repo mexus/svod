@@ -1,13 +1,17 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Attribute, Error, Expr, Ident, LitInt, Result, Token, Type, braced, bracketed,
+    Attribute, Error, Expr, Generics, Ident, LitInt, Result, Token, Type, braced, bracketed,
     parse::{Parse, ParseStream},
     token::{Brace, Comma, Paren},
 };
 
 pub(crate) struct JitWrapper {
     name: Ident,
+    /// Optional wrapper generics (`RnntBlockJit<const W: usize>`): declared on
+    /// the struct and its impl, and in scope inside `build`, so one wrapper can
+    /// be instantiated at several compile-time shapes.
+    generics: Generics,
     model_ty: Type,
     /// Host-written inputs, in `prepare` order. A bare `name: Tensor` line at
     /// the top level and an `inputs { .. }` entry produce the same slot.
@@ -143,6 +147,7 @@ fn parse_slots(block: ParseStream) -> Result<Vec<Slot>> {
 impl Parse for JitWrapper {
     fn parse(input: ParseStream) -> Result<Self> {
         let name: Ident = input.parse()?;
+        let generics: Generics = input.parse()?;
         let content;
         syn::parenthesized!(content in input);
         let model_ty: Type = content.parse()?;
@@ -217,7 +222,7 @@ impl Parse for JitWrapper {
 
         let build_body = build_body.ok_or_else(|| Error::new(name.span(), "missing `build(...) { ... }` block"))?;
 
-        Ok(JitWrapper { name, model_ty, inputs, state, outputs, vars, batch_var, build_args, build_body })
+        Ok(JitWrapper { name, generics, model_ty, inputs, state, outputs, vars, batch_var, build_args, build_body })
     }
 }
 
@@ -277,6 +282,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     let rt = quote! { ::svod_tensor::jit::rt };
 
     let name = &jit.name;
+    let (impl_generics, ty_generics, where_clause) = jit.generics.split_for_impl();
     let model_ty = &jit.model_ty;
     let state_name = format_ident!("{}State", name);
     let name_str = name.to_string();
@@ -1035,7 +1041,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     });
 
     let expanded = quote! {
-        pub struct #name {
+        pub struct #name #impl_generics #where_clause {
             /// `Arc` so `replicate` can return `Self` without an `M: Clone`
             /// bound; the model only feeds `&`-access graph building. Note
             /// the wrapper is therefore `Send`/`Sync` iff `M: Send + Sync`.
@@ -1133,7 +1139,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
             }
         }
 
-        impl #name {
+        impl #impl_generics #name #ty_generics #where_clause {
             pub fn new(model: #model_ty) -> Self {
                 #(#var_inits)*
                 Self {
