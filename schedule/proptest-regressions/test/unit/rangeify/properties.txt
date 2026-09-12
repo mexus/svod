@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9260446aa0b11ae91b3bbff90806721abe5aaf3db890ebd7b26bcddfa3b5c1a6 # shrinks to terms = 1
+cc 89b10e7fb48b9e5eed5b0936dc2d46abad39831470bf9dfb4cdb23b04c21eddc # shrinks to graph = UOp { id: 45102, op: Sink(Sink { sources: [UOp { id: 45097, op: Reshape(Reshape { src: UOp { id: 45089, op: Buffer(Buffer { shape: UOp { id: 265, op: Const(ConstValueHash(Int(1))), dtype: Scalar(WeakInt), content_hash: 8657946287885845151, tag: None, origin: None, .. }, arg: ParamArg { slot: 3290, dtype: Scalar(Float32), vmin_vmax: None, multiple_of: None, name: None, addrspace: Some(Global), axis: None, device: Some(Cpu), volatile: false } }), dtype: Scalar(Float32), content_hash: 16041717660726123825, tag: None, origin: None, .. }, new_shape: UOp { id: 45096, op: Stack(Stack { sources: [UOp { id: 265, op: Const(ConstValueHash(Int(1))), dtype: Scalar(WeakInt), content_hash: 8657946287885845151, tag: None, origin: None, .. }, UOp { id: 265, op: Const(ConstValueHash(Int(1))), dtype: Scalar(WeakInt), content_hash: 8657946287885845151, tag: None, origin: None, .. }] }), dtype: Scalar(WeakInt), content_hash: 17475331138469445536, tag: None, origin: None, .. } }), dtype: Scalar(Float32), content_hash: 14005377647307462805, tag: None, origin: None, .. }], info: None }), dtype: Scalar(Void), content_hash: 16433744450058700448, tag: None, origin: None, .. }

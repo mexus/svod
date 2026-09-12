@@ -1,119 +1,66 @@
 //! `transform_sources_with_bufferize` / `transform_single_source`: how a
 //! consumer's ranges are pushed into each of its sources.
 
-use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, Op, UOp};
+use std::sync::Arc;
 
-use crate::rangeify::{
-    IndexingContext,
-    transforms::{transform_single_source, transform_sources_with_bufferize},
-};
-use svod_ir::ops;
+use svod_ir::{Op, UOp};
 
-#[test]
-fn test_transform_buffer_source() {
-    // Create two BUFFER operations with the same shape for a valid binary op
-    let buffer1 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 40, DType::Float32);
-    let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 40, DType::Float32);
+use crate::rangeify::IndexingContext;
+use crate::rangeify::transforms::transform_sources_with_bufferize;
+use crate::test::support::prelude::*;
 
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Loop);
-
-    // Create consumer - adding two buffers of the same shape
-    let consumer = buffer1.try_add(&buffer2).unwrap();
-
-    // Setup context with ranges for consumer
+fn consumer_with_ranges(consumer: &Arc<UOp>, ranges: &[Arc<UOp>]) -> IndexingContext {
     let mut ctx = IndexingContext::new();
-    ctx.set_ranges(&consumer, vec![range.clone()], vec![range.clone()]);
-
-    // Transform sources
-    let new_sources = transform_sources_with_bufferize(&consumer, &mut ctx);
-
-    assert!(new_sources.is_some());
-    let new_sources = new_sources.unwrap();
-    assert_eq!(new_sources.len(), 2);
-
-    // Both buffer sources should be wrapped in INDEX
-    assert!(matches!(new_sources[0].op(), Op::Index(..)));
-    assert!(matches!(new_sources[1].op(), Op::Index(..)));
+    ctx.set_ranges(consumer, ranges.to_vec(), ranges.to_vec());
+    ctx
 }
 
+/// A consumer's BUFFER sources are wrapped in an INDEX over its ranges, and a
+/// compute the context marked realized is materialised through a STAGE first.
 #[test]
-fn test_transform_realizable_source() {
-    // Create a source that needs realization (use compute op, not buffer)
-    let a = UOp::native_const(1.0f32);
-    let x = a.try_add(&UOp::native_const(2.0f32)).unwrap();
-    let consumer = x.try_sqrt().unwrap();
+fn buffer_sources_are_indexed_and_realized_computes_are_staged() {
+    let consumer = buffer(40).try_add(&buffer(40)).expect("add");
+    let range = range(10, svod_ir::AxisType::Loop, 0);
+    let mut ctx = consumer_with_ranges(&consumer, std::slice::from_ref(&range));
 
-    // Create ranges
-    let range = UOp::new(
-        Op::Range(ops::Range {
-            end: UOp::index_const(5),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Loop,
-            deps: smallvec::SmallVec::new(),
-        }),
-        DType::Index,
-    );
+    let sources = transform_sources_with_bufferize(&consumer, &mut ctx).expect("buffers transform");
 
-    // Setup context
-    let mut ctx = IndexingContext::new();
+    assert_eq!(sources.len(), 2);
+    for source in sources {
+        let (storage, indices) = expect_index(&source);
+        assert!(matches!(storage.op(), Op::Buffer(..)));
+        assert_same!(indices[0], range);
+    }
+
+    let x = UOp::native_const(1.0f32).try_add(&UOp::native_const(2.0f32)).expect("add");
+    let consumer = x.try_sqrt().expect("sqrt");
+    let mut ctx = consumer_with_ranges(&consumer, std::slice::from_ref(&range));
     ctx.set_ranges(&x, vec![range.clone()], vec![range.clone()]);
-    ctx.set_ranges(&consumer, vec![range.clone()], vec![range.clone()]);
     ctx.mark_realize(&x, vec![0]);
 
-    // Transform
-    let new_src = transform_single_source(&consumer, &x, std::slice::from_ref(&range), &mut ctx);
+    let source =
+        crate::rangeify::transforms::transform_single_source(&consumer, &x, std::slice::from_ref(&range), &mut ctx);
 
-    // Should be INDEX(STAGE(x))
-    if let Op::Index(ops::Index { buffer, .. }) = new_src.op() {
-        assert!(matches!(buffer.op(), Op::Stage(..)));
-    } else {
-        panic!("Expected INDEX operation");
-    }
+    let (storage, indices) = expect_index(&source);
+    assert!(matches!(storage.op(), Op::Stage(..)), "a realized compute is staged: {}", source.tree());
+    assert_same!(indices[0], range);
 }
 
+/// A consumer with no assigned ranges has nothing to push down, and a movement
+/// chain over a buffer is deferred to the BPM movement rewrite, which needs the
+/// index context that only the full pass has.
 #[test]
-fn test_no_transform_for_normal_source() {
-    let x = UOp::native_const(1.0f32);
-    let y = UOp::native_const(2.0f32);
-    // Use direct Binary construction - this test checks transform behavior, not arithmetic
-    let add = x.try_add(&y).unwrap();
+fn rangeless_and_movement_consumers_are_left_alone() {
+    let consumer = UOp::native_const(1.0f32).try_add(&UOp::native_const(2.0f32)).expect("add");
+    assert!(transform_sources_with_bufferize(&consumer, &mut IndexingContext::new()).is_none());
 
-    let mut ctx = IndexingContext::new();
+    let view = || {
+        buffer(12).try_reshape(&smallvec::smallvec![svod_ir::SInt::Const(3), svod_ir::SInt::Const(4)]).expect("reshape")
+    };
+    let consumer = view().try_add(&view()).expect("add");
+    let ranges = [range(3, svod_ir::AxisType::Loop, 0), range(4, svod_ir::AxisType::Loop, 1)];
+    let mut ctx = consumer_with_ranges(&consumer, &ranges);
 
-    // No ranges assigned, no transformation should happen
-    let result = transform_sources_with_bufferize(&add, &mut ctx);
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_transform_movement_chain_on_buffer() {
-    // Movement ops (RESHAPE, PERMUTE, etc.) on BUFFERs are NOT transformed by
-    // transform_sources_with_bufferize — they're deferred to the BPM pattern
-    // rewrite engine (movement-through-INDEX in pm_add_buffers_patterns).
-    let buffer = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
-
-    // RESHAPE(BUFFER) to 3x4 shape
-    let reshape_shape = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
-    let reshape = UOp::new(Op::Reshape(ops::Reshape { src: buffer.clone(), new_shape: reshape_shape }), DType::Float32);
-
-    assert!(reshape.op().is_movement(), "RESHAPE should be identified as movement op");
-
-    // Create an ADD that uses the reshaped buffer
-    let buffer2 = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 12, DType::Float32);
-    let reshape_shape2 = UOp::stack(vec![UOp::index_const(3), UOp::index_const(4)].into());
-    let reshape2 =
-        UOp::new(Op::Reshape(ops::Reshape { src: buffer2.clone(), new_shape: reshape_shape2 }), DType::Float32);
-    let add = reshape.try_add(&reshape2).unwrap();
-
-    // Set up context with ranges for add
-    let range0 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Loop);
-    let range1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Loop);
-
-    let mut ctx = IndexingContext::new();
-    ctx.set_ranges(&add, vec![range0.clone(), range1.clone()], vec![range0.clone(), range1.clone()]);
-
-    // Movement ops are NOT handled here — deferred to BPM rewrite engine
-    let new_sources = transform_sources_with_bufferize(&add, &mut ctx);
-    assert!(new_sources.is_none(), "Movement ops should be left for BPM rewrite engine");
+    assert!(transform_sources_with_bufferize(&consumer, &mut ctx).is_none());
+    assert!(has_op(&consumer, |op| op.is_movement()), "the fixture must contain a movement op");
 }

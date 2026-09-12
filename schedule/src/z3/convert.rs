@@ -9,7 +9,7 @@ use std::sync::Arc;
 use snafu::{OptionExt, Snafu};
 use svod_dtype::DType;
 use svod_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
-use svod_ir::{Op, UOp};
+use svod_ir::{Op, UOp, UOpKey};
 use z3::Solver;
 use z3::ast::{Bool, Dynamic, Int};
 
@@ -19,13 +19,21 @@ use svod_ir::ops;
 /// Z3 conversion context with solver.
 pub struct Z3Context {
     solver: Solver,
+    /// Conversion memo, keyed by node identity and shared across every
+    /// `convert_uop` call on this context.
+    ///
+    /// It must outlive the single call: a RANGE and a narrowing CAST each mint an
+    /// unconstrained `fresh_const`, so converting the two sides of an equivalence
+    /// separately would give the same node two unrelated Z3 variables and refute
+    /// even `e == e`. The key holds an `Arc`, so an address cannot be reused.
+    cache: HashMap<UOpKey, Dynamic>,
 }
 
 impl Z3Context {
     /// Create a new Z3 context with a solver.
     pub fn new() -> Self {
         let solver = Solver::new();
-        Self { solver }
+        Self { solver, cache: HashMap::new() }
     }
 
     /// Get mutable reference to the solver.
@@ -38,21 +46,13 @@ impl Z3Context {
     /// Processes UOps in topological order (bottom-up) to ensure dependencies
     /// are converted before they're used.
     pub fn convert_uop(&mut self, uop: &Arc<UOp>) -> Result<Dynamic, ConversionError> {
-        let mut cache = HashMap::new();
-        self.convert_uop_cached(uop, &mut cache)
+        self.convert_uop_cached(uop)
     }
 
     /// Convert UOp with caching to avoid redundant conversion.
-    fn convert_uop_cached(
-        &mut self,
-        uop: &Arc<UOp>,
-        cache: &mut HashMap<usize, Dynamic>,
-    ) -> Result<Dynamic, ConversionError> {
-        // Use pointer address as cache key
-        let key = Arc::as_ptr(uop) as usize;
-
-        // Check cache first
-        if let Some(z3_expr) = cache.get(&key) {
+    fn convert_uop_cached(&mut self, uop: &Arc<UOp>) -> Result<Dynamic, ConversionError> {
+        let key = UOpKey(uop.clone());
+        if let Some(z3_expr) = self.cache.get(&key) {
             return Ok(z3_expr.clone());
         }
 
@@ -64,7 +64,7 @@ impl Z3Context {
 
             Op::Range(ops::Range { end, .. }) => {
                 // Range represents loop variable: [0, end)
-                let end_z3 = self.convert_uop_cached(end, cache)?;
+                let end_z3 = self.convert_uop_cached(end)?;
 
                 // Create a fresh variable for this range
                 let range_var = Int::fresh_const("range");
@@ -80,20 +80,20 @@ impl Z3Context {
             }
 
             Op::Unary(op, src) => {
-                let src_z3 = self.convert_uop_cached(src, cache)?;
+                let src_z3 = self.convert_uop_cached(src)?;
                 Self::convert_unary(*op, &src_z3)?
             }
 
             Op::Binary(op, lhs, rhs) => {
-                let lhs_z3 = self.convert_uop_cached(lhs, cache)?;
-                let rhs_z3 = self.convert_uop_cached(rhs, cache)?;
+                let lhs_z3 = self.convert_uop_cached(lhs)?;
+                let rhs_z3 = self.convert_uop_cached(rhs)?;
                 Self::convert_binary(*op, &lhs_z3, &rhs_z3)?
             }
 
             Op::Ternary(TernaryOp::Where, cond, true_val, false_val) => {
-                let cond_z3 = self.convert_uop_cached(cond, cache)?;
-                let true_z3 = self.convert_uop_cached(true_val, cache)?;
-                let false_z3 = self.convert_uop_cached(false_val, cache)?;
+                let cond_z3 = self.convert_uop_cached(cond)?;
+                let true_z3 = self.convert_uop_cached(true_val)?;
+                let false_z3 = self.convert_uop_cached(false_val)?;
 
                 if let Some(cond_bool) = cond_z3.as_bool() {
                     if let (Some(true_int), Some(false_int)) = (true_z3.as_int(), false_z3.as_int()) {
@@ -107,9 +107,9 @@ impl Z3Context {
             }
 
             Op::Ternary(TernaryOp::MulAcc, a, b, c) => {
-                let a_z3 = self.convert_uop_cached(a, cache)?;
-                let b_z3 = self.convert_uop_cached(b, cache)?;
-                let c_z3 = self.convert_uop_cached(c, cache)?;
+                let a_z3 = self.convert_uop_cached(a)?;
+                let b_z3 = self.convert_uop_cached(b)?;
+                let c_z3 = self.convert_uop_cached(c)?;
 
                 if let (Some(a_int), Some(b_int), Some(c_int)) = (a_z3.as_int(), b_z3.as_int(), c_z3.as_int()) {
                     Dynamic::from_ast(&(a_int * b_int + c_int))
@@ -129,7 +129,7 @@ impl Z3Context {
                 // wrap or truncate, asserting equality could make the solver
                 // globally UNSAT and falsely "verify" arbitrary equivalences. Fall
                 // back to a fresh bounded var in that case.
-                let src_z3 = self.convert_uop_cached(src, cache)?;
+                let src_z3 = self.convert_uop_cached(src)?;
                 let cast_z3 = self.convert_bounded_from_dtype(dtype.clone())?;
                 let (dst_min, dst_max) = dtype_bounds(dtype.clone());
                 let src_fits = match (const_value_to_i64(src.vmin()), const_value_to_i64(src.vmax())) {
@@ -147,8 +147,7 @@ impl Z3Context {
             }
         };
 
-        // Cache the result
-        cache.insert(key, z3_expr.clone());
+        self.cache.insert(key, z3_expr.clone());
         Ok(z3_expr)
     }
 

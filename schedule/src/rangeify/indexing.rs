@@ -186,6 +186,9 @@ fn shape_key(shape: &[SInt]) -> UOpKey {
 }
 
 /// Whether these inputs are already memoised, for the reuse test.
+///
+/// Hash-consing makes two equal index chains the same `Arc`, so pointer equality
+/// alone cannot tell a cache hit from a rebuild; only the cache itself can.
 #[cfg(test)]
 pub(crate) fn movement_cache_holds(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> bool {
     MOVEMENT_CACHE.lock().expect("movement cache poisoned").contains_key(&movement_key(op, in_shape, rngs))

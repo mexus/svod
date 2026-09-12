@@ -1,19 +1,18 @@
 //! `split_reduceop`: two-stage reduction when the reduced extent is large enough
-//! to be worth a materialised intermediate.
+//! to be worth a materialised intermediate, plus the conditions that reject a
+//! split outright.
 
 use std::sync::Arc;
 
-use smallvec::SmallVec;
-use svod_device::DeviceSpec;
 use svod_dtype::DType;
-use svod_ir::{Op, ReduceOp, SInt, UOp};
+use svod_ir::{Op, ReduceOp, SInt, UOp, ops};
 use test_case::test_case;
 
 use crate::rangeify::kernel::{SplitReduceOpConfig, collect_range_ids, split_reduceop};
-use svod_ir::ops;
+use crate::test::support::prelude::*;
 
 fn tensor(shape: &[usize]) -> Arc<UOp> {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, shape.iter().product(), DType::Float32);
+    let buffer = buffer_of(shape.iter().product(), svod_dtype::ScalarDType::Float32);
     match shape {
         [_] => buffer,
         _ => buffer.try_reshape(&shape.iter().map(|&s| SInt::Const(s)).collect()).expect("reshape"),
@@ -21,23 +20,29 @@ fn tensor(shape: &[usize]) -> Arc<UOp> {
 }
 
 fn expanded(base: &[usize], to: &[usize]) -> Arc<UOp> {
-    let new_shape = UOp::stack(to.iter().map(|&d| UOp::index_const(d as i64)).collect());
+    let new_shape = stack(to.iter().map(|&d| UOp::index_const(d as i64)));
     UOp::new(Op::Expand(ops::Expand { src: tensor(base), new_shape }), DType::Float32)
 }
 
 fn has_contiguous(uop: &Arc<UOp>) -> bool {
-    uop.toposort().iter().any(|node| matches!(node.op(), Op::Contiguous(..)))
+    has_op(uop, |op| matches!(op, Op::Contiguous(..)))
+}
+
+fn split(source: &Arc<UOp>, axis: usize, config: &SplitReduceOpConfig) -> Option<Arc<UOp>> {
+    split_reduceop(&source.try_reduce_axis(ReduceOp::Add, vec![axis]).expect("reduce axis"), config)
 }
 
 /// Ratio of total elements to output elements decides the split; the default
 /// threshold is 32768. A broadcast (EXPAND) axis is never a split candidate —
-/// splitting it would materialise the same value repeatedly.
+/// splitting it would materialise the same value repeatedly — and a movement
+/// chain over one still splits once it is pushed through.
 #[test_case(tensor(&[1_000]), 0, false ; "1d below threshold")]
 #[test_case(tensor(&[100_000]), 0, true ; "1d above threshold")]
 #[test_case(tensor(&[1_000, 1_000]), 1, false ; "2d ratio 1000 is below threshold")]
 #[test_case(tensor(&[1_000, 100_000]), 1, true ; "2d ratio 100000 is above threshold")]
 #[test_case(expanded(&[100, 1, 1_000], &[100, 500, 1_000]), 1, false ; "the reduced axis is the broadcast one")]
 #[test_case(expanded(&[100, 1, 100_000], &[100, 50, 100_000]), 2, true ; "another axis is broadcast")]
+#[test_case(flattened_expand(), 0, true ; "a movement chain hides the extent")]
 fn a_reduction_splits_once_its_ratio_clears_the_threshold(source: Arc<UOp>, axis: usize, splits: bool) {
     let reduce = source.try_reduce_axis(ReduceOp::Add, vec![axis]).expect("reduce axis");
 
@@ -55,16 +60,9 @@ fn a_reduction_splits_once_its_ratio_clears_the_threshold(source: Arc<UOp>, axis
     }
 }
 
-/// `RESHAPE(EXPAND(RESHAPE(buffer)))` flattened to one axis: the movement chain
-/// has to be pushed through before the extent can be judged.
-#[test]
-fn a_reduction_behind_a_movement_chain_still_splits() {
-    let flattened =
-        expanded(&[50, 1], &[50, 1_000]).try_reshape(&smallvec::smallvec![SInt::Const(50_000)]).expect("reshape");
-    let reduce = flattened.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis");
-
-    let transformed = split_reduceop(&reduce, &SplitReduceOpConfig::default()).expect("50000 clears the threshold");
-    assert!(has_contiguous(&transformed));
+/// `RESHAPE(EXPAND(RESHAPE(buffer)))` flattened to one axis.
+fn flattened_expand() -> Arc<UOp> {
+    expanded(&[50, 1], &[50, 1_000]).try_reshape(&smallvec::smallvec![SInt::Const(50_000)]).expect("reshape")
 }
 
 #[test_case(ReduceOp::Add ; "add")]
@@ -76,10 +74,7 @@ fn the_split_keeps_the_original_reduce_op(reduce_op: ReduceOp) {
 
     let transformed = split_reduceop(&reduce, &SplitReduceOpConfig::default()).expect("split");
     assert!(
-        transformed
-            .toposort()
-            .iter()
-            .any(|node| matches!(node.op(), Op::Reduce(ops::Reduce { reduce_op: op, .. }) if *op == reduce_op)),
+        has_op(&transformed, |op| matches!(op, Op::Reduce(ops::Reduce { reduce_op: op, .. }) if *op == reduce_op)),
         "{reduce_op:?} must survive the split"
     );
 }
@@ -87,23 +82,74 @@ fn the_split_keeps_the_original_reduce_op(reduce_op: ReduceOp) {
 #[test]
 fn the_split_can_be_turned_off() {
     let config = SplitReduceOpConfig { enabled: false, ..Default::default() };
-    let reduce = tensor(&[100_000]).try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis");
-
-    assert!(split_reduceop(&reduce, &config).is_none());
+    assert!(split(&tensor(&[100_000]), 0, &config).is_none());
 }
 
+// ===== bail-out conditions =====
+
+/// A REDUCE with no axes and one whose ranges are already closed are not
+/// tensor-form reductions and cannot be re-shaped into two stages.
 #[test]
-fn the_output_size_cap_follows_the_configured_bit_width() {
+fn axeless_or_ranged_reductions_do_not_split() {
+    let source = tensor(&[100_000]);
+    let no_axes = UOp::new(
+        Op::Reduce(ops::Reduce {
+            src: source.clone(),
+            ranges: smallvec::smallvec![],
+            reduce_op: ReduceOp::Add,
+            num_axes: 0,
+        }),
+        DType::Float32,
+    );
+    let with_ranges = UOp::new(
+        Op::Reduce(ops::Reduce {
+            src: source,
+            ranges: smallvec::smallvec![global_range(100_000, 0)],
+            reduce_op: ReduceOp::Add,
+            num_axes: 1,
+        }),
+        DType::Float32,
+    );
+
+    for reduce in [no_axes, with_ranges] {
+        assert!(split_reduceop(&reduce, &SplitReduceOpConfig::default()).is_none(), "{}", reduce.tree());
+    }
+}
+
+/// The output-size cap is what rejects a candidate, and `output_size_bits` alone
+/// decides the cap; the other defaults are the documented schedule policy.
+#[test]
+fn the_output_cap_rejects_every_divisor_when_it_is_too_small() {
+    let config = SplitReduceOpConfig { output_size_bits: 4, ..Default::default() };
+    assert_eq!(config.max_output_size(), 16);
+    assert!(split(&tensor(&[1_000, 100_000]), 1, &config).is_none());
+
     let default = SplitReduceOpConfig::default();
     assert_eq!((default.split_threshold, default.max_divisor, default.min_divisor), (32768, 256, 8));
     assert_eq!(default.max_output_size(), 1 << default.output_size_bits);
-
     let narrower = SplitReduceOpConfig { output_size_bits: 20, ..Default::default() };
     assert_eq!(narrower.max_output_size(), 1 << 20);
 }
 
+/// A split needs a divisor of the reduced dimension: a prime extent has none and
+/// a symbolic extent cannot be divided at schedule time, so both are left alone.
+/// A non-REDUCE can never be split either.
+#[test]
+fn nondivisible_symbolic_and_nonreduce_inputs_do_not_split() {
+    assert!(split(&tensor(&[100_003]), 0, &SplitReduceOpConfig::default()).is_none());
+
+    let size = UOp::var("size", DType::Int32, 1, i64::MAX);
+    let symbolic = UOp::new_buffer(svod_device::DeviceSpec::Cpu, 1, DType::Float32)
+        .try_reshape(&smallvec::smallvec![SInt::Symbolic(size)])
+        .expect("reshape");
+    let reduce = symbolic.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis");
+    assert!(split_reduceop(&reduce, &SplitReduceOpConfig::default()).is_none());
+
+    assert!(split_reduceop(&tensor(&[100_000]), &SplitReduceOpConfig::default()).is_none());
+}
+
 fn range_ids(ranges: &[(i64, usize)]) -> Vec<usize> {
-    let uops: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|&(end, id)| UOp::range_const(end, id)).collect();
+    let uops: smallvec::SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|&(end, id)| global_range(end, id)).collect();
     let expr = uops.iter().skip(1).fold(uops[0].clone(), |acc, r| acc.try_add(r).expect("add"));
     collect_range_ids(&expr)
 }

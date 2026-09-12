@@ -1,138 +1,93 @@
+//! The one fixture surface for the rangeify tests.
+
 use std::sync::Arc;
 
-use svod_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
+use svod_ir::{BinaryOp, ConstValue, DType, Matcher, Op, RewriteResult, UOp};
 use test_case::test_case;
 
 use crate::rangeify::indexing::{get_const_value, is_const, is_identity_value, is_zero_value};
-use svod_ir::ops;
+use crate::test::support::count::count_kinds;
 
-/// Count occurrences of ops matching a predicate in a UOp graph.
-///
-/// Recursively traverses the graph and counts all UOps where `predicate` returns true.
-pub fn count_ops<F>(uop: &Arc<UOp>, predicate: F) -> usize
-where
-    F: Fn(&Op) -> bool + Copy,
-{
-    let mut count = if predicate(uop.op()) { 1 } else { 0 };
+pub(crate) use crate::test::support::build::{has_op, reduce_range};
 
-    // Count in all source UOps
-    for src in uop.op().sources() {
-        count += count_ops(&src, predicate);
+/// Distinct `CALL`s, i.e. the kernel count.
+pub(crate) use crate::test::support::count::kernels as count_kernels;
+
+pub(crate) fn count_stores(uop: &Arc<UOp>) -> usize {
+    count_kinds(uop).stores
+}
+
+pub(crate) fn count_stages(uop: &Arc<UOp>) -> usize {
+    count_kinds(uop).stages
+}
+
+pub(crate) fn any_op(uop: &Arc<UOp>, pred: impl Fn(&Op) -> bool) -> bool {
+    uop.toposort().iter().any(|node| pred(node.op()))
+}
+
+#[track_caller]
+pub(crate) fn assert_same_ptr(a: &Arc<UOp>, b: &Arc<UOp>) {
+    assert!(Arc::ptr_eq(a, b), "expected the same node\n got: {}\nwant: {}", a.tree(), b.tree());
+}
+
+/// The rewritten node, panicking on `NoMatch`/`Gate`: `if let Rewritten { .. }` with no
+/// `else` would pass when the pattern never fires.
+#[track_caller]
+pub(crate) fn rewritten<C>(matcher: &(impl Matcher<C> + ?Sized), uop: &Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    match matcher.rewrite(uop, ctx) {
+        RewriteResult::Rewritten(out) => out,
+        other => panic!("expected Rewritten, got {other:?}\nfor {}", uop.tree()),
     }
-
-    count
 }
 
-/// Count CALL operations in a UOp graph.
-pub fn count_kernels(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Call(..)))
+#[track_caller]
+pub(crate) fn assert_no_match<C>(matcher: &(impl Matcher<C> + ?Sized), uop: &Arc<UOp>, ctx: &mut C) {
+    if let result @ (RewriteResult::Rewritten(_) | RewriteResult::Gate(_)) = matcher.rewrite(uop, ctx) {
+        panic!("expected NoMatch, got {result:?}\nfor {}", uop.tree());
+    }
 }
 
-/// Extract the first CALL from a pipeline result.
-///
-/// The kernel split pipeline may return:
-/// - CALL directly
-/// - AFTER(DEFINE_GLOBAL, [END(CALL)])
-/// - SINK([AFTER(...)])
-///
-/// This helper extracts the first CALL found in any of these structures.
-pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+#[track_caller]
+pub(crate) fn const_value(uop: &Arc<UOp>) -> ConstValue {
     match uop.op() {
-        // Direct callable wrapper
+        Op::Const(value) => value.0,
+        other => panic!("expected Const, got {other:?}\n{}", uop.tree()),
+    }
+}
+
+#[track_caller]
+pub(crate) fn assert_const_float(uop: &Arc<UOp>, expected: f32) {
+    let value = const_value(uop).try_float().unwrap_or_else(|| panic!("expected a float const\n{}", uop.tree()));
+    assert_eq!(value as f32, expected, "expected {expected}, got\n{}", uop.tree());
+}
+
+/// The first CALL of a pipeline result, which may be CALL, `AFTER(_, [END(CALL)])`,
+/// `SINK([.., CALL, ..])` or `END(CALL)`.
+pub(crate) fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match uop.op() {
         Op::Call(..) => Some(uop.clone()),
-        // AFTER(passthrough, deps) - check deps for END(CALL)
-        Op::After(ops::After { deps, .. }) => {
-            for dep in deps.iter() {
-                if let Op::End(ops::End { computation, .. }) = dep.op()
-                    && matches!(computation.op(), Op::Call(..))
-                {
-                    return Some(computation.clone());
-                }
-                // Also check if dep is directly a callable wrapper
-                if matches!(dep.op(), Op::Call(..)) {
-                    return Some(dep.clone());
-                }
-            }
-            None
-        }
-        // SINK - check sources
-        Op::Sink(ops::Sink { sources, .. }) => {
-            for src in sources.iter() {
-                if let Some(kernel) = extract_kernel(src) {
-                    return Some(kernel);
-                }
-            }
-            None
-        }
-        // END(CALL)
-        Op::End(ops::End { computation, .. }) if matches!(computation.op(), Op::Call(..)) => Some(computation.clone()),
+        Op::After(svod_ir::ops::After { deps, .. }) => deps.iter().find_map(extract_kernel),
+        Op::Sink(svod_ir::ops::Sink { sources, .. }) => sources.iter().find_map(extract_kernel),
+        Op::End(svod_ir::ops::End { computation, .. }) => extract_kernel(computation),
         _ => None,
     }
 }
 
-/// Count codegen PARAM operations (device: None) in a UOp graph.
-pub fn count_codegen_params(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Param(ops::Param { arg, .. }) if arg.device.is_none()))
+pub(crate) fn loop_range(end: i64, axis_id: usize) -> Arc<UOp> {
+    crate::test::support::build::range(end, svod_ir::AxisType::Loop, axis_id)
 }
 
-/// Count DEFINE_LOCAL operations in a UOp graph.
-pub fn count_define_locals(uop: &Arc<UOp>) -> usize {
-    count_ops(
-        uop,
-        |op| matches!(op, Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(svod_dtype::AddrSpace::Local)),
-    )
+/// The `RANGE`s an `END`/`SINK` subtree closes.
+pub(crate) fn closed_range_count(uop: &Arc<UOp>) -> usize {
+    match uop.op() {
+        Op::End(svod_ir::ops::End { ranges, .. }) => ranges.len(),
+        Op::Sink(svod_ir::ops::Sink { sources, .. }) => sources.iter().map(closed_range_count).sum(),
+        _ => 0,
+    }
 }
-
-/// Count STORE operations in a UOp graph.
-pub fn count_stores(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Store(..)))
-}
-
-/// Count END operations in a UOp graph.
-pub fn count_ends(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::End(..)))
-}
-
-/// Count STAGE operations in a UOp graph.
-pub fn count_bufferizes(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Stage(..)))
-}
-
-// ============================================================================
-// Test UOp Construction Helpers
-// ============================================================================
-
-/// Create a constant UOp with the given value.
-pub fn create_const(val: i64) -> Arc<UOp> {
-    UOp::index_const(val)
-}
-
-/// Create a RANGE operation with constant end value.
-pub fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
-    UOp::range_const(end, axis_id)
-}
-
-/// Create a RANGE operation with symbolic end value.
-pub fn create_range_symbolic(end: Arc<UOp>, axis_id: usize) -> Arc<UOp> {
-    UOp::range(end, axis_id)
-}
-
-/// Create a STAGE operation with global address space.
-pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::stage_global(compute, ranges)
-}
-
-/// Create a STAGE operation with custom options.
-pub fn create_bufferize_opts(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: BufferizeOpts) -> Arc<UOp> {
-    UOp::stage(compute, ranges, opts)
-}
-
-// ============================================================================
-// Tests for the indexing helpers these builders feed
-// ============================================================================
 
 /// `is_identity_value` is per-operator and side-aware: `-` and `//` have a right
-/// identity only.
+/// identity only; the bitwise operators use the all-ones mask.
 #[test_case(ConstValue::Int(0), BinaryOp::Add, false, true ; "zero is a left add identity")]
 #[test_case(ConstValue::Int(0), BinaryOp::Add, true, true ; "zero is a right add identity")]
 #[test_case(ConstValue::Float(0.0), BinaryOp::Add, false, true ; "float zero is an add identity")]
@@ -143,6 +98,12 @@ pub fn create_bufferize_opts(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: Buf
 #[test_case(ConstValue::Int(0), BinaryOp::Sub, true, true ; "sub has a right identity")]
 #[test_case(ConstValue::Int(1), BinaryOp::FloorDiv, false, false ; "div has no left identity")]
 #[test_case(ConstValue::Int(1), BinaryOp::FloorDiv, true, true ; "div has a right identity")]
+#[test_case(ConstValue::Float(1.0), BinaryOp::Fdiv, true, true ; "float div has a right identity")]
+#[test_case(ConstValue::Float(2.0), BinaryOp::Fdiv, true, false ; "float div right identity is one")]
+#[test_case(ConstValue::Int(0), BinaryOp::Or, false, true ; "zero is an or identity")]
+#[test_case(ConstValue::Int(0), BinaryOp::Xor, true, true ; "zero is a xor identity")]
+#[test_case(ConstValue::Int(-1), BinaryOp::And, false, true ; "all ones is an and identity")]
+#[test_case(ConstValue::Int(0), BinaryOp::And, true, false ; "zero is not an and identity")]
 #[test_case(ConstValue::Int(2), BinaryOp::Add, false, false ; "two is not an add identity")]
 #[test_case(ConstValue::Int(0), BinaryOp::Mul, false, false ; "zero is not a mul identity")]
 fn identity_values(value: ConstValue, op: BinaryOp, right: bool, expected: bool) {
@@ -152,7 +113,9 @@ fn identity_values(value: ConstValue, op: BinaryOp, right: bool, expected: bool)
 /// `is_zero_value` is the absorbing element, not the literal zero.
 #[test_case(ConstValue::Int(0), BinaryOp::Mul, true ; "zero absorbs mul")]
 #[test_case(ConstValue::Float(0.0), BinaryOp::Mul, true ; "float zero absorbs mul")]
+#[test_case(ConstValue::Float(-0.0), BinaryOp::Mul, true ; "signed zero absorbs mul too")]
 #[test_case(ConstValue::Int(0), BinaryOp::And, true ; "zero absorbs and")]
+#[test_case(ConstValue::UInt(0), BinaryOp::And, false ; "only Int zero is in the absorbing table")]
 #[test_case(ConstValue::Int(1), BinaryOp::Mul, false ; "one does not absorb mul")]
 #[test_case(ConstValue::Int(0), BinaryOp::Add, false ; "zero does not absorb add")]
 fn zero_values(value: ConstValue, op: BinaryOp, expected: bool) {
