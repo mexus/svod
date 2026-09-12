@@ -136,6 +136,13 @@ pub const SM80_CFG: MatmulCfg =
 pub const SM80_SMALL_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
+/// Apple7+ (`simdgroup_matrix`, SIMD-group 32) config: 64x64 block, 2x2 waves
+/// (128 threads), one 32x32 accumulator/wave, `k_step = 32`. `vec_load` is **off**:
+/// the 128-bit fill is an 8-lane bf16 vector and MSL has no vector wider than 4
+/// lanes. The two 64x32 bf16 strips are 8 KiB of Apple's 32 KiB threadgroup budget.
+pub const METAL_CFG: MatmulCfg =
+    MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: 32 };
+
 /// Size-adaptive config selection: small N (where the 256×256/8-wave grid
 /// starves the machine) uses [`SMALL_CFG`]; everything else keeps [`M1_CFG`].
 /// Small N uses an occupancy-tuned config; the threshold follows size-adaptive tuning.
@@ -154,6 +161,7 @@ pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
         svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151) if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
         svod_dtype::GpuArch::Cuda(_) if n.is_multiple_of(SM80_CFG.block) => SM80_CFG,
         svod_dtype::GpuArch::Cuda(_) => SM80_SMALL_CFG,
+        svod_dtype::GpuArch::Metal(_) => METAL_CFG,
         _ => cfg_for_n(n),
     }
 }
@@ -185,7 +193,8 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &MatmulCfg) -> (Arc<UOp>,
 /// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere).
 pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
     crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
-        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
+        .with_metal_from(svod_dtype::MetalFamily::Apple(7));
 
 /// **Graph-native** `n×n` matrix multiply — returns a lazy output [`Tensor`] (a
 /// `custom_kernel` / `Op::Call` node), the matmul peer of [`crate::flash_attention`].
@@ -366,7 +375,7 @@ pub fn gemm_core(
     // [k_step, reg] Col fragment, and per-accumulator A sub-tiles (M row-block
     // {warp_row + a*wave_rows}).
     let bb = g.load(
-        ker.operand((k_step, reg), in_dt.clone(), TileLayout::Col),
+        ker.operand_b((k_step, reg), in_dt.clone(), TileLayout::Col),
         b_smem.subtile((k_step, reg), (0, warp_col.clone())),
         MoveIdx::default(),
     );

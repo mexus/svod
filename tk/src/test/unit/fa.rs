@@ -11,6 +11,7 @@ use svod_tensor::Tensor;
 use crate::Kernel;
 use crate::kernels::fa::{FaConfig, FaOpts, build_fa_mw_rdb, flash_attention_with};
 use svod_ir::ops;
+use test_case::test_case;
 
 /// A non-rank-4 `q`/`k` operand is a structured `Err` (not a panic). The shape
 /// preconditions resolve before any device dispatch, so this runs GPU-free.
@@ -991,4 +992,349 @@ fn fa_policy_counts_the_rdna_band() {
     assert!(rdna.att_band && !cdna.att_band);
     assert_eq!(rdna.shared_bytes((16, 32), 64) - cdna.shared_bytes((16, 32), 64), 8 * 32 * 16 * 2);
     assert_eq!(cdna.shared_bytes((16, 32), 64), 4 * 32 * 64 * 2);
+}
+
+// ── Metal (Apple7+, `simdgroup_matrix`) ───────────────────────────────────────
+
+/// Host render of the production FA builder for an Apple GPU: same body, the 8x8
+/// `simdgroup_matrix` fragment, MSL out. No GPU needed.
+fn render_fa_metal(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, usize), cfg: FaConfig) -> String {
+    use crate::kernels::fa::NUM_WARPS;
+    let family = svod_dtype::MetalFamily::Apple(9);
+    let caps = crate::ArchCaps::for_arch(svod_dtype::GpuArch::Metal(family));
+    let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+    let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    let sink = ker.finish(1);
+    let renderer = svod_codegen::c::CRenderer::metal();
+    let opt_renderer = svod_schedule::OptimizerRenderer::for_metal_family(family).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&renderer),
+        None,
+    );
+    let optimized =
+        svod_schedule::apply_post_optimization_with_renderer(sink, &opt_renderer).expect("post optimization");
+    let program =
+        svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu).expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear_uop =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear_uop, Some(name)).expect("render").code;
+    if let Ok(dir) = std::env::var("TK_DUMP_MSL") {
+        std::fs::create_dir_all(&dir).expect("dump dir");
+        std::fs::write(std::path::Path::new(&dir).join(format!("{name}.metal")), &code).expect("dump MSL");
+    }
+    code
+}
+
+/// Apple FA renders to MSL: the WMMA helper is the 8x8x8 simdgroup-matrix call,
+/// the cross-lane fold is `simd_shuffle_xor`, K/V ride `threadgroup` arrays, and
+/// nothing AMD- or PTX-shaped survives (in particular the `; svod.sched.pipeline`
+/// marker, which is an LLVM comment and not valid MSL, must be dropped).
+#[test_case(16, 32, false, 64; "16x32 d64")]
+#[test_case(16, 32, true, 64; "16x32 causal d64")]
+#[test_case(16, 16, false, 128; "16x16 d128")]
+fn test_fa_metal_renders_simdgroup_matrix(q_blk: usize, kv_blk: usize, causal: bool, d: usize) {
+    let cfg = FaConfig { q_blk, kv_blk, unroll: false, causal };
+    let code = render_fa_metal(&format!("fa_metal_{q_blk}x{kv_blk}_{causal}_{d}"), (1, 256, 2, 2, d), cfg);
+    assert!(code.contains("kernel void fa_metal_"), "MSL kernel signature");
+    assert!(code.contains("simdgroup_multiply_accumulate"), "8x8 matrix core");
+    assert!(code.contains("__WMMA_8_8_8_bfloat_float"), "canonical WMMA helper name");
+    assert!(code.contains("simdgroup_bfloat8x8") && code.contains("simdgroup_float8x8"), "fragment types");
+    assert!(code.contains("simd_shuffle_xor"), "butterfly row fold");
+    assert!(code.contains("threadgroup "), "K/V staged in threadgroup memory");
+    assert!(code.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"), "LDS fences");
+    assert!(!code.contains("svod.sched"), "scheduling markers must not reach MSL");
+    assert!(!code.contains("amdgcn") && !code.contains("mfma"), "no AMD intrinsics");
+    assert!(!code.contains("nvvm") && !code.contains("mma.sync") && !code.contains("ldmatrix"), "no PTX");
+    assert!(!code.contains("Scalar("), "no Debug-formatted dtype leaked into an identifier");
+}
+
+/// Diagnostic: run the smallest FA case and report WHERE the output disagrees —
+/// which q rows, which d columns, and whether the result is a permutation of the
+/// reference along either axis. A magnitude alone cannot distinguish "wrong
+/// fragment order" from "wrong softmax".
+#[test]
+#[ignore]
+fn diag_fa_structure() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip: unsupported device");
+        return;
+    }
+    let (b, n, h, d) = (1usize, 128usize, 1usize, 64usize);
+    let mk = || {
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::Float16);
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(), mk(), mk());
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None })
+        .expect("fa")
+        .expect("applies")
+        .cast(DType::Float32);
+    og.realize().expect("realize");
+    let got: Vec<f32> = og.as_vec::<f32>().expect("read");
+    let perm = |t: &Tensor| t.cast(DType::Float32).try_permute(&[0, 2, 1, 3]).expect("permute");
+    let r =
+        perm(&q).scaled_dot_product_attention().key(&perm(&k)).value(&perm(&v)).is_causal(false).call().expect("sdpa");
+    let r = r.try_permute(&[0, 2, 1, 3]).expect("back");
+    r.realize().expect("realize ref");
+    let exp: Vec<f32> = r.as_vec::<f32>().expect("read ref");
+
+    let at = |v: &Vec<f32>, row: usize, col: usize| v[row * d + col];
+    // Per-row and per-column error profile.
+    let row_err: Vec<f32> =
+        (0..n).map(|i| (0..d).map(|j| (at(&got, i, j) - at(&exp, i, j)).abs()).fold(0.0, f32::max)).collect();
+    let col_err: Vec<f32> =
+        (0..d).map(|j| (0..n).map(|i| (at(&got, i, j) - at(&exp, i, j)).abs()).fold(0.0, f32::max)).collect();
+    let bad_rows: Vec<usize> = (0..n).filter(|&i| row_err[i] > 2e-2).collect();
+    let bad_cols: Vec<usize> = (0..d).filter(|&j| col_err[j] > 2e-2).collect();
+    println!("bad rows {}/{n}: {:?}", bad_rows.len(), &bad_rows[..bad_rows.len().min(24)]);
+    println!("bad cols {}/{d}: {:?}", bad_cols.len(), &bad_cols[..bad_cols.len().min(24)]);
+    // Is row i of `got` equal to some other row of `exp`?
+    for i in 0..8.min(n) {
+        let best = (0..n)
+            .map(|c| (c, (0..d).map(|j| (at(&got, i, j) - at(&exp, c, j)).abs()).fold(0.0, f32::max)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("rows");
+        println!("  got row {i:3} best-matches exp row {:3} (err {:.4})", best.0, best.1);
+    }
+    println!("got[0][..8] = {:?}", &got[..8]);
+    println!("exp[0][..8] = {:?}", &exp[..8]);
+}
+
+// ── QK rung ───────────────────────────────────────────────────────────────────
+
+/// The FA `QKᵀ` step in isolation: the exact tile sequence `fa_qk` runs — load K
+/// and Q, grid-transpose both, `mma_atb` into a `Col` accumulator — with no LDS
+/// double buffer, no mask and no softmax. `att[i][j]` must equal
+/// `Σ_d K[i][d]·Q[j][d]`. This is the rung between "matmul is correct" (which
+/// exercises `mma_ab` with a `Row` A) and "flash attention is correct"; the
+/// difference it isolates is the `a_t` path and the register grid transpose.
+/// `cargo test -p svod-tk --lib fa::qk_step_contract -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn qk_step_contract() {
+    use crate::MoveIdx;
+    use crate::arch::FragRole;
+    use crate::tiles::TileLayout;
+
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip qk_step_contract: no fragment device");
+        return;
+    };
+    let (kv, q, d) = (16usize, 16usize, 16usize);
+    let dt = DType::BFloat16;
+    let bdt = dt.clone();
+    let build = move |ker: &Kernel| -> Arc<UOp> {
+        let dt = bdt.clone();
+        let warp = ker.warp();
+        let o = ker.gl(&[1, 1, kv, q], DType::Float32);
+        let gk = ker.gl(&[1, 1, kv, d], dt.clone());
+        let gq = ker.gl(&[1, 1, q, d], dt.clone());
+        let k_reg = warp.load(ker.operand((kv, d), dt.clone(), TileLayout::Row), gk, MoveIdx::block((0, 0, 0, 0), 2));
+        let q_reg = warp.load(ker.operand_b((q, d), dt.clone(), TileLayout::Row), gq, MoveIdx::block((0, 0, 0, 0), 2));
+        let k_reg_t = warp.transpose(ker.operand((d, kv), dt.clone(), TileLayout::Col), &k_reg);
+        let q_reg_t = warp.transpose(ker.operand_b((d, q), dt.clone(), TileLayout::Col), &q_reg);
+        let att = warp.zero(ker.acc((kv, q), TileLayout::Col));
+        let att = warp.mma_atb(att, &k_reg_t, &q_reg_t);
+        let _ = warp.store(o, att, MoveIdx::block((0, 0, 0, 0), 2));
+        let _ = ker.frag(FragRole::Accumulator);
+        ker.finish(1)
+    };
+    // Small integers so bf16 is exact and a mismatch is a wiring fault.
+    let kd: Vec<f32> = (0..kv * d).map(|p| ((p * 5 + p / d) % 7) as f32 - 3.0).collect();
+    let qd: Vec<f32> = (0..q * d).map(|p| ((p * 3 + p % d) % 5) as f32 - 2.0).collect();
+    let mk = |v: &[f32], r: usize, c: usize| {
+        let t = Tensor::from_slice(v).try_reshape([1, 1, r, c]).expect("reshape").cast(dt.clone());
+        t.realize().expect("realize");
+        t
+    };
+    let (tk_, tq) = (mk(&kd, kv, d), mk(&qd, q, d));
+    let mut out = Tensor::empty(&[1, 1, kv, q], DType::Float32);
+    crate::run_kernel("qk_step", [1, 1, 1], caps.wave_size as i64, &mut [&mut out], &[&tk_, &tq], build)
+        .expect("qk launch");
+    let got = out.as_vec::<f32>().expect("read out");
+
+    let want = |i: usize, j: usize| -> f32 { (0..d).map(|x| kd[i * d + x] * qd[j * d + x]).sum() };
+    let mut bad = Vec::new();
+    for i in 0..kv {
+        for j in 0..q {
+            if (got[i * q + j] - want(i, j)).abs() > 1e-3 {
+                bad.push((i, j, want(i, j), got[i * q + j]));
+            }
+        }
+    }
+    // Which product IS it? Same technique as `matmul_core_contract`.
+    let at = |v: &[f32], t: bool, r: usize, c: usize| if t { v[c * d + r] } else { v[r * d + c] };
+    let mut matches = Vec::new();
+    for (xn, xv, xt) in [("K", &kd, false), ("Kᵀ", &kd, true), ("Q", &qd, false), ("Qᵀ", &qd, true)] {
+        for (yn, yv, yt) in [("K", &kd, false), ("Kᵀ", &kd, true), ("Q", &qd, false), ("Qᵀ", &qd, true)] {
+            for ot in [false, true] {
+                let ok = (0..kv).all(|i| {
+                    (0..q).all(|j| {
+                        let w: f32 = (0..d).map(|x| at(xv, xt, i, x) * at(yv, yt, x, j)).sum();
+                        let g = if ot { got[j * q + i] } else { got[i * q + j] };
+                        (g - w).abs() < 1e-3
+                    })
+                });
+                if ok {
+                    matches.push(format!("{}{xn}·{yn}{}", if ot { "(" } else { "" }, if ot { ")ᵀ" } else { "" }));
+                }
+            }
+        }
+    }
+    println!("{}: {} / {} wrong; computes {matches:?}", caps.arch.target_name(), bad.len(), kv * q);
+    for &(i, j, w, g) in bad.iter().take(6) {
+        println!("   ({i:2},{j:2}) want {w:7.1} got {g:7.1}");
+    }
+    assert!(bad.is_empty(), "QKᵀ step wrong");
+}
+
+/// The FA `QKᵀ → A·V` chain in isolation, deterministic: `att = K·Qᵀ` into a `Col`
+/// accumulator, copied to a B-position operand, then `o = Vᵀ·att`. This is the rung
+/// above [`qk_step_contract`] — it adds the accumulator→operand handoff and the
+/// second `mma_atb`, and it is deterministic where the end-to-end FA tests use
+/// `randn` (so their error magnitudes are not comparable between runs).
+/// `cargo test -p svod-tk --lib fa::qk_pv_chain_contract -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn qk_pv_chain_contract() {
+    use crate::MoveIdx;
+    use crate::tiles::TileLayout;
+
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip qk_pv_chain_contract: no fragment device");
+        return;
+    };
+    let (kv, q, d) = (16usize, 16usize, 16usize);
+    let dt = DType::BFloat16;
+    let bdt = dt.clone();
+    let build = move |ker: &Kernel| -> Arc<UOp> {
+        let dt = bdt.clone();
+        let warp = ker.warp();
+        let o = ker.gl(&[1, 1, d, q], DType::Float32);
+        let gk = ker.gl(&[1, 1, kv, d], dt.clone());
+        let gq = ker.gl(&[1, 1, q, d], dt.clone());
+        let gv = ker.gl(&[1, 1, kv, d], dt.clone());
+        let blk = MoveIdx::block((0, 0, 0, 0), 2);
+        let k_reg = warp.load(ker.operand((kv, d), dt.clone(), TileLayout::Row), gk, blk.clone());
+        let q_reg = warp.load(ker.operand_b((q, d), dt.clone(), TileLayout::Row), gq, blk.clone());
+        let v_reg = warp.load(ker.operand((kv, d), dt.clone(), TileLayout::Col), gv, blk.clone());
+        let k_reg_t = warp.transpose(ker.operand((d, kv), dt.clone(), TileLayout::Col), &k_reg);
+        let q_reg_t = warp.transpose(ker.operand_b((d, q), dt.clone(), TileLayout::Col), &q_reg);
+        let att = warp.zero(ker.acc((kv, q), TileLayout::Col));
+        let att = warp.mma_atb(att, &k_reg_t, &q_reg_t);
+        let att_mma = warp.copy(ker.operand_b((kv, q), dt.clone(), TileLayout::Col), &att);
+        let acc = warp.zero(ker.acc((d, q), TileLayout::Col));
+        let acc = warp.mma_atb(acc, &v_reg, &att_mma);
+        let _ = warp.store(o, acc, blk);
+        ker.finish(1)
+    };
+    let kd: Vec<f32> = (0..kv * d).map(|p| ((p * 5 + p / d) % 7) as f32 - 3.0).collect();
+    let qd: Vec<f32> = (0..q * d).map(|p| ((p * 3 + p % d) % 5) as f32 - 2.0).collect();
+    let vd: Vec<f32> = (0..kv * d).map(|p| ((p * 2 + p / d) % 3) as f32 - 1.0).collect();
+    let mk = |v: &[f32], r: usize, c: usize| {
+        let t = Tensor::from_slice(v).try_reshape([1, 1, r, c]).expect("reshape").cast(dt.clone());
+        t.realize().expect("realize");
+        t
+    };
+    let (tk_, tq, tv) = (mk(&kd, kv, d), mk(&qd, q, d), mk(&vd, kv, d));
+    let mut out = Tensor::empty(&[1, 1, d, q], DType::Float32);
+    crate::run_kernel("qk_pv", [1, 1, 1], caps.wave_size as i64, &mut [&mut out], &[&tk_, &tq, &tv], build)
+        .expect("qk_pv launch");
+    let got = out.as_vec::<f32>().expect("read out");
+
+    let att = |i: usize, j: usize| -> f32 { (0..d).map(|x| kd[i * d + x] * qd[j * d + x]).sum() };
+    let want = |dd: usize, j: usize| -> f32 { (0..kv).map(|i| vd[i * d + dd] * att(i, j)).sum() };
+    let mut bad = Vec::new();
+    for dd in 0..d {
+        for j in 0..q {
+            if (got[dd * q + j] - want(dd, j)).abs() > 1e-2 {
+                bad.push((dd, j, want(dd, j), got[dd * q + j]));
+            }
+        }
+    }
+    let transposed = (0..d).all(|dd| (0..q).all(|j| (got[j * q + dd] - want(dd, j)).abs() <= 1e-2));
+    println!("{}: {} / {} wrong; result is oᵀ: {transposed}", caps.arch.target_name(), bad.len(), d * q);
+    for &(i, j, w, g) in bad.iter().take(6) {
+        println!("   ({i:2},{j:2}) want {w:9.1} got {g:9.1}");
+    }
+    assert!(bad.is_empty(), "QKᵀ→A·V chain wrong");
+}
+
+/// [`qk_pv_chain_contract`] plus FA's **output path**: the `[d,q]` PV accumulator
+/// is grid-transposed into an `acc_t` and stored as `O[q,d]`. The grid transpose
+/// swaps fragments but not their contents, so this is the rung that pins whether
+/// `FragRole::AccumulatorT` carries the right map. Deterministic: `att = K·Qᵀ` into a `Col`
+/// accumulator, copied to a B-position operand, then `o = Vᵀ·att`. This is the rung
+/// above [`qk_step_contract`] — it adds the accumulator→operand handoff and the
+/// second `mma_atb`, and it is deterministic where the end-to-end FA tests use
+/// `randn` (so their error magnitudes are not comparable between runs).
+/// `cargo test -p svod-tk --lib fa::fa_output_store_contract -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fa_output_store_contract() {
+    use crate::MoveIdx;
+    use crate::tiles::TileLayout;
+
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip fa_output_store_contract: no fragment device");
+        return;
+    };
+    let (kv, q, d) = (16usize, 16usize, 16usize);
+    let dt = DType::BFloat16;
+    let bdt = dt.clone();
+    let build = move |ker: &Kernel| -> Arc<UOp> {
+        let dt = bdt.clone();
+        let warp = ker.warp();
+        let o = ker.gl(&[1, 1, q, d], DType::Float32);
+        let gk = ker.gl(&[1, 1, kv, d], dt.clone());
+        let gq = ker.gl(&[1, 1, q, d], dt.clone());
+        let gv = ker.gl(&[1, 1, kv, d], dt.clone());
+        let blk = MoveIdx::block((0, 0, 0, 0), 2);
+        let k_reg = warp.load(ker.operand((kv, d), dt.clone(), TileLayout::Row), gk, blk.clone());
+        let q_reg = warp.load(ker.operand_b((q, d), dt.clone(), TileLayout::Row), gq, blk.clone());
+        let v_reg = warp.load(ker.operand((kv, d), dt.clone(), TileLayout::Col), gv, blk.clone());
+        let k_reg_t = warp.transpose(ker.operand((d, kv), dt.clone(), TileLayout::Col), &k_reg);
+        let q_reg_t = warp.transpose(ker.operand_b((d, q), dt.clone(), TileLayout::Col), &q_reg);
+        let att = warp.zero(ker.acc((kv, q), TileLayout::Col));
+        let att = warp.mma_atb(att, &k_reg_t, &q_reg_t);
+        let att_mma = warp.copy(ker.operand_b((kv, q), dt.clone(), TileLayout::Col), &att);
+        let acc = warp.zero(ker.acc((d, q), TileLayout::Col));
+        let acc = warp.mma_atb(acc, &v_reg, &att_mma);
+        let acc_t = warp.transpose(ker.acc_t((q, d), TileLayout::Row), &acc);
+        let _ = warp.store(o, acc_t, blk);
+        ker.finish(1)
+    };
+    let kd: Vec<f32> = (0..kv * d).map(|p| ((p * 5 + p / d) % 7) as f32 - 3.0).collect();
+    let qd: Vec<f32> = (0..q * d).map(|p| ((p * 3 + p % d) % 5) as f32 - 2.0).collect();
+    let vd: Vec<f32> = (0..kv * d).map(|p| ((p * 2 + p / d) % 3) as f32 - 1.0).collect();
+    let mk = |v: &[f32], r: usize, c: usize| {
+        let t = Tensor::from_slice(v).try_reshape([1, 1, r, c]).expect("reshape").cast(dt.clone());
+        t.realize().expect("realize");
+        t
+    };
+    let (tk_, tq, tv) = (mk(&kd, kv, d), mk(&qd, q, d), mk(&vd, kv, d));
+    let mut out = Tensor::empty(&[1, 1, q, d], DType::Float32);
+    crate::run_kernel("fa_out", [1, 1, 1], caps.wave_size as i64, &mut [&mut out], &[&tk_, &tq, &tv], build)
+        .expect("qk_pv launch");
+    let got = out.as_vec::<f32>().expect("read out");
+
+    let att = |i: usize, j: usize| -> f32 { (0..d).map(|x| kd[i * d + x] * qd[j * d + x]).sum() };
+    let want = |dd: usize, j: usize| -> f32 { (0..kv).map(|i| vd[i * d + dd] * att(i, j)).sum() };
+    let mut bad = Vec::new();
+    for dd in 0..d {
+        for j in 0..q {
+            if (got[j * d + dd] - want(dd, j)).abs() > 1e-2 {
+                bad.push((dd, j, want(dd, j), got[j * d + dd]));
+            }
+        }
+    }
+    let transposed = (0..d).all(|dd| (0..q).all(|j| (got[dd * q + j] - want(dd, j)).abs() <= 1e-2));
+    println!("{}: {} / {} wrong; result is oᵀ: {transposed}", caps.arch.target_name(), bad.len(), d * q);
+    for &(i, j, w, g) in bad.iter().take(6) {
+        println!("   ({i:2},{j:2}) want {w:9.1} got {g:9.1}");
+    }
+    assert!(bad.is_empty(), "FA output store wrong");
 }

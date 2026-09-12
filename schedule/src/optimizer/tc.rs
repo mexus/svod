@@ -518,14 +518,7 @@ fn apply_axis_choice_impl(
             .collect();
 
         let metadata = WmmaMetadata {
-            name: format!(
-                "WMMA_{}_{}_{}_{}_{}",
-                tc.dims.0,
-                tc.dims.1,
-                tc.dims.2,
-                wmma_dtype_name(&tc.dtype_in),
-                wmma_dtype_name(&tc.dtype_out),
-            ),
+            name: tc.wmma_name(),
             dims: tc.dims,
             dtype_in: tc.dtype_in.clone(),
             dtype_out: tc.dtype_out.clone(),
@@ -693,20 +686,6 @@ pub fn apply(
     use_tensor_cores: usize,
 ) -> Result<[Arc<UOp>; 3], OptError> {
     apply_with_axis_choice(scheduler, tc_select, tc_opt, use_tensor_cores, None)
-}
-
-/// Short dtype name for WMMA function identifiers.
-fn wmma_dtype_name(dtype: &svod_ir::prelude::DType) -> &'static str {
-    use svod_dtype::ScalarDType;
-    match dtype.base() {
-        ScalarDType::Float32 => "float",
-        ScalarDType::Float16 => "half",
-        ScalarDType::BFloat16 => "bfloat",
-        ScalarDType::Float64 => "double",
-        ScalarDType::Int32 => "int",
-        ScalarDType::Int8 => "int8",
-        _ => "unknown",
-    }
 }
 
 // ============================================================================

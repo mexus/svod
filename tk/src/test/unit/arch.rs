@@ -14,7 +14,7 @@ use test_case::test_case;
 
 use crate::ArchCaps;
 use crate::arch::FragRole;
-use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand};
+use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand, OperandB};
 use crate::layout::ReduceTree;
 use crate::tiles::{
     RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16, ST_16X16_MMA,
@@ -82,15 +82,41 @@ fn cuda_sm86_caps_resolve_mma_sync_fragments() {
     assert!(c.acc_reusable_as_input(), "the two-half f32 accumulator is the A-fragment register order");
 }
 
-/// Pre-Ampere CUDA (sm_75: f16 `m16n8k8` only, no K=16 f16/bf16 core) and Metal
-/// have no fragment table: every resolver is `None`, so an MMA kernel fails loudly.
+/// Apple7+ resolves to the 8x8 `simdgroup_matrix` fragment, in two orientations.
+/// Apple's core reads its operands straight off the fragment map, so tk's `Col`
+/// accumulator (holding `Cᵀ`, as on every other arch) is reached by emitting
+/// `Cᵀ = Bᵀ·Aᵀ`: the B operand's own `Col` declaration already transposes it under
+/// the plain map, while the `Row`-declared **A** operand needs the map flipped.
+/// Accumulators — plain and transposed-store alike — keep the plain map, which is
+/// what the store, the mask, the RV broadcast and the softmax reduce all assume.
+/// Each orientation is pinned by a hardware rung (`matmul_k_addressing`,
+/// `fa_output_store_contract`).
+/// The LDS strip is unswizzled (an 8-column 16-bit row is already one 16-byte chunk).
+#[test]
+fn caps_metal_apple7() {
+    let c = ArchCaps::for_arch(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)));
+    assert_eq!(c.wave_size, 32);
+    assert!(c.has_matrix_core_layouts());
+    for role in [Accumulator, AccumulatorT, OperandB] {
+        assert_eq!(c.frag(role), Some(crate::tiles::RT_8X8_SIMD), "{role:?}");
+    }
+    assert_eq!(c.frag(Operand), Some(crate::tiles::RT_8X8_SIMD_T));
+    assert_eq!(c.shared_default(), Some(crate::tiles::ST_8X8));
+    assert_eq!(c.shared_swizzled(), Some(crate::tiles::ST_8X8));
+    assert!(c.acc_reusable_as_input(), "one simdgroup_matrix map serves operand and accumulator");
+}
+
+/// Pre-Ampere CUDA (sm_75: f16 `m16n8k8` only, no K=16 f16/bf16 core) and Apple
+/// GPUs below family 7 (no `simdgroup_matrix`) have no fragment table: every
+/// resolver is `None`, so an MMA kernel fails loudly.
 #[test_case(GpuArch::Cuda(CudaArch::from_compute_capability(7, 5)); "sm_75")]
-#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)); "metal")]
+#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(6)); "apple6")]
+#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Mac2); "mac2")]
 fn caps_without_fragment_layouts(arch: GpuArch) {
     let c = ArchCaps::for_arch(arch);
     assert_eq!(c.wave_size, 32);
     assert!(!c.has_matrix_core_layouts());
-    for role in [Accumulator, Operand, AccumulatorT] {
+    for role in [Accumulator, Operand, OperandB, AccumulatorT] {
         assert_eq!(c.frag(role), None, "{role:?}");
     }
     assert_eq!(c.shared_default(), None);

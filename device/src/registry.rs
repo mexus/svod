@@ -152,6 +152,12 @@ pub fn resolve_cuda_arch(device_id: usize) -> Result<svod_dtype::CudaArch> {
     Ok(crate::cuda::CudaDevice::open(device_id)?.arch())
 }
 
+/// The Apple GPU family of Metal device `device_id`, read from the opened
+/// (cached) device; the Metal counterpart of [`resolve_amd_arch_from_topology`].
+pub fn resolve_metal_family(device_id: usize) -> Result<svod_dtype::MetalFamily> {
+    Ok(crate::metal::MetalDevice::open(device_id)?.family())
+}
+
 /// The streaming-multiprocessor count of CUDA device `device_id`.
 pub fn resolve_cuda_sm_count(device_id: usize) -> Result<u32> {
     Ok(crate::cuda::CudaDevice::open(device_id)?.limits().sm_count)

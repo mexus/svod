@@ -32,7 +32,7 @@ fn kmeans_sink(n: usize, k: usize, d: usize, caps: ArchCaps) -> Arc<UOp> {
 }
 
 /// The assignment kernel's graph carries: a score WMMA, the index-carrying
-/// `row_arg_reduce` `ds_bpermute` `Op::Custom` gathers (two reduces per tile —
+/// `arg_reduce` `ds_bpermute` `Op::Custom` gathers (two reduces per tile —
 /// a tile-min over centroids + a running-best extraction — each riding the
 /// arch's sibling gather), the `Op::Ternary` slot-0 update `where`s, and the two
 /// `[N, 1]` output stores. Holds on both wave64 (gfx942) and wave32 (gfx1151).

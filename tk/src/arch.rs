@@ -20,9 +20,13 @@
 //!   wave-halves, and an even/odd-interleaved `<8×float>` accumulator (the
 //!   `RT_16X16_W32_*` shapes); CUDA sm_80+ (`mma.sync m16n8k16`, warp32) holds a
 //!   16×16 tile as two m16n8 halves ([`crate::layout::LaneMap::MmaSync`], 8/lane
-//!   for inputs and accumulator alike — [`crate::tiles::RT_16X16_MMA`]). Unresolved
-//!   (`None`) on Metal and pre-Ampere CUDA, so an MMA kernel fails loudly at
-//!   fragment resolution instead of rendering a wrong layout.
+//!   for inputs and accumulator alike — [`crate::tiles::RT_16X16_MMA`]); Apple7+
+//!   (`simdgroup_matrix<T, 8, 8>`, SIMD-group 32) holds a quarter-size 8×8 fragment
+//!   at 2/lane, one map for operands and accumulator alike
+//!   ([`crate::tiles::RT_8X8_SIMD`]) — bar the A operand, which takes it flipped
+//!   ([`FragRole::Operand`]). Unresolved (`None`) on pre-Ampere CUDA and
+//!   pre-Apple7 Metal, so an MMA kernel fails loudly at fragment resolution instead
+//!   of rendering a wrong layout.
 //!
 //! gfx942 is the validated/calibrated target — the register-tile fragment-layout
 //! tables ([`crate::tiles`] strides and `group::mma`'s per-lane upcast counts) and
@@ -33,8 +37,8 @@
 use svod_dtype::{AmdArch, CudaArch, GpuArch};
 
 use crate::tiles::{
-    RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_16X16, ST_16X16_MMA,
-    ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32, STBaseShape,
+    RT_8X8_SIMD, RT_8X8_SIMD_T, RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN,
+    RTBaseShape, ST_8X8, ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32, STBaseShape,
 };
 
 /// Logical role of a 16×16 matrix-core fragment, independent of arch packing.
@@ -44,8 +48,19 @@ use crate::tiles::{
 pub enum FragRole {
     /// f32 MMA output / online-softmax accumulator.
     Accumulator,
-    /// f16/bf16 WMMA input operand (A or B).
+    /// f16/bf16 WMMA input operand in the **A** position (and the default for any
+    /// operand on an arch whose core takes both sides in one orientation).
+    ///
+    /// AMD's MFMA and CUDA's `mma.sync` calibration tables absorb tk's `Col`
+    /// accumulator convention, so both operand positions share one fragment there.
+    /// Apple's core does not: it computes `D = A·B` straight off the map, so a `Col`
+    /// accumulator is reached by emitting `Cᵀ = Bᵀ·Aᵀ`, which needs BOTH operands
+    /// transposed. A B tile is declared `Col` and so already is; this `Row`-declared
+    /// A tile is not, so on Metal it takes the flipped map.
     Operand,
+    /// The operand in the **B** position — the same fragment as [`Self::Operand`]
+    /// everywhere except Metal, where only the A position needs the flipped map.
+    OperandB,
     /// Accumulator transposed for an N-major store (e.g. the FA output `O[q,d]`
     /// from the `[d,q]` PV accumulator).
     AccumulatorT,
@@ -108,7 +123,11 @@ impl ArchCaps {
     /// [`Self::frag`] and the shared-tile strips resolve): AMD, and CUDA from
     /// Ampere (the f16/bf16 `m16n8k16` floor).
     pub fn has_matrix_core_layouts(&self) -> bool {
-        self.amd().is_some() || self.cuda().is_some_and(CudaArch::has_bf16_mma)
+        match self.arch {
+            GpuArch::Amd(_) => true,
+            GpuArch::Cuda(cuda) => cuda.has_bf16_mma(),
+            GpuArch::Metal(family) => family.has_simdgroup_matrix(),
+        }
     }
 
     /// Physical register fragment for a logical [`FragRole`] on this arch — the
@@ -124,12 +143,26 @@ impl ArchCaps {
         if !self.has_matrix_core_layouts() {
             return None;
         }
-        Some(match self.amd() {
-            None => RT_16X16_MMA,
-            Some(amd) if amd.is_cdna() => RT_16X16,
-            Some(_) => match role {
+        Some(match self.arch {
+            GpuArch::Cuda(_) => RT_16X16_MMA,
+            // Apple's core computes `D = A·B` straight off the fragment map, with no
+            // per-operand calibration table to absorb tk's `Col` convention. tk's
+            // accumulators are `Col`, so the product is emitted transposed
+            // (`Cᵀ = Bᵀ·Aᵀ`, the `swap` in `MmaPlan::resolve`) and each operand must
+            // reach the core already transposed: the B tile's own `Col` declaration
+            // does that under the plain map, while the `Row`-declared A tile needs
+            // the map itself flipped. The accumulator keeps the plain map so a `Col`
+            // accumulator holds `Cᵀ` exactly as on AMD and CUDA — the invariant the
+            // store, the mask, the RV broadcast and the softmax reduce all read.
+            GpuArch::Metal(_) => match role {
+                FragRole::Operand => RT_8X8_SIMD_T,
+                FragRole::OperandB | FragRole::Accumulator | FragRole::AccumulatorT => RT_8X8_SIMD,
+            },
+            GpuArch::Amd(amd) if amd.is_cdna() => RT_16X16,
+            GpuArch::Amd(_) => match role {
                 FragRole::Accumulator => RT_16X16_W32_ACC,
-                FragRole::Operand => RT_16X16_W32_IN,
+                // RDNA's B fragment is the same replicated input as A.
+                FragRole::Operand | FragRole::OperandB => RT_16X16_W32_IN,
                 FragRole::AccumulatorT => RT_16X16_W32_ACC_T,
             },
         })
@@ -153,16 +186,18 @@ impl ArchCaps {
         if !self.has_matrix_core_layouts() {
             return None;
         }
-        Some(match self.amd() {
-            None => ST_16X16_MMA,
-            Some(amd) if amd.is_cdna() => {
+        Some(match self.arch {
+            GpuArch::Cuda(_) => ST_16X16_MMA,
+            // An 8-column 16-bit row is already one conflict-free 16-byte chunk.
+            GpuArch::Metal(_) => ST_8X8,
+            GpuArch::Amd(amd) if amd.is_cdna() => {
                 if swizzled {
                     ST_16X16_SWIZZLED
                 } else {
                     ST_16X16
                 }
             }
-            Some(_) => ST_16X16_SWIZZLED_W32,
+            GpuArch::Amd(_) => ST_16X16_SWIZZLED_W32,
         })
     }
 
@@ -173,7 +208,15 @@ impl ArchCaps {
     /// `mma_AB(o, att_bf, v)`); false on RDNA (the even/odd `<8×f32>` accumulator
     /// and the replicated `<16×in>` input differ), where the acc→input handoff
     /// must round-trip through LDS instead, and wherever [`Self::frag`] is `None`.
+    /// True on Metal: one `simdgroup_matrix` lane map serves both roles.
     pub fn acc_reusable_as_input(&self) -> bool {
-        self.is_cdna() || self.cuda().is_some_and(CudaArch::has_bf16_mma)
+        match self.arch {
+            GpuArch::Amd(_) => self.is_cdna(),
+            GpuArch::Cuda(cuda) => cuda.has_bf16_mma(),
+            // The `simdgroup_matrix` B operand and the f32 accumulator carry the same
+            // `thread_elements()` map (hardware-verified), and it is the B position an
+            // accumulator feeds (FA's `att → att_mma`), so the handoff is a copy.
+            GpuArch::Metal(_) => true,
+        }
     }
 }

@@ -134,3 +134,28 @@ pub const ST_16X16_MMA: STBaseShape =
 /// accumulator alike.
 pub const RT_16X16_MMA: RTBaseShape =
     RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, map: LaneMap::MmaSync };
+
+// ── Apple (Metal, SIMD-group 32, `simdgroup_matrix<T, 8, 8>`) base shapes ─────
+//
+// Apple's only matrix-core shape is 8×8×8 over a 32-lane SIMD group, so a lane
+// holds 64/32 = 2 elements — a quarter of the 16×16 fragment every other arch
+// carries, which simply makes a 16×16 logical tile a 2×2 grid of fragments. The
+// map ([`LaneMap::SimdgroupMatrix`]) is shared by the B operand and the f32
+// accumulator, so an MMA result feeds straight back as a B input with no LDS
+// relayout; only the A operand reads it flipped (see [`crate::arch::FragRole`]).
+// The LDS strip is unswizzled: at 8 columns of 16-bit data a row is
+// 16 bytes, one bank-conflict-free chunk already, and the 16-byte XOR swizzles
+// assume `chunk < cols`.
+
+/// LDS strip fragment for the Metal kernels (`ept = 64/32 = 2`), unswizzled.
+pub const ST_8X8: STBaseShape =
+    STBaseShape { base: BaseShape { rows: 8, cols: 8, ept: 2 }, swizzle: Swizzle::Identity };
+/// The **A operand** fragment on Apple: [`RT_8X8_SIMD`] read transposed, so the
+/// `Row`-declared A tile reaches the core already transposed — the half of
+/// `Cᵀ = Bᵀ·Aᵀ` the `Col` declaration does not supply on its own.
+pub const RT_8X8_SIMD_T: RTBaseShape =
+    RTBaseShape { base: BaseShape { rows: 8, cols: 8, ept: 2 }, map: LaneMap::SimdgroupMatrixT };
+/// Apple `simdgroup_matrix` fragment: `half`/`bfloat` B operand and `float`
+/// accumulator alike (both 2 elements per lane under one map).
+pub const RT_8X8_SIMD: RTBaseShape =
+    RTBaseShape { base: BaseShape { rows: 8, cols: 8, ept: 2 }, map: LaneMap::SimdgroupMatrix };

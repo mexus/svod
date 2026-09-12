@@ -167,7 +167,7 @@ fn topk_sink(corpus: usize, query: usize, d: usize, k: usize, caps: ArchCaps) ->
 }
 
 /// The topk kernel's graph carries the full argmin-insert machinery on BOTH archs:
-/// the score WMMA, the index-carrying `row_arg_reduce` `ds_bpermute` `Op::Custom`
+/// the score WMMA, the index-carrying `arg_reduce` `ds_bpermute` `Op::Custom`
 /// gathers (two reduces per insert step — a corpus-min and a K-slot-max — each
 /// riding the arch's sibling gather), the `Op::Ternary` evict/mask `where`s, and the
 /// two `[query, k]` output stores. Built rolled (the corpus loop).

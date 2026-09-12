@@ -401,6 +401,42 @@ fn metal_rejects_unsupported_dtypes(node: std::sync::Arc<UOp>, reason: &str) {
     );
 }
 
+/// The cross-lane builders render the `metal_stdlib` overloads with a `ushort`
+/// lane/mask, and reject the widths MSL has no overload for.
+#[test_case::test_case(DType::Float32, "simd_shuffle"; "f32 shuffle")]
+#[test_case::test_case(DType::Int32, "simd_shuffle"; "i32 shuffle")]
+#[test_case::test_case(DType::Float16, "simd_shuffle"; "f16 shuffle")]
+fn metal_simd_shuffle_renders(dt: DType, call: &str) {
+    let v = load_scalar(1, dt);
+    let sh = crate::c::metal::simd_shuffle(&v, &UOp::const_(DType::Int32, ConstValue::Int(3)));
+    let code = render_ok(&UOp::sink(vec![element(UOp::param(0, 4, sh.dtype(), None), 0).store(sh)]), "shuffle");
+    assert!(code.contains(&format!("{call}(")) && code.contains("(ushort)"), "{code}");
+}
+
+#[test]
+fn metal_simd_shuffle_xor_renders() {
+    let v = load_scalar(1, DType::Float32);
+    let sh = crate::c::metal::simd_shuffle_xor(&v, &UOp::const_(DType::Int32, ConstValue::Int(8)));
+    let code = render_ok(&UOp::sink(vec![element(UOp::param(0, 4, sh.dtype(), None), 0).store(sh)]), "shuffle_xor");
+    assert!(code.contains("simd_shuffle_xor(") && code.contains("(ushort)"), "{code}");
+}
+
+/// MSL has no 64-bit `simd_*` overload (measured on Apple9), so the builders reject
+/// the width instead of emitting MSL that fails to compile.
+#[test_case::test_case(DType::Int64; "i64")]
+#[test_case::test_case(DType::UInt64; "u64")]
+#[should_panic(expected = "no 64-bit cross-lane overload")]
+fn metal_simd_shuffle_rejects_64_bit(dt: DType) {
+    let _ = crate::c::metal::simd_shuffle(&load_scalar(1, dt), &UOp::const_(DType::Int32, ConstValue::Int(1)));
+}
+
+#[test]
+#[should_panic(expected = "no 64-bit cross-lane overload")]
+fn metal_simd_shuffle_xor_rejects_64_bit() {
+    let v = load_scalar(1, DType::Int64);
+    let _ = crate::c::metal::simd_shuffle_xor(&v, &UOp::const_(DType::Int32, ConstValue::Int(1)));
+}
+
 /// `out[i] = a[i] + b[i]` over 1024 floats as the optimizer lays it out for
 /// Metal: 256 threadgroups of 4 threads.
 #[test]

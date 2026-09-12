@@ -108,3 +108,58 @@ fn wmma_helper(metadata: &WmmaMetadata) -> String {
          }}"
     )
 }
+
+// ── Cross-lane builders ───────────────────────────────────────────────────────
+//
+// The MSL analog of `llvm::nvptx::ops::shfl_*`. MSL's `simd_*` are overloaded
+// functions in `metal_stdlib` (already included by the prelude), so unlike the
+// AMD `ds_bpermute` path there is no declaration to hoist, no i32 round-trip and
+// no lane-address arithmetic — the whole lowering is the call text. These build
+// `Op::Custom` (a typed SSA binding), never `Op::CustomI`: a `CustomI` is spliced
+// once per consumer, and re-evaluating a cross-lane op per use is a convergence
+// hazard, not just a redundant instruction.
+
+/// MSL's `simd_*` overload set covers the 32-bit-and-narrower scalars and their
+/// vectors; there is **no 64-bit overload** (`long`/`ulong` fail to compile,
+/// verified on Apple9). NVPTX's `shfl` has the same width limit and splits a 64-bit
+/// value through two 32-bit exchanges; nothing in tk shuffles 64 bits (reduces carry
+/// f32 values and Int32 indices), so rather than carry an unexercised split this
+/// rejects the width at the builder, turning an opaque MSL compile failure into a
+/// precise one. A caller that needs it splits at the call site — the same place
+/// NVPTX's would have to.
+fn reject_64_bit(op: &str, dtype: &svod_dtype::DType) {
+    assert!(
+        dtype.bytes() <= 4,
+        "Metal `{op}`: MSL has no 64-bit cross-lane overload, got {dtype:?} — split through two 32-bit halves"
+    );
+}
+
+/// `simd_shuffle(value, lane)` — read `value` from `lane` of the SIMD group.
+///
+/// # Panics
+/// Panics on a value wider than 32 bits (see [`reject_64_bit`]).
+pub fn simd_shuffle(value: &Arc<UOp>, lane: &Arc<UOp>) -> Arc<UOp> {
+    let dtype = value.dtype();
+    reject_64_bit("simd_shuffle", &dtype);
+    UOp::custom(smallvec::smallvec![value.clone(), lane.clone()], "simd_shuffle({0}, (ushort)({1}))".to_string(), dtype)
+}
+
+/// `simd_shuffle_xor(value, mask)` — the butterfly exchange with lane `L ^ mask`.
+///
+/// # Panics
+/// Panics on a value wider than 32 bits (see [`reject_64_bit`]).
+pub fn simd_shuffle_xor(value: &Arc<UOp>, mask: &Arc<UOp>) -> Arc<UOp> {
+    let dtype = value.dtype();
+    reject_64_bit("simd_shuffle_xor", &dtype);
+    UOp::custom(
+        smallvec::smallvec![value.clone(), mask.clone()],
+        "simd_shuffle_xor({0}, (ushort)({1}))".to_string(),
+        dtype,
+    )
+}
+
+/// `simdgroup_barrier(mem_flags::mem_threadgroup)` — the SIMD-group-scoped fence,
+/// cheaper than the threadgroup barrier `Op::Barrier` lowers to.
+pub fn simdgroup_barrier(deps: smallvec::SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
+    UOp::custom(deps, "simdgroup_barrier(mem_flags::mem_threadgroup)".to_string(), svod_dtype::DType::Void)
+}

@@ -21,7 +21,7 @@
 
 use std::fmt;
 
-use svod_dtype::{AmdArch, CudaArch, DeviceSpec, GpuArch};
+use svod_dtype::{AmdArch, CudaArch, DeviceSpec, GpuArch, MetalFamily};
 
 use crate::launch::{Result, ToolchainUnavailableSnafu, UnsupportedArchSnafu};
 
@@ -33,12 +33,13 @@ use crate::launch::{Result, ToolchainUnavailableSnafu, UnsupportedArchSnafu};
 pub struct ArchSet {
     pub amd: &'static [AmdArch],
     pub cuda_min: Option<CudaArch>,
+    pub metal_min: Option<MetalFamily>,
 }
 
 impl ArchSet {
     /// AMD-only support.
     pub const fn amd(amd: &'static [AmdArch]) -> Self {
-        Self { amd, cuda_min: None }
+        Self { amd, cuda_min: None, metal_min: None }
     }
 
     /// Also support CUDA at compute capability `min` and above.
@@ -46,12 +47,17 @@ impl ArchSet {
         Self { cuda_min: Some(min), ..self }
     }
 
+    /// Also support Apple GPUs from family `min` upward.
+    pub const fn with_metal_from(self, min: MetalFamily) -> Self {
+        Self { metal_min: Some(min), ..self }
+    }
+
     /// Whether `arch` is in the set.
     pub fn supports(&self, arch: GpuArch) -> bool {
         match arch {
             GpuArch::Amd(amd) => self.amd.contains(&amd),
             GpuArch::Cuda(cuda) => self.cuda_min.is_some_and(|min| cuda >= min),
-            GpuArch::Metal(_) => false,
+            GpuArch::Metal(family) => self.metal_min.is_some_and(|min| family >= min),
         }
     }
 }
@@ -59,16 +65,19 @@ impl ArchSet {
 impl fmt::Display for ArchSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "AMD {:?}", self.amd)?;
-        match self.cuda_min {
-            Some(min) => write!(f, " + CUDA {min}+"),
+        if let Some(min) = self.cuda_min {
+            write!(f, " + CUDA {min}+")?;
+        }
+        match self.metal_min {
+            Some(min) => write!(f, " + Metal {min}+"),
             None => Ok(()),
         }
     }
 }
 
 /// Resolve the concrete [`GpuArch`] backing a [`DeviceSpec`] — AMD from the KFD
-/// topology, CUDA from the driver's compute capability (a host/Metal or unreadable
-/// device → `None`). The arch is deliberately not in the spec (a hardware
+/// topology, CUDA from the driver's compute capability, Metal from the opened
+/// device's GPU family (a host or unreadable device → `None`). The arch is deliberately not in the spec (a hardware
 /// property), so it is looked up by `device_id`. [`resolve_supported_arch`] gates
 /// on it and returns it; [`check_target`] is the `()`-returning wrapper for callers
 /// that only need the gate.
@@ -78,9 +87,10 @@ pub fn resolve_arch(spec: &DeviceSpec) -> Option<GpuArch> {
             svod_device::registry::resolve_amd_arch_from_topology(*device_id).ok().map(GpuArch::Amd)
         }
         DeviceSpec::Cuda { device_id } => svod_device::registry::resolve_cuda_arch(*device_id).ok().map(GpuArch::Cuda),
-        // Metal has an arch of its own but tk has no lowering for it; the gate
-        // reports `UnsupportedArch`.
-        DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
+        DeviceSpec::Metal { device_id } => {
+            svod_device::registry::resolve_metal_family(*device_id).ok().map(GpuArch::Metal)
+        }
+        DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
     }
 }
 
@@ -115,7 +125,9 @@ pub fn resolve_supported_arch(spec: &DeviceSpec, supported: ArchSet) -> Result<G
     let (target, present) = match arch {
         GpuArch::Amd(_) => ("amdgcn", svod_runtime::amd::has_amdgpu_target()),
         GpuArch::Cuda(_) => ("nvptx64", svod_runtime::cuda::has_nvptx_target()),
-        GpuArch::Metal(_) => unreachable!("ArchSet never admits Metal"),
+        // Metal renders MSL source through the system compiler rather than an LLVM
+        // GPU backend, so the toolchain probe is the device probe.
+        GpuArch::Metal(_) => ("metal", svod_device::metal::has_devices()),
     };
     if !present {
         return ToolchainUnavailableSnafu { target }.fail();

@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
+use svod_codegen::c::metal::{simd_shuffle, simd_shuffle_xor};
 use svod_codegen::llvm::nvptx::ops::{shfl_bfly, shfl_idx};
 use svod_dtype::{DType, GpuArch};
 use svod_ir::{AxisType, UOp};
@@ -147,7 +148,7 @@ pub enum SwapDir {
     ByLaneBit(i64),
 }
 
-/// Direction for [`Group::row_arg_reduce`]/[`Group::col_arg_reduce`]: select the
+/// Direction for [`Group::arg_reduce`]/[`Group::arg_reduce`]: select the
 /// minimum (`Min`) or maximum (`Max`) element along the reduced axis and return
 /// its index. Ties resolve to the smaller index (matching `Tensor::topk` /
 /// `argmin`, whose `Int32` indices the result interoperates with).
@@ -302,11 +303,10 @@ impl<'k> Group<'k> {
     /// in-register cross-lane gather with no LDS and no barrier, lowered per arch:
     /// `llvm.amdgcn.ds.bpermute` on AMD (i32-typed; lane `L` receives `data` from
     /// lane `byte_addr(L) >> 2`, so f32 is bitcast through i32 and the byte address
-    /// is `src_lane * 4`), `shfl.sync.idx` on CUDA. Both ride the typed `Op::Custom`
-    /// path (the `declare` is auto-hoisted+deduped to the module prefix).
+    /// is `src_lane * 4`), `shfl.sync.idx` on CUDA, `simd_shuffle` on Metal. All
+    /// ride the typed `Op::Custom` path (on the LLVM targets the `declare` is
+    /// auto-hoisted+deduped to the module prefix).
     ///
-    /// # Panics
-    /// Panics on an arch without a shuffle lowering (Metal).
     pub(super) fn shuffle_lane(&self, value: &Arc<UOp>, src_lane: &Arc<UOp>) -> Arc<UOp> {
         match self.ker.caps.arch {
             GpuArch::Amd(_) => {
@@ -323,17 +323,18 @@ impl<'k> Group<'k> {
                 if is_f32 { sh.bitcast(DType::Float32) } else { sh }
             }
             GpuArch::Cuda(_) => shfl_idx(value, src_lane),
-            GpuArch::Metal(_) => unimplemented!("tk cross-lane shuffle has no Metal lowering"),
+            GpuArch::Metal(_) => simd_shuffle(value, src_lane),
         }
     }
 
     /// Butterfly gather: this lane's `value` from lane `laneid ^ mask` — the
-    /// `shfl.sync.bfly` immediate form on CUDA, the same `ds_bpermute` as
-    /// [`Self::shuffle_lane`] with a computed partner on AMD.
+    /// `shfl.sync.bfly` immediate form on CUDA and `simd_shuffle_xor` on Metal, the
+    /// same `ds_bpermute` as [`Self::shuffle_lane`] with a computed partner on AMD.
     pub(super) fn shuffle_xor_lane(&self, value: &Arc<UOp>, mask: i64) -> Arc<UOp> {
         match self.ker.caps.arch {
             GpuArch::Cuda(_) => shfl_bfly(value, &cidx(mask)),
-            _ => self.shuffle_lane(value, &ixor(&self.laneid(), mask)),
+            GpuArch::Metal(_) => simd_shuffle_xor(value, &cidx(mask)),
+            GpuArch::Amd(_) => self.shuffle_lane(value, &ixor(&self.laneid(), mask)),
         }
     }
 

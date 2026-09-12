@@ -333,7 +333,12 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
             .and_then(svod_dtype::GpuArch::cuda)
             .map(svod_schedule::OptimizerRenderer::for_cuda_arch)
             .unwrap_or_else(svod_schedule::OptimizerRenderer::cuda),
-        DeviceSpec::Metal { .. } => svod_schedule::OptimizerRenderer::metal(),
+        DeviceSpec::Metal { .. } => device
+            .renderer
+            .gpu_arch()
+            .and_then(GpuArch::metal)
+            .map(svod_schedule::OptimizerRenderer::for_metal_family)
+            .unwrap_or_else(svod_schedule::OptimizerRenderer::metal),
         DeviceSpec::Amd { .. } => device
             .renderer
             .gpu_arch()

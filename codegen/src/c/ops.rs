@@ -532,6 +532,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         }
 
         Op::Custom(ops::Custom { deps, code }) => {
+            // Scheduling markers are LLVM line comments carried on a Void CUSTOM;
+            // `;` is not a comment in MSL, so drop them rather than splice them.
+            if crate::llvm::sched::is_scheduling_marker(code) {
+                ctx.register(uop.id, String::new());
+                return Some(());
+            }
             let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
             let rendered = match format_custom_template_strict(code, &args) {
                 Ok(s) => s,

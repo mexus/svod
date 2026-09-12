@@ -66,11 +66,13 @@ fn iconst(v: i64) -> Arc<UOp> {
 
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
 /// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), gfx1151
-/// (RDNA3.5 WMMA, wave32) and CUDA sm_80+ (`mma.sync`, warp32). The launcher gates
+/// (RDNA3.5 WMMA, wave32), CUDA sm_80+ (`mma.sync`, warp32) and Apple7+
+/// (`simdgroup_matrix`, SIMD-group 32). The launcher gates
 /// against this list; generic launch infrastructure stays architecture-agnostic.
 pub const FA_SUPPORTED_ARCHS: crate::ArchSet =
     crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
-        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
+        .with_metal_from(svod_dtype::MetalFamily::Apple(7));
 
 /// Whether `device` can run the production graph flash-attention kernel.
 /// Uses the same architecture and toolchain gate as [`crate::launch_custom`].
@@ -388,9 +390,12 @@ pub(crate) fn build_fa_mw_rdb(
     // Q tile + transpose (shared, read-only across the loop). `o_reg_t` is the
     // transpose of the `[d,q]` PV accumulator for the `O[q,d]` store (N-major ⇒
     // `rt_acc_t` on RDNA).
-    let q_reg_fl = ker.operand((q_blk_rows, d), f32, row);
-    let q_reg = ker.operand((q_blk_rows, d), in_dt.clone(), row);
-    let q_reg_t = ker.operand((d, q_blk_rows), in_dt.clone(), col);
+    // Q feeds the B operand of the QKᵀ mma (K feeds A, V feeds A of the PV mma), so
+    // its gather takes the B-position fragment map — a no-op off Metal, where A and B
+    // share one fragment; see `FragRole::Operand`.
+    let q_reg_fl = ker.operand_b((q_blk_rows, d), f32, row);
+    let q_reg = ker.operand_b((q_blk_rows, d), in_dt.clone(), row);
+    let q_reg_t = ker.operand_b((d, q_blk_rows), in_dt.clone(), col);
     let o_reg_t = ker.acc_t((q_blk_rows, d), row);
 
     // One scratch set: the rolled body has a back-edge, so the carried FaAcc + a
@@ -400,7 +405,7 @@ pub(crate) fn build_fa_mw_rdb(
         k_reg_t: ker.operand((d, kv_blk_rows), in_dt.clone(), col),
         v_reg: ker.operand((kv_blk_rows, d), in_dt.clone(), col),
         att: ker.acc((kv_blk_rows, q_blk_rows), col),
-        att_mma: ker.operand((kv_blk_rows, q_blk_rows), in_dt.clone(), col),
+        att_mma: ker.operand_b((kv_blk_rows, q_blk_rows), in_dt.clone(), col),
         max_vec_last: ker.acc_vec(q_blk_rows),
         att_smem: (!ker.caps.acc_reusable_as_input())
             .then(|| ker.shared((NUM_WARPS * kv_blk_rows, q_blk_rows), in_dt.clone(), row)),
@@ -577,8 +582,6 @@ impl FaPolicy {
     /// local memory (3-15× slower).
     ///
     /// # Panics
-    /// Panics for a Metal arch: tk has no Metal lowering, and no [`crate::ArchSet`]
-    /// admits one.
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         let small = (Q_BLK, KV_BLK);
         let att_band = !crate::ArchCaps::for_arch(arch).acc_reusable_as_input();
@@ -610,7 +613,19 @@ impl FaPolicy {
                 shared_max: 48 << 10,
                 att_band,
             },
-            svod_dtype::GpuArch::Metal(_) => unreachable!("tk has no Metal lowering; no ArchSet admits it"),
+            // Apple's threadgroup budget is half AMD's (32 KiB), and the
+            // `simdgroup_matrix` accumulator feeds an operand directly, so
+            // `att_band` is false and the band costs nothing. The core count is not
+            // reported by Metal; `for_device` leaves this default in place.
+            svod_dtype::GpuArch::Metal(_) => Self {
+                compute_units: 40,
+                big: small,
+                big_max_d: usize::MAX,
+                small,
+                unroll: false,
+                shared_max: 32 << 10,
+                att_band,
+            },
         }
     }
 
@@ -756,7 +771,16 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
     // would pass `Kernel::gl` (which checks only the byte width) and then
     // silently change which K/V stream the body takes.
     let kv_dtype = [k, v].into_iter().map(|t| t.uop().dtype()).find(|dt| *dt != dtype);
-    let kv_shape = [("k", kd), ("v", vd)].into_iter().find(|(_, dims)| *dims != [b, n, h_kv, d]);
+    // K/V must agree with q on batch, KV-head count and head dim — a mismatch there
+    // is a caller bug. Their SEQUENCE length is checked separately, in the tiling
+    // predicate: a KV length differing from q's is cross-attention (or incremental
+    // decode), a legitimate attention shape this kernel simply does not implement, so
+    // it declines and the caller falls back instead of surfacing an error.
+    let kv_shape = [("k", &kd), ("v", &vd)]
+        .into_iter()
+        .find(|(_, dims)| [dims[0], dims[2], dims[3]] != [b, h_kv, d])
+        .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
+    let kv_seq_match = kd[1] == n && vd[1] == n;
     let (tiling_device, build_device) = (q.device(), q.device());
 
     crate::launch_custom(
@@ -772,14 +796,8 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             if let Some(got) = kv_dtype {
                 return crate::launch::DtypeSnafu { kernel: "flash-attention", got, expected: "the dtype of q" }.fail();
             }
-            if let Some((operand, got)) = kv_shape {
-                return crate::launch::OperandShapeSnafu {
-                    kernel: "flash-attention",
-                    operand,
-                    expected: vec![b, n, h_kv, d],
-                    got,
-                }
-                .fail();
+            if let Some((operand, got, expected)) = kv_shape {
+                return crate::launch::OperandShapeSnafu { kernel: "flash-attention", operand, expected, got }.fail();
             }
             ensure!(
                 d % BLK == 0,
@@ -804,11 +822,13 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         },
         // Runtime tiling (`None`) — `N` is the (audio) sequence length and may
         // legitimately not tile, so the caller falls back per-clip instead of
-        // padding; a head dim whose tiles overflow shared memory declines too.
+        // padding; a head dim whose tiles overflow shared memory declines too, as
+        // does a KV length that differs from q's (this kernel is self-attention only).
         move |arch| {
-            FaPolicy::for_device(&tiling_device, arch)
-                .tile(b, n, h, d)
-                .is_some_and(|(q_blk, _)| n.is_multiple_of(q_blk * NUM_WARPS))
+            kv_seq_match
+                && FaPolicy::for_device(&tiling_device, arch)
+                    .tile(b, n, h, d)
+                    .is_some_and(|(q_blk, _)| n.is_multiple_of(q_blk * NUM_WARPS))
         },
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {

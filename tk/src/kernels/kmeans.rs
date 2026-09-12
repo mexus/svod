@@ -12,9 +12,9 @@
 //! The assignment kernel streams `K` centroids in [`TM`]-tall tiles through a
 //! [`crate::loop_scope::Loop`] and keeps, per point, the running argmin — a
 //! flashlib-style top-1 fold (the degenerate case of KNN's argmin-insert top-K).
-//! Each tile produces a `(tile_min, tile_arg)` pair via [`Group::row_arg_reduce`];
+//! Each tile produces a `(tile_min, tile_arg)` pair via [`Group::arg_reduce`];
 //! the running best is extracted from the carried `[BLK, BLK]` val tile (also via
-//! `row_arg_reduce(Min)` — padding rows at `+∞` never win), and the per-point
+//! `arg_reduce(Min)` — padding rows at `+∞` never win), and the per-point
 //! predicate `tile_min < running_best` gates a single-slot `map_position` update
 //! (the KNN `evict_slot` pattern with a fixed slot-0 evict target).
 //!
@@ -25,7 +25,7 @@
 //! assign), leave the rest to the scheduler.
 //!
 //! Orientation (same as KNN): **centroids `k` are the reduced / row axis** and
-//! points `n` the column, so `row_arg_reduce(Min)` folds the centroid axis and
+//! points `n` the column, so `arg_reduce(Min)` folds the centroid axis and
 //! returns one `(val, idx)` per point. The cross MMA is `mma_atb(score, cᵀ, xᵀ)`
 //! — both operands transposed to `[d, *]` Col fragments — yielding
 //! `score[k, n] = Σ_d c[k,d]·x[n,d] = ⟨c[k], x[n]⟩` in the f32 accumulator.
@@ -98,12 +98,12 @@ fn rv_point_src<'k>(warp: &Group<'k>, rv: &RV<'k>) -> (Arc<UOp>, Vec<usize>) {
     (warp.anchor(rv.uop()), rv.shape().to_vec())
 }
 
-/// A length-`BLK` f32 RV seeded to `init` (the `row_arg_reduce` value accumulator).
+/// A length-`BLK` f32 RV seeded to `init` (the `arg_reduce` value accumulator).
 fn seed_val<'k>(ker: &'k Kernel, warp: &Group<'k>, init: f64) -> RV<'k> {
     let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(BLK, DType::Float32, VecLayout::Ortho, frag), init)
 }
-/// A length-`BLK` Int32 index RV seeded to `−1` (the `row_arg_reduce` index acc).
+/// A length-`BLK` Int32 index RV seeded to `−1` (the `arg_reduce` index acc).
 fn seed_idx<'k>(ker: &'k Kernel, warp: &Group<'k>) -> RV<'k> {
     let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(BLK, DType::Int32, VecLayout::Ortho, frag), -1.0)
@@ -185,7 +185,7 @@ fn load_points_t<'k>(ker: &'k Kernel, warp: &Group<'k>, d: usize, x_gl: &GL, n_b
 /// Per-point running argmin state: two Col-layout `[BLK, BLK]` register tiles —
 /// `val` (f32, row 0 = running best, rows 1-15 = `+∞` padding) and `idx` (Int32,
 /// row 0 = running arg, rows 1-15 = `−1`). The padding rows stay at `+∞`/`−1` so
-/// `row_arg_reduce(Min)` extracting the running best always picks row 0.
+/// `arg_reduce(Min)` extracting the running best always picks row 0.
 struct Best<'k> {
     val: RT<'k>,
     idx: RT<'k>,
@@ -203,7 +203,7 @@ fn mask_ragged_centroids<'k>(warp: &Group<'k>, score: RT<'k>, k_tile: &Arc<UOp>,
 /// Update slot 0 of a `[BLK, BLK]` Col tile at each point-column where
 /// `candidate[n] < current_best[n]`, writing `replacement[n]`. The per-element
 /// `k_pos` (= row position) gates the update to row 0 only — rows 1-15 keep their
-/// `+∞`/`−1` padding, so the next iteration's `row_arg_reduce(Min)` still picks
+/// `+∞`/`−1` padding, so the next iteration's `arg_reduce(Min)` still picks
 /// row 0. The per-point RVs are read by the column index (`idx[1]`), the
 /// multi-RV generalization of KNN's `combine_rv`.
 fn update_slot0<'k>(
@@ -256,8 +256,7 @@ fn fold_best<'k>(
     }
 
     // a. per-point tile-min over the TM centroid rows → (val, arg) RVs.
-    let (tile_min, tile_arg) =
-        warp.row_arg_reduce(seed_val(ker, warp, POS_INF), seed_idx(ker, warp), &score, ArgDir::Min);
+    let (tile_min, tile_arg) = warp.arg_reduce(seed_val(ker, warp, POS_INF), seed_idx(ker, warp), &score, ArgDir::Min);
 
     // b. global_k = k_tile·TM + tile_arg in a FRESH RV (cf. KNN's global_m).
     let kbase = k_tile.mul(&cidx(TM as i64)).cast(DType::Int32);
@@ -265,10 +264,9 @@ fn fold_best<'k>(
     let global_k = warp
         .map(seed_idx(ker, warp), move |_, idx| load_at(&ta_buf, &ta_shape, idx).try_add(&kbase).expect("global_k"));
 
-    // c. per-point running best (extracted from the val tile via row_arg_reduce).
+    // c. per-point running best (extracted from the val tile via arg_reduce).
     //    Padding rows at +∞ never win the min, so the fold yields row-0's value.
-    let (running_best, _) =
-        warp.row_arg_reduce(seed_val(ker, warp, POS_INF), seed_idx(ker, warp), &best.val, ArgDir::Min);
+    let (running_best, _) = warp.arg_reduce(seed_val(ker, warp, POS_INF), seed_idx(ker, warp), &best.val, ArgDir::Min);
 
     // d. Conditional update at slot 0: where tile_min < running_best, write
     //    tile_min (val) and global_k (idx). Chain idx after val so both carried
