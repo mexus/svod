@@ -834,6 +834,37 @@ pub struct TensorCore {
     ),
 }
 
+impl TensorCore {
+    /// The canonical `WMMA_{m}_{n}_{k}_{in}_{out}` identifier for this core. It is
+    /// interpolated verbatim into generated source (the MSL renderer emits a helper
+    /// function of this name), so it must stay a valid C identifier — spell the
+    /// dtypes here, never with `Debug`.
+    pub fn wmma_name(&self) -> String {
+        format!(
+            "WMMA_{}_{}_{}_{}_{}",
+            self.dims.0,
+            self.dims.1,
+            self.dims.2,
+            wmma_dtype_name(&self.dtype_in),
+            wmma_dtype_name(&self.dtype_out),
+        )
+    }
+}
+
+/// Source-identifier spelling of a matrix-core operand dtype.
+pub fn wmma_dtype_name(dtype: &svod_dtype::DType) -> &'static str {
+    use svod_dtype::ScalarDType;
+    match dtype.base() {
+        ScalarDType::Float32 => "float",
+        ScalarDType::Float16 => "half",
+        ScalarDType::BFloat16 => "bfloat",
+        ScalarDType::Float64 => "double",
+        ScalarDType::Int32 => "int",
+        ScalarDType::Int8 => "int8",
+        _ => "unknown",
+    }
+}
+
 // ============================================================================
 // TENSOR CORE CONFIGURATION (Static Const Data)
 // ============================================================================

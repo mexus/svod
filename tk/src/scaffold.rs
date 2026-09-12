@@ -68,15 +68,15 @@ impl Kernel {
     /// kernel that requires a matrix-core layout.
     ///
     /// # Panics
-    /// Panics when tk defines no matrix-core fragment layouts for the arch (Metal,
-    /// pre-Ampere CUDA) — an authoring error: such kernels must gate on an
+    /// Panics when tk defines no matrix-core fragment layouts for the arch
+    /// (pre-Ampere CUDA, pre-Apple7 Metal) — an authoring error: such kernels must gate on an
     /// [`crate::ArchSet`] that excludes those arches.
     pub fn frag(&self, role: FragRole) -> RTBaseShape {
         self.caps.frag(role).unwrap_or_else(|| self.no_layout(&format!("{role:?} fragment")))
     }
     fn no_layout<T>(&self, what: &str) -> T {
         panic!(
-            "{}: tk defines no {what} layout for this arch (matrix-core kernels need AMD or CUDA sm_80+)",
+            "{}: tk defines no {what} layout for this arch (matrix-core kernels need AMD, CUDA sm_80+ or Apple7+)",
             self.caps.arch.target_name()
         )
     }
@@ -102,6 +102,13 @@ impl Kernel {
     /// Panics when the arch has no fragment layouts (see [`Kernel::frag`]).
     pub fn operand(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> RT<'_> {
         self.rt(dims, dt, layout, self.frag(FragRole::Operand))
+    }
+
+    /// An operand register tile in the **B** position of a matrix multiply
+    /// ([`FragRole::OperandB`]) — identical to [`Self::operand`] except on an arch
+    /// whose core reads its two operands in different orientations.
+    pub fn operand_b(&self, dims: (usize, usize), dt: DType, layout: TileLayout) -> RT<'_> {
+        self.rt(dims, dt, layout, self.frag(FragRole::OperandB))
     }
     /// An f32 ortho register-vector — the softmax/reduce accumulator vectors, sized
     /// by the accumulator fragment's per-lane slots ([`FragRole::Accumulator`]).

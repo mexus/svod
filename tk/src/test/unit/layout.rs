@@ -16,11 +16,13 @@ use crate::ArchCaps;
 use crate::arch::FragRole;
 use crate::index::Idx;
 use crate::layout::{LaneMap, LdmatrixX4, ReduceTree};
-use crate::tiles::{RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape};
+use crate::tiles::{
+    RT_8X8_SIMD, RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape,
+};
 
 const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
 
-/// Every 16×16 matrix-core fragment tk resolves a role to, with its wave size.
+/// Every matrix-core fragment tk resolves a role to, with its wave size.
 /// (The `RT_32X32`/`RT_16X32`/`RT_32X16` constants are unused tinygrad carry-overs
 /// whose stride-4 map does not cover a 32-wide fragment; no kernel builds on them.)
 fn all_frags() -> Vec<(RTBaseShape, usize, &'static str)> {
@@ -30,6 +32,7 @@ fn all_frags() -> Vec<(RTBaseShape, usize, &'static str)> {
         (RT_16X16_W32_IN, 32, "gfx1151 input"),
         (RT_16X16_W32_ACC_T, 32, "gfx1151 acc_t"),
         (RT_16X16_MMA, 32, "sm_86 mma.sync"),
+        (RT_8X8_SIMD, 32, "apple simdgroup_matrix"),
     ]
 }
 
@@ -129,7 +132,7 @@ fn amd_maps(f: RTBaseShape, transpose: bool, lane: usize, j: usize, expect: (i64
 // orientations, and its UOp evaluation folds to the same integers.
 proptest! {
     #[test]
-    fn layouts_are_bijections(which in 0usize..5, transpose in any::<bool>()) {
+    fn layouts_are_bijections(which in 0usize..6, transpose in any::<bool>()) {
         let (f, wave, name) = all_frags()[which];
         let (rows, cols, ept) = (f.base.rows, f.base.cols, f.base.ept);
         let replication = wave * ept / (rows * cols);
@@ -273,4 +276,64 @@ fn ldmatrix_x4_plan_reproduces_the_map(transpose: bool) {
             }
         }
     }
+}
+
+// ── Apple `simdgroup_matrix<T, 8, 8>` ─────────────────────────────────────────
+
+/// The Apple lane table, **measured on hardware** (Apple9, macOS 26.6): an 8x8
+/// tile was filled with `row*8 + col`, loaded with `simdgroup_load`, and each
+/// lane's `thread_elements()[0..1]` read back. The ordering is undocumented, so
+/// this table — not the closed form — is the source of truth; the closed form
+/// `row = 4·((L/16)%2) + (L/2)%4, col = 4·((L/8)%2) + 2·(L%2) + j` is what it
+/// pinned. The same table was verified for a `float` MAC **result**, which is
+/// what licenses [`ArchCaps::acc_reusable_as_input`] on Metal.
+#[test_case(0, [(0, 0), (0, 1)]; "lane 0")]
+#[test_case(1, [(0, 2), (0, 3)]; "lane 1")]
+#[test_case(2, [(1, 0), (1, 1)]; "lane 2")]
+#[test_case(7, [(3, 2), (3, 3)]; "lane 7")]
+#[test_case(8, [(0, 4), (0, 5)]; "lane 8")]
+#[test_case(15, [(3, 6), (3, 7)]; "lane 15")]
+#[test_case(16, [(4, 0), (4, 1)]; "lane 16")]
+#[test_case(23, [(7, 2), (7, 3)]; "lane 23")]
+#[test_case(24, [(4, 4), (4, 5)]; "lane 24")]
+#[test_case(31, [(7, 6), (7, 7)]; "lane 31")]
+fn simdgroup_matrix_lane_table(lane: usize, want: [(i64, i64); 2]) {
+    for (j, expected) in want.into_iter().enumerate() {
+        assert_eq!(rc(&RT_8X8_SIMD, false, lane, j), expected, "lane {lane} element {j}");
+    }
+}
+
+/// A row of the 8x8 fragment is held by the four lanes `{L, L^1, L^8, L^9}`, so
+/// the online-softmax fold is the two-mask butterfly `[1, 8]` — one step shorter
+/// than the AMD wave64 sibling gather. Derived here from the map itself so the
+/// tree and the table cannot drift apart.
+#[test]
+fn simdgroup_matrix_row_fold() {
+    let mut rows: BTreeMap<i64, BTreeSet<usize>> = BTreeMap::new();
+    for lane in 0..32 {
+        rows.entry(rc(&RT_8X8_SIMD, false, lane, 0).0).or_default().insert(lane);
+    }
+    assert_eq!(rows.len(), 8, "every row is claimed");
+    for (row, lanes) in &rows {
+        let base = *lanes.iter().next().expect("non-empty");
+        let want: BTreeSet<usize> = [base, base ^ 1, base ^ 8, base ^ 9].into_iter().collect();
+        assert_eq!(lanes, &want, "row {row} lanes");
+    }
+    assert_eq!(RT_8X8_SIMD.map.tree(32), ReduceTree::Butterfly([1, 8].into_iter().collect()));
+    assert_eq!(RT_8X8_SIMD.map.slots(), 1, "a lane's two elements share a row, so one kept value");
+    assert!(RT_8X8_SIMD.map.folds_cols(false), "the register axis is the column axis");
+    assert_eq!(RT_8X8_SIMD.map.ldmatrix_x4(false), None, "no PTX ldmatrix analog");
+}
+
+/// The Metal fragment resolves for Apple7+ in the two orientations the matrix
+/// core's operand contract calls for: transposed for the `Row`-declared A operand,
+/// plain for the B operand (whose `Col` declaration transposes it already) and for
+/// the accumulators, which must keep tk's `Col`-holds-`Cᵀ` invariant.
+#[test]
+fn metal_caps_resolve_the_simdgroup_fragment() {
+    let caps = ArchCaps::for_arch(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)));
+    for role in [FragRole::Accumulator, FragRole::AccumulatorT, FragRole::OperandB] {
+        assert_eq!(caps.frag(role).map(|f| f.map), Some(LaneMap::SimdgroupMatrix), "{role:?}");
+    }
+    assert_eq!(caps.frag(FragRole::Operand).map(|f| f.map), Some(LaneMap::SimdgroupMatrixT));
 }

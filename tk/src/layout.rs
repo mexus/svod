@@ -107,6 +107,23 @@ pub enum LaneMap {
     /// PTX **A** fragment `a0..a7`, the two **C** fragments `c0..c3` per half, and
     /// (read transposed) the two **B** fragments `{0,1,4,5}` / `{2,3,6,7}`.
     MmaSync,
+    /// Apple `simdgroup_matrix<T, 8, 8>` (32 lanes, 2 elements each), measured on
+    /// Apple9 — the ordering `thread_elements()[j]` exposes is undocumented, so it
+    /// is pinned by the hardware table in `test/unit/layout.rs`:
+    /// `row = 4·((L/16)%2) + (L/2)%4, col = 4·((L/8)%2) + 2·(L%2) + j`. The
+    /// **B operand and the accumulator share this map**, which is what lets Metal
+    /// feed an MMA result straight back as an input ([`crate::ArchCaps::acc_reusable_as_input`]).
+    /// A row is held by the four lanes `{L, L^1, L^8, L^9}`, so the fold is a
+    /// two-step butterfly over masks 1 and 8.
+    SimdgroupMatrix,
+    /// [`Self::SimdgroupMatrix`] read transposed — the **A operand** of Apple's
+    /// core. AMD's MFMA and CUDA's `mma.sync` absorb tk's `Col` accumulator
+    /// convention in their calibration tables; Apple's core computes `D = A·B`
+    /// straight off the map, so a `Col` accumulator is reached by emitting
+    /// `Cᵀ = Bᵀ·Aᵀ` — which needs both operands transposed. A B tile's own `Col`
+    /// declaration supplies that; the `Row`-declared A tile takes this map instead.
+    /// See [`crate::arch::FragRole::Operand`].
+    SimdgroupMatrixT,
 }
 
 impl LaneMap {
@@ -129,6 +146,12 @@ impl LaneMap {
                 let c = t.mul(2).add(&j.rem(2)).add(&j.div(4).mul(8));
                 if transpose { (c, r) } else { (r, c) }
             }
+            LaneMap::SimdgroupMatrix | LaneMap::SimdgroupMatrixT => {
+                let r = lane.div(16).rem(2).mul(4).add(&lane.div(2).rem(4));
+                let c = lane.div(8).rem(2).mul(4).add(&lane.rem(2).mul(2)).add(j);
+                let flip = matches!(*self, LaneMap::SimdgroupMatrixT);
+                if transpose ^ flip { (c, r) } else { (r, c) }
+            }
         }
     }
 
@@ -136,7 +159,8 @@ impl LaneMap {
     /// `transpose` — the coordinate that varies with `j`; the reduce keeps the other.
     pub fn folds_cols(&self, transpose: bool) -> bool {
         match self {
-            LaneMap::Strided { .. } | LaneMap::MmaSync => !transpose,
+            LaneMap::Strided { .. } | LaneMap::MmaSync | LaneMap::SimdgroupMatrix => !transpose,
+            LaneMap::SimdgroupMatrixT => transpose,
             LaneMap::Interleaved => false,
             LaneMap::InterleavedT => true,
         }
@@ -164,10 +188,13 @@ impl LaneMap {
 
     /// The cross-lane completion for a `wave_size`-lane wave: the AMD maps fold
     /// the `wave_size/16` sibling lane-groups (`[16, 32, 48]` at wave64, `[16]` at
-    /// wave32); [`Self::MmaSync`] folds the quad (`L ^ 1`, `L ^ 2`).
+    /// wave32); [`Self::MmaSync`] folds the quad (`L ^ 1`, `L ^ 2`) and
+    /// [`Self::SimdgroupMatrix`] the row's four lanes (`L ^ 1`, `L ^ 8`).
     pub fn tree(&self, wave_size: usize) -> ReduceTree {
         match self {
             LaneMap::MmaSync => ReduceTree::Butterfly([1, 2].into_iter().collect()),
+            // A row lives in lanes {L, L^1, L^8, L^9}; masks 1 and 8 cover it.
+            LaneMap::SimdgroupMatrix | LaneMap::SimdgroupMatrixT => ReduceTree::Butterfly([1, 8].into_iter().collect()),
             _ => ReduceTree::Gather((1..wave_size as i64 / 16).map(|i| i * 16).collect()),
         }
     }
@@ -182,6 +209,12 @@ impl LaneMap {
     /// hand-permuted: [`Self::MmaSync`] reads `[0, 1, 2, 3]` plain and `[0, 2, 1,
     /// 3]` transposed (ThunderKittens `ldsm4t(tmp[0], tmp[2], tmp[1], tmp[3])`).
     pub fn ldmatrix_x4(&self, transpose: bool) -> Option<LdmatrixX4> {
+        // `ldmatrix` is a PTX instruction over a 16x16 fragment; an 8x8 simdgroup
+        // matrix has no such load (its analog is `simdgroup_load`, which the WMMA
+        // helper issues itself), so the derivation below does not apply.
+        if matches!(self, LaneMap::SimdgroupMatrix | LaneMap::SimdgroupMatrixT) {
+            return None;
+        }
         [false, true].into_iter().find_map(|trans| {
             let mut words = [0usize; 4];
             for (p, word) in words.iter_mut().enumerate() {

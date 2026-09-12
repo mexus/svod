@@ -55,7 +55,7 @@ const BLK: usize = 16;
 /// [`BLK`] (16). The corpus is streamed in `M/TM` tiles, so the running top-K runs
 /// `M/TM × k` insert passes instead of `M/16 × k`: a taller `TM` trades fewer insert
 /// passes for a proportionally heavier per-step reduce. Each `[TM, query]` score
-/// sub-tile is `TM/16` stacked 16-row WMMA fragments; `row_arg_reduce` folds across
+/// sub-tile is `TM/16` stacked 16-row WMMA fragments; `arg_reduce` folds across
 /// those stacked frags INTERNALLY, returning one logical-`TM`-row argmin per query
 /// (the in-primitive cross-frag fold). MUST be a multiple of 16; independent of the
 /// query width and `K_pad`
@@ -213,7 +213,7 @@ fn load_query_t<'k>(ker: &'k Kernel, warp: &Group<'k>, query: usize, d: usize, x
 
 /// Per-query running top-K state: two Col-layout `[K_pad=BLK, query]` register
 /// tiles — `val` (f32, K-slot = row, seeded `+∞`) and `idx` (Int32, seeded `−1`).
-/// `row_arg_reduce` folds the K-slot (row) axis on both archs, so a `Max` reduce
+/// `arg_reduce` folds the K-slot (row) axis on both archs, so a `Max` reduce
 /// yields the per-query running-worst slot to evict.
 struct TopK<'k> {
     val: RT<'k>,
@@ -246,7 +246,7 @@ struct TopK<'k> {
 /// # Panics
 /// Panics unless `query`/`d` are multiples of [`BLK`], `corpus > 0`, `1 ≤ k ≤ BLK`,
 /// and `query ≤ BLK` (the v1 single-query-fragment constraint: a wider query would
-/// fold distinct queries together in the per-query `row_arg_reduce`).
+/// fold distinct queries together in the per-query `arg_reduce`).
 pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: usize) {
     Kernel::assert_divisible(query, BLK, "KNN topk query");
     Kernel::assert_divisible(d, BLK, "KNN topk D");
@@ -284,7 +284,7 @@ pub fn build_knn_topk(ker: &Kernel, corpus: usize, query: usize, d: usize, k: us
 
     // Running top-K state (Col `[K_pad=BLK, query]`). The fragment is 16-wide but only
     // the first `k` K-slots are live; seed slots `[0, k)` to `+∞` (empty, fillable) and
-    // the padding `[k, 16)` to `−∞` so the `row_arg_reduce(Max)` worst-slot search NEVER
+    // the padding `[k, 16)` to `−∞` so the `arg_reduce(Max)` worst-slot search NEVER
     // evicts into a padding slot (a `−∞` always loses the Max to a real `+∞`/finite
     // slot). Without this the worst is forever the `+∞` of an unused slot and inserts
     // leak past the stored first-`k` columns. `idx` seeds to `−1` everywhere.
@@ -345,13 +345,13 @@ fn topk_insert<'k>(
     // the LAST step is the loop's terminal store, so its `remove_used` (dead — no next
     // argmin) is skipped, leaving idx-evict last on the store stack for `lp.close()`.
     for step in 0..k {
-        // a. per-query tile-min over the TM corpus rows. `row_arg_reduce` folds the
+        // a. per-query tile-min over the TM corpus rows. `arg_reduce` folds the
         //    `[TM, query]` Col score's `TM/16` stacked height-frags INTERNALLY (the
         //    in-primitive cross-frag fold), returning one `(row_min, row_arg)` per
         //    query directly — `row_arg` is the in-tile corpus row `0..TM` (global
         //    over the stacked frags). `global_m = m_tile·TM + row_arg`.
         let (row_min, row_arg) =
-            warp.row_arg_reduce(seed_val(ker, warp, BLK, POS_INF), seed_idx(ker, warp, BLK), &score, ArgDir::Min);
+            warp.arg_reduce(seed_val(ker, warp, BLK, POS_INF), seed_idx(ker, warp, BLK), &score, ArgDir::Min);
         // `global_m = m_tile·TM + row_arg` in a FRESH RV — `warp.map` rewrites its
         // tile in place, so mapping `row_arg` directly would clobber the in-tile index
         // that `remove_used` still needs to mask the consumed element (the `k > 1`
@@ -365,7 +365,7 @@ fn topk_insert<'k>(
         // b. per-query running-worst value + its K-slot index. The running top-K is
         //    `[K_pad=BLK, query]` (one frag), so this reduce needs no fold.
         let (worst, evict) =
-            warp.row_arg_reduce(seed_val(ker, warp, BLK, NEG_INF), seed_idx(ker, warp, BLK), &topk.val, ArgDir::Max);
+            warp.arg_reduce(seed_val(ker, warp, BLK, NEG_INF), seed_idx(ker, warp, BLK), &topk.val, ArgDir::Max);
 
         // d. Evict (conditional rewrite by K-slot): write row_min/global_m into the
         //    `evict[query]` K-slot where `row_min[query] < worst[query]` (do_insert).
@@ -383,16 +383,16 @@ fn topk_insert<'k>(
     topk
 }
 
-/// A length-`length` f32 RV seeded to `init` (the `row_arg_reduce` value
+/// A length-`length` f32 RV seeded to `init` (the `arg_reduce` value
 /// accumulator; it actually overwrites the seed with `dir.init()`, but a same-dtype
 /// seed keeps the alloc explicit). `length` is always `BLK` (one output slot per
-/// lane): `row_arg_reduce` collapses the whole reduced axis — including the score
+/// lane): `arg_reduce` collapses the whole reduced axis — including the score
 /// tile's `TM/16` stacked frags, folded internally — into that single slot.
 fn seed_val<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize, init: f64) -> RV<'k> {
     let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(length, DType::Float32, VecLayout::Ortho, frag), init)
 }
-/// A length-`length` Int32 index RV seeded to `−1` (the `row_arg_reduce` index acc).
+/// A length-`length` Int32 index RV seeded to `−1` (the `arg_reduce` index acc).
 fn seed_idx<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize) -> RV<'k> {
     let frag = ker.frag(FragRole::Accumulator);
     warp.clear_rv(ker.rv(length, DType::Int32, VecLayout::Ortho, frag), -1.0)
@@ -400,7 +400,7 @@ fn seed_idx<'k>(ker: &'k Kernel, warp: &Group<'k>, length: usize) -> RV<'k> {
 
 /// Seed the running-top-K value tile (Col `[K_pad=BLK, query]`): K-slots `[0, k)`
 /// to `+∞` (empty, fillable), the padding slots `[k, 16)` to `−∞` so the worst-slot
-/// `row_arg_reduce(Max)` never evicts into a padding slot. The per-element K-slot
+/// `arg_reduce(Max)` never evicts into a padding slot. The per-element K-slot
 /// is its global row position, computed arch-correctly via [`Group::map_position`].
 /// Both branches are constant (`x` is only used for its dtype), so this uses the
 /// seed form directly instead of [`Group::mask_where`].
@@ -472,7 +472,7 @@ fn evict_slot<'k>(
 /// Remove the consumed corpus element from a Col `[TM, query]` score tile: set
 /// `score[m == row_arg[query], query] = +∞` where `row_min[query] < worst[query]`
 /// (i.e. the element actually inserted this step), so the next step's argmin skips
-/// it. `row_arg` is the in-tile corpus row (0..TM) `row_arg_reduce` folded across
+/// it. `row_arg` is the in-tile corpus row (0..TM) `arg_reduce` folded across
 /// the stacked frags, compared against the element's global row position (computed
 /// via [`Group::map_position`]). Exactly one tile position matches (the frag
 /// decomposition `0..TM ↔ (idx[0], in-frag row)` is a bijection), so no

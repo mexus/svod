@@ -41,6 +41,13 @@ use svod_ir::ops;
 /// disabled) is an inert no-op rather than malformed IR.
 const PIPELINE_PREFIX: &str = "; svod.sched.pipeline";
 
+/// Whether an `Op::Custom` body is a scheduling marker rather than renderable code.
+/// The LLVM text renderer lowers these (or drops them off CDNA); a renderer with a
+/// different comment syntax — MSL — must drop them instead of splicing them in.
+pub fn is_scheduling_marker(code: &str) -> bool {
+    code.starts_with(PIPELINE_PREFIX)
+}
+
 /// The compute pattern of a marked loop — selects the lowering recipe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedKind {

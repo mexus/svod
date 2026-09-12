@@ -33,7 +33,7 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
         (0..(ept as f64).log2() as usize).map(|i| (AxisId::Renumbered(4 - i), 2)).collect()
     };
     WmmaMetadata {
-        name: format!("WMMA_{}_{}_{}_{:?}_{:?}", tc.dims.0, tc.dims.1, tc.dims.2, tc.dtype_in, tc.dtype_out),
+        name: tc.wmma_name(),
         dims: tc.dims,
         dtype_in: tc.dtype_in.clone(),
         dtype_out: tc.dtype_out.clone(),
@@ -48,7 +48,7 @@ fn wmma_from_tc(tc: &TensorCore, device: RendererDevice) -> WmmaMetadata {
     }
 }
 
-/// The K=16 matrix-core descriptor for `dtype_in → dtype_out` on `arch`, looked up
+/// The matrix-core descriptor for `dtype_in → dtype_out` on `arch`, looked up
 /// from the shared per-arch tensor-core table (`Renderer::for_{amd,cuda}_arch`)
 /// rather than re-encoded here — so bf16/f16 on CDNA's MFMA cores, the RDNA wave32
 /// cores and CUDA's `mma.sync` come from one source. AMD cores are the square
@@ -59,7 +59,11 @@ fn wmma_desc(arch: GpuArch, dtype_in: &DType, dtype_out: &DType) -> WmmaMetadata
         GpuArch::Cuda(cuda) => Renderer::for_cuda_arch(cuda),
         GpuArch::Metal(family) => Renderer::for_metal_family(family),
     };
-    let dims = if arch.cuda().is_some() { (8, 16, 16) } else { (16, 16, 16) };
+    let dims = match arch {
+        GpuArch::Cuda(_) => (8, 16, 16),
+        GpuArch::Metal(_) => (8, 8, 8),
+        GpuArch::Amd(_) => (16, 16, 16),
+    };
     let tc = ren
         .tensor_cores
         .iter()
@@ -145,10 +149,35 @@ impl MmaPlan {
                 })
                 .collect()
         } else {
-            assert_eq!(a.base.base.cols, 16, "mma: only the 16-col WMMA base is supported");
+            if arch.metal().is_some() {
+                // Apple's core reads its operands straight off the fragment map, so
+                // the `Col` accumulator convention has to be emitted rather than
+                // absorbed by a calibration table — see `FragRole::Operand`.
+                assert_eq!(
+                    c.layout,
+                    TileLayout::Col,
+                    "mma: Apple's simdgroup core builds the product as `Cᵀ = Bᵀ·Aᵀ`, so the accumulator must be a Col tile"
+                );
+                for (name, t) in [("A", a), ("B", b), ("C", c)] {
+                    assert!(
+                        matches!(t.base.map, LaneMap::SimdgroupMatrix | LaneMap::SimdgroupMatrixT)
+                            && t.base.base.elements_per_thread() == 2,
+                        "mma: operand {name} must carry an 8×8 simdgroup-matrix fragment, got {:?}",
+                        t.base.map
+                    );
+                }
+            }
+            // The A fragment's column axis is the core's K, whatever the arch.
+            assert_eq!(a.base.base.cols, meta.dims.2, "mma: the A fragment's columns must equal the core's K");
             let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
             let regs = |axes| (0..upcast_count(axes)).collect();
-            vec![MmaStep { a: regs(&axes.a), b: regs(&axes.b), c: regs(&axes.c), swap: false }]
+            // A `Col` accumulator holds `Cᵀ`, so the product must be built as
+            // `Cᵀ = Bᵀ·Aᵀ` from the (already transposed) operand readings — the
+            // operands exchange roles. AMD's MFMA fragment tables absorb this in
+            // their own calibration; a core that reads operands straight off the
+            // lane map (Apple's `simdgroup_matrix`) has to be told.
+            let swap = arch.metal().is_some() && c.layout == TileLayout::Col;
+            vec![MmaStep { a: regs(&axes.a), b: regs(&axes.b), c: regs(&axes.c), swap }]
         };
         MmaPlan { meta, steps }
     }

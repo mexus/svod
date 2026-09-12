@@ -105,7 +105,7 @@ fn test_row_reduce_graph_shape() {
     assert!(!topo.iter().any(|u| matches!(u.op(), Op::Wmma(..))), "a reduction has no WMMA");
 }
 
-/// `row_arg_reduce` threads an index alongside the value: each sibling-gather step
+/// `arg_reduce` threads an index alongside the value: each sibling-gather step
 /// shuffles BOTH payloads (so the partner's index rides its own `ds_bpermute`,
 /// never re-derived) → exactly `2 * (wave_size / 16 - 1)` `Op::Custom` gathers, plus
 /// the `where`-select pair-fold (`Ternary` + `Lt`/`Eq` compares), and still no LDS,
@@ -121,7 +121,7 @@ fn test_row_arg_reduce_graph_shape() {
         let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
         // The index result transitively depends on the value path (the keep
         // predicate reads the value compares), so its toposort covers both.
-        let (_, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
+        let (_, idx) = warp.arg_reduce(val, idx, &src, ArgDir::Min);
         idx.uop().toposort()
     };
     for caps in [ArchCaps::GFX942, ArchCaps::for_amd(AmdArch::Gfx1151)] {
@@ -237,7 +237,7 @@ fn test_softmax_unroll_gpu() {
 ///
 /// End-to-end argmin of a known 16×16 matrix into the role-selected accumulator
 /// fragment (arch-portable: wave64 gfx942, wave32 gfx1151, warp32 CUDA — where the
-/// quad butterfly completes the fold and each lane keeps two row slots). `row_arg_reduce`
+/// quad butterfly completes the fold and each lane keeps two row slots). `arg_reduce`
 /// reduces the fragment's `inner`-carrying folded axis — the matrix *column* on the
 /// non-interleave gfx942 frag, the matrix *row* on the wave32 even/odd accumulator
 /// (the caller arranges the tile, exactly like `row_reduce` in FA). To assert one
@@ -296,7 +296,7 @@ fn test_row_argmin_gpu() {
         let src = warp.load(ker.rt((16, 16), DType::Float32, ROW, frag), ain, MoveIdx::block((0, 0, 0, 0), 2));
         let val = warp.clear_rv(ker.rv(16, DType::Float32, VecLayout::Ortho, frag), f64::INFINITY);
         let idx = warp.clear_rv(ker.rv(16, DType::Int32, VecLayout::Ortho, frag), -1.0);
-        let (val, idx) = warp.row_arg_reduce(val, idx, &src, ArgDir::Min);
+        let (val, idx) = warp.arg_reduce(val, idx, &src, ArgDir::Min);
 
         let vtile = warp.add_rv(warp.zero(ker.rt((16, 16), DType::Float32, ROW, frag)), &val);
         let itile = warp.add_rv(warp.zero(ker.rt((16, 16), DType::Int32, ROW, frag)), &idx);

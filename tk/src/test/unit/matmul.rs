@@ -733,6 +733,85 @@ fn test_matmul_bench_cuda() {
     }
 }
 
+/// Per-dispatch time and TFLOP/s of the resolved arch's bf16 matmul config at
+/// N = 2048 / 4096 — the roofline reference for "is our GEMM leaving anything on the
+/// table". Unlike [`test_matmul_bench_cuda`] this runs on whatever fragment device is
+/// selected, and every [`MatmulCfg`] field is env-overridable (`MM_BLOCK`, `MM_WR`,
+/// `MM_WC`, `MM_ACC`, `MM_SWZ`, `MM_VEC`, `MM_K`) so a config can be swept without a
+/// rebuild — how `METAL_CFG`'s `k_step` was tuned. Prefer N=4096: smaller sizes are
+/// cache-resident and show clock-state bimodality, so they read several TFLOP/s apart
+/// run to run.
+/// `MM_K=16 SVOD_DEVICE=METAL:0 cargo test -p svod-tk --lib matmul::test_matmul_bench_gpu -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn test_matmul_bench_gpu() {
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip test_matmul_bench_gpu: no fragment device");
+        return;
+    };
+    if !super::device_supported(crate::kernels::matmul::MATMUL_SUPPORTED_ARCHS) {
+        eprintln!("skip test_matmul_bench_gpu: matmul unsupported here");
+        return;
+    }
+    let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    for n in [2048usize, 4096] {
+        let base = cfg_for_arch(caps.arch, n);
+        let cfg = crate::kernels::matmul::MatmulCfg {
+            block: envu("MM_BLOCK", base.block),
+            wave_rows: envu("MM_WR", base.wave_rows),
+            wave_cols: envu("MM_WC", base.wave_cols),
+            n_accum: envu("MM_ACC", base.n_accum),
+            l2_swizzle: envu("MM_SWZ", base.l2_swizzle as usize) != 0,
+            vec_load: envu("MM_VEC", base.vec_load as usize) != 0,
+            k_step: envu("MM_K", base.k_step),
+        };
+        let (a, b) = matmul_inputs(n);
+        let mut c = Tensor::empty(&[n, n], DType::Float32);
+        let compiled = crate::compile_kernel(
+            "matmul_bench",
+            cfg.grid_dims(n),
+            cfg.threads(caps.wave_size),
+            &mut [&mut c],
+            &[&a, &b],
+            |ker| {
+                build_matmul_cfg(ker, n, cfg);
+                ker.finish(cfg.n_accum)
+            },
+        )
+        .expect("compile");
+        // GPU stamps need the graph-replay path; a lone dispatch may be unstamped
+        // (Metal), so fall back to host wall time — these kernels are ms-scale.
+        for _ in 0..3 {
+            unsafe { compiled.dispatch(true) }.expect("warmup");
+        }
+        let mut us: Vec<f64> = (0..12)
+            .map(|_| match compiled.dispatch_gpu_ns().expect("dispatch") {
+                Some(ns) => ns as f64 / 1e3,
+                None => {
+                    let t = std::time::Instant::now();
+                    unsafe { compiled.dispatch(true) }.expect("dispatch");
+                    t.elapsed().as_secs_f64() * 1e6
+                }
+            })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        let median = us[us.len() / 2];
+        let tflops = 2.0 * (n as f64).powi(3) / (median * 1e-6) / 1e12;
+        println!(
+            "matmul[{}] N={n} blk={} wr={} wc={} acc={} k={} vec={}: median {median:.1} us = {tflops:.2} TFLOP/s (best {:.1} us = {:.2})",
+            caps.arch.target_name(),
+            cfg.block,
+            cfg.wave_rows,
+            cfg.wave_cols,
+            cfg.n_accum,
+            cfg.k_step,
+            cfg.vec_load,
+            us[0],
+            2.0 * (n as f64).powi(3) / (us[0] * 1e-6) / 1e12
+        );
+    }
+}
+
 /// `mma_AB` reads B as a `[k,n]` (`Col`) tile; a `Row` tile would be
 /// multiplied transposed, so the plan refuses it at build time. GPU-free.
 #[test]
@@ -754,4 +833,174 @@ fn mma_atb_rejects_a_row_a_tile() {
     let a = ker.operand((16, 16), DType::BFloat16, TileLayout::Row);
     let b = ker.operand((16, 16), DType::BFloat16, TileLayout::Col);
     let _ = warp.mma_atb(warp.zero(ker.acc((16, 16), TileLayout::Col)), &a, &b);
+}
+
+/// Element-level check of the Apple `simdgroup_matrix` lane map (the Metal peer of
+/// [`test_matmul_cuda_grid`]): `A = I`, `B[k][j] = (k%16)·16 + j%16` ⇒ `C = B`, so
+/// the first 16×16 output block must read `got[i][j] = i·16 + j`. A within-fragment
+/// or within-tile permutation of the A/B/C register order lands at the wrong
+/// `(i, j)` and prints the permutation instead of a scalar error.
+/// `cargo test -p svod-tk --lib matmul::test_matmul_metal_grid -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_matmul_metal_grid() {
+    let Some(caps) = super::fragment_device().filter(|c| c.arch.metal().is_some()) else {
+        eprintln!("skip test_matmul_metal_grid: no Apple7+ device");
+        return;
+    };
+    let _ = caps;
+    let n = 64usize;
+    let cfg = crate::kernels::matmul::METAL_CFG;
+    let eye: Vec<f32> = (0..n * n).map(|p| if p / n == p % n { 1.0 } else { 0.0 }).collect();
+    let ramp: Vec<f32> = (0..n * n).map(|p| (((p / n) % 16) * 16 + (p % n) % 16) as f32).collect();
+    let mk = |d: &[f32]| {
+        let t = Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
+        t.realize().expect("realize");
+        t
+    };
+    // `A = I` exercises the B/accumulator ordering; `B = I` exercises the A
+    // ordering (an identity is invariant under a CONSISTENT relabelling of both
+    // axes, so one direction alone cannot see a shared permutation).
+    for (label, ad, bd) in [("A=I, B=ramp", &eye, &ramp), ("A=ramp, B=I", &ramp, &eye)] {
+        let (a, b) = (mk(ad), mk(bd));
+        let got = launch_matmul("matmul_metal_grid", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+        let mut bad = Vec::new();
+        for i in 0..16 {
+            for j in 0..16 {
+                let want = (i * 16 + j) as i32;
+                let have = got[i * n + j].round() as i32;
+                if have != want {
+                    bad.push((i, j, want, have));
+                }
+            }
+        }
+        println!("{label}: {} / 256 wrong in fragment block", bad.len());
+        for &(i, j, want, have) in bad.iter().take(8) {
+            println!("   ({i:2},{j:2}) want {want:3} got {have:4}{}", {
+                let (wi, wj) = ((have / 16) as usize, (have % 16) as usize);
+                if (0..16).contains(&wi) && (0..16).contains(&wj) {
+                    format!("  = value of ({wi},{wj})")
+                } else {
+                    String::new()
+                }
+            });
+        }
+        assert!(bad.is_empty(), "{label}: fragment block permuted");
+    }
+}
+
+/// **Matrix-core conformance**: what does the whole tile pipeline actually compute?
+///
+/// The identity probes ([`test_matmul_metal_grid`]) cannot see an operand swap —
+/// `I·B == B·I` — so this drives BOTH operands with general values and matches the
+/// result against every product the pipeline could plausibly be computing. On an
+/// arch whose fragment tables and matrix core agree, exactly `A·B` matches; any
+/// other match names the mis-pairing instead of reporting a scalar error.
+///
+/// Values are small integers so bf16 holds them exactly and the comparison is
+/// exact — a mismatch is a wiring fault, never rounding.
+/// `cargo test -p svod-tk --lib matmul::matmul_core_contract -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn matmul_core_contract() {
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip matmul_core_contract: no fragment device");
+        return;
+    };
+    let n = 64usize;
+    let cfg = crate::kernels::matmul::cfg_for_arch(caps.arch, n);
+    if !n.is_multiple_of(cfg.block) {
+        eprintln!("skip matmul_core_contract: N={n} not a multiple of block {}", cfg.block);
+        return;
+    }
+    let a_data: Vec<f32> = (0..n * n).map(|p| ((p * 7 + p / n * 3) % 5) as f32).collect();
+    let b_data: Vec<f32> = (0..n * n).map(|p| ((p * 11 + p % n * 2) % 4) as f32).collect();
+    let mk = |d: &[f32]| {
+        let t = Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
+        t.realize().expect("realize");
+        t
+    };
+    let (a, b) = (mk(&a_data), mk(&b_data));
+    // Self-check: the hand-rolled reference must agree with the tensor matmul on the
+    // SAME rounded operands, so a mismatch below indicts the kernel, not this test.
+    {
+        let cpu = a.cast(DType::Float32).matmul(&b.cast(DType::Float32)).expect("reference matmul");
+        cpu.realize().expect("realize reference");
+        let cpu = cpu.as_vec::<f32>().expect("read reference");
+        let mine: Vec<f32> =
+            (0..n * n).map(|p| (0..n).map(|k| a_data[(p / n) * n + k] * b_data[k * n + p % n]).sum()).collect();
+        let err = cpu.iter().zip(&mine).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "the test's own reference disagrees with tensor matmul (max {err:e})");
+    }
+    let got = launch_matmul("matmul_contract", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+
+    let at = |d: &[f32], t: bool, r: usize, c: usize| if t { d[c * n + r] } else { d[r * n + c] };
+    let mut matches = Vec::new();
+    for (xn, xd, xt) in [("A", &a_data, false), ("Aᵀ", &a_data, true), ("B", &b_data, false), ("Bᵀ", &b_data, true)]
+    {
+        for (yn, yd, yt) in [("A", &a_data, false), ("Aᵀ", &a_data, true), ("B", &b_data, false), ("Bᵀ", &b_data, true)]
+        {
+            for out_t in [false, true] {
+                let ok = (0..n).all(|i| {
+                    (0..n).all(|j| {
+                        let want: f32 = (0..n).map(|k| at(xd, xt, i, k) * at(yd, yt, k, j)).sum();
+                        let have = if out_t { got[j * n + i] } else { got[i * n + j] };
+                        (have - want).abs() < 1e-3
+                    })
+                });
+                if ok {
+                    matches.push(format!("{}{xn}·{yn}{}", if out_t { "(" } else { "" }, if out_t { ")ᵀ" } else { "" }));
+                }
+            }
+        }
+    }
+    println!("{}: pipeline computes {:?}", caps.arch.target_name(), matches);
+    assert!(matches.iter().any(|m| m == "A·B"), "matrix-core contract broken: computes {matches:?}, not A·B");
+}
+
+/// **K-addressing probe**: `A[i][k] = 1` iff `k == k0`, `B[k][j] = k·100 + j`, so
+/// `C[i][j]` must equal `B[k0][j]` for every row `i`. Whichever source row of `B`
+/// actually appears names the k the kernel read — so a permuted or truncated K
+/// walk prints as a `k0 -> k` map instead of a scalar error. This is the rung
+/// between "one MMA is correct" and "the whole tile is correct".
+/// `cargo test -p svod-tk --lib matmul::matmul_k_addressing -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn matmul_k_addressing() {
+    let Some(caps) = super::fragment_device() else {
+        eprintln!("skip matmul_k_addressing: no fragment device");
+        return;
+    };
+    let n = 64usize;
+    let cfg = crate::kernels::matmul::cfg_for_arch(caps.arch, n);
+    if !n.is_multiple_of(cfg.block) {
+        eprintln!("skip matmul_k_addressing: N={n} not a multiple of block {}", cfg.block);
+        return;
+    }
+    let b_data: Vec<f32> = (0..n * n).map(|p| ((p / n) * 100 + p % n) as f32).collect();
+    let mk = |d: &[f32]| {
+        let t = Tensor::from_slice(d).try_reshape([n, n]).expect("reshape").cast(DType::BFloat16);
+        t.realize().expect("realize");
+        t
+    };
+    let b = mk(&b_data);
+    let mut wrong = Vec::new();
+    for k0 in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63] {
+        let a_data: Vec<f32> = (0..n * n).map(|p| if p % n == k0 { 1.0 } else { 0.0 }).collect();
+        let a = mk(&a_data);
+        let got = launch_matmul("matmul_k_probe", n, cfg, |ker| build_matmul_cfg(ker, n, cfg), &a, &b);
+        // Row 0 of the result should be row k0 of B.
+        // bf16 holds only 8 mantissa bits, so `k·100` above 256 lands on the bf16
+        // grid (1500 -> 1504); compare within that spacing, not exactly.
+        let v = got[0].round() as i32;
+        let want = (k0 * 100) as f32;
+        let (saw_k, saw_j) = (v / 100, v % 100);
+        let ok = (got[0] - want).abs() <= want.abs() * 0.005 + 0.5;
+        if !ok {
+            wrong.push(k0);
+        }
+        println!("  k0={k0:2} -> C[0][0]={v:5} (B[{saw_k}][{saw_j}]) {}", if ok { "ok" } else { "MISMATCH" });
+        let _ = (saw_k, saw_j);
+    }
+    assert!(wrong.is_empty(), "K addressing wrong for k0 = {wrong:?}");
 }
