@@ -1,157 +1,129 @@
+//! White-box tests over `crate::optimizer::heuristics`: one declarative kernel builder for the buffer-backed shapes the pass ranks, then the threshold tables it decides on.
+
 use std::sync::Arc;
 
-use svod_dtype::{AddrSpace, DType, DeviceSpec};
-use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp};
+use proptest::prelude::*;
+use svod_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
+use svod_ir::{AxisType, BinaryOp, Op, ParamArg, ReduceOp, UOp, ops};
 use test_case::test_case;
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
 use crate::optimizer::heuristics::{
-    apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_local_dims, apply_matvec_fast_path,
-    apply_threading, try_grouped_reduction, try_tensor_cores, try_warp_row_reduction,
+    apply_default_upcast, apply_heuristic_upcasts, apply_image_upcasts, apply_local_dims, apply_masked_upcasts,
+    apply_matmul_output_upcasting, apply_matmul_tiling, apply_matvec_fast_path, apply_threading, apply_unroll,
+    count_strides, hand_coded_optimizations, has_matmul_pattern, is_masked, try_grouped_reduction, try_tensor_cores,
+    try_warp_row_reduction,
 };
 use crate::optimizer::renderer::TcTilePolicy;
-use crate::optimizer::{Opt, OptOps, Renderer, Scheduler};
-use crate::test::helpers::{create_conv_like_pattern, create_matmul_pattern_with, create_typed_matmul_pattern};
-use svod_ir::ops;
+use crate::optimizer::{Opt, OptArg, OptOps, Renderer, Scheduler, apply_opt};
+use crate::test::support::prelude::*;
+use crate::test::unit::optimizer::kernels::{
+    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, times, two_n_matmul,
+};
 
-/// Matvec-shaped `sum_k A[k] * B[k]` over `stored` buffers; with `wide`, both
-/// loads are cast to it before the product.
-fn create_matvec_like_pattern(rows: i64, cols: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
-    create_row_reduce_pattern(AxisType::Global, rows, cols, stored, wide)
-}
+// THE KERNEL SHAPES THIS PASS IS RANKED AGAINST
 
-/// [`create_matvec_like_pattern`] with the row axis of `row_axis` type.
-fn create_row_reduce_pattern(row_axis: AxisType, rows: i64, cols: i64, stored: DType, wide: Option<DType>) -> Arc<UOp> {
-    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), row_axis);
-    let reduce = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Reduce);
-
-    let idx_expr = row.try_add(&reduce).expect("index add should succeed");
-    let load = || {
-        let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, stored.clone());
-        let value = UOp::index().buffer(buffer).indices(vec![idx_expr.clone()]).call().expect("index should build");
-        match &wide {
-            Some(wide) => value.cast(wide.clone()),
-            None => value,
-        }
-    };
-    let (a, b) = (load(), load());
-
-    let mul = a.try_mul(&b).expect("mul should succeed");
-    let red = mul.reduce(vec![reduce].into(), ReduceOp::Add);
-    UOp::sink(vec![red, row])
-}
-
-fn create_tc_retry_pattern() -> Arc<UOp> {
-    let m_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
-    let n_good_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Global);
-    let k_range = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(2), AxisType::Reduce);
-    let n_bad_range = UOp::range_axis(UOp::index_const(15), AxisId::Renumbered(3), AxisType::Global);
-
-    let a_buf = UOp::new_buffer(DeviceSpec::Cpu, 4096, DType::Float32);
-    let b_buf = UOp::new_buffer(DeviceSpec::Cpu, 4096, DType::Float32);
-
-    let a_idx = m_range.try_add(&k_range).expect("A index should build");
-    let b_idx = k_range.try_add(&n_bad_range).and_then(|x| x.try_add(&n_good_range)).expect("B index should build");
-
-    let a_val = UOp::index().buffer(a_buf).indices(vec![a_idx]).call().expect("A load should build");
-    let b_val = UOp::index().buffer(b_buf).indices(vec![b_idx]).call().expect("B load should build");
-
-    let mul = a_val.try_mul(&b_val).expect("mul should succeed");
-    let red = mul.reduce(vec![k_range].into(), ReduceOp::Add);
-    UOp::sink(vec![red, m_range, n_good_range, n_bad_range])
-}
-
-/// A widening integer cast on the operands is exact under the int8→int32 WMMA,
-/// so it must not hide the tensor core; float casts keep the generic path.
-#[test_case(DType::Int8, DType::Int32, true; "int8 operands widened to int32 use the integer wmma")]
-#[test_case(DType::Float16, DType::Float32, false; "float16 operands widened to float32 stay scalar")]
-fn try_tensor_cores_sees_through_widening_integer_casts(stored: DType, wide: DType, uses_tc: bool) {
-    let sink = create_typed_matmul_pattern(16, 16, 16, stored.clone(), Some(wide));
-    let mut scheduler = Scheduler::new(sink, Renderer::amd_rdna3());
-
-    assert_eq!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()), uses_tc);
-
-    let wmma = scheduler.ast().toposort().into_iter().find_map(|u| match u.op() {
-        Op::Wmma(ops::Wmma { metadata, .. }) => Some(metadata.dtype_in.clone()),
-        _ => None,
-    });
-    assert_eq!(wmma, uses_tc.then_some(stored));
-}
-
-/// A fused elementwise producer on a MUL operand (`relu(A) @ B`, a padded
-/// conv's `WHERE`) leaves the WMMA legal; tinygrad only checks the dtypes, so
-/// the hand-coded path must not demand bare loads.
-#[test]
-fn try_tensor_cores_accepts_fused_operands() {
-    let relu = |value: Arc<UOp>| UOp::alu(svod_ir::BinaryOp::Max, value.clone(), value.const_like(0.0f64));
-    let sink = create_matmul_pattern_with(16, 16, 16, DType::Float16, relu);
-    let mut scheduler = Scheduler::new(sink, Renderer::amd_rdna3());
-
-    assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert!(scheduler.ast().toposort().iter().any(|u| matches!(u.op(), Op::Wmma(..))));
-}
-
-/// `(axis type, constant extent)` of a RANGE.
-fn range_axis(range: &Arc<UOp>) -> Option<(AxisType, i64)> {
-    let Op::Range(ops::Range { end, axis_type, .. }) = range.op() else { return None };
-    match end.op() {
-        Op::Const(c) => match c.0 {
-            ConstValue::Int(extent) => Some((*axis_type, extent)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// A conv-shaped reduce over (channels, taps) takes the tensor core by default:
-/// one divisible reduce axis becomes the WMMA K (highest axis id first, so the
-/// taps when both divide) and the other survives as a reduce loop around it.
-/// `Strict` keeps tinygrad's single-reduce-axis rule.
-#[test_case(64, 5, TcOpt::Relaxed, Some(5); "wide channels with five taps")]
-#[test_case(16, 25, TcOpt::Relaxed, Some(25); "narrow channels with many taps")]
-#[test_case(64, 16, TcOpt::Relaxed, Some(64); "both reduce axes divisible")]
-#[test_case(12, 5, TcOpt::Relaxed, None; "no reduce axis divisible")]
-#[test_case(64, 5, TcOpt::Strict, None; "strict declines the second reduce axis")]
-fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_opt: TcOpt, leftover: Option<i64>) {
-    let sink = create_conv_like_pattern(32, 32, channels, taps, DType::Float16);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
-
-    let uses_tc = leftover.is_some();
-    assert_eq!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().tc_opt(tc_opt).build()), uses_tc);
-    assert_eq!(scheduler.ast().toposort().iter().any(|u| matches!(u.op(), Op::Wmma(..))), uses_tc);
-    let Some(leftover) = leftover else { return };
-
-    let loops: Vec<_> =
-        scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == leftover).collect();
-    assert_eq!(
-        loops,
-        vec![(AxisType::Reduce, leftover)],
-        "the other reduce axis must survive as a loop around the WMMA"
+/// Conv-shaped `C[m,n] = sum_{k,t} A[m,k,t] * B[k,t,n]`: a matmul whose reduce spans two axes, channels `k` and taps `t`.
+///
+/// [`crate::test::support::build::conv_like`] is the same shape but indexes through a widening cast on every axis; the
+/// stride analyses this pass runs cannot see through one, so the heuristics need the [`Ranged`] typing instead.
+fn conv_like_weak(m: i64, n: i64, k: i64, taps: i64) -> Arc<UOp> {
+    let kernel =
+        Ranged::new(&[(m, AxisType::Global), (n, AxisType::Global), (k, AxisType::Reduce), (taps, AxisType::Reduce)]);
+    let a = kernel.index(
+        &DType::Float16,
+        m * k * taps,
+        plus(times(&kernel.range(0), k * taps), plus(times(&kernel.range(2), taps), kernel.range(3))),
     );
+    let b = kernel.index(
+        &DType::Float16,
+        k * taps * n,
+        plus(times(&kernel.range(2), taps * n), plus(times(&kernel.range(3), n), kernel.range(1))),
+    );
+    let product = a.try_mul(&b).expect("mul");
+    kernel.sink(product.reduce(vec![kernel.range(2), kernel.range(3)].into(), ReduceOp::Add), &[0, 1])
 }
 
-/// `C[m,n] = sum_k f32(A[m,k] * B[k,n])` over f16 buffers — the mixed-precision
-/// shape every tensor-core renderer offers (CDNA and Intel Xe offer only that).
-fn create_mixed_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
-    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
-    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
-    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
-    let load = |numel: i64, row: &Arc<UOp>, stride: i64, col: &Arc<UOp>| {
-        let buffer = UOp::new_buffer(DeviceSpec::Cpu, numel as usize, DType::Float16);
-        let index = row.try_mul(&UOp::index_const(stride)).and_then(|x| x.try_add(col)).expect("index should build");
-        UOp::index().buffer(buffer).indices(vec![index]).call().expect("load should build")
-    };
-    let a = load(m * k, &m_range, k, &k_range);
-    let b = load(k * n, &k_range, n, &n_range);
-    let product = a.try_mul(&b).expect("mul should succeed").cast(DType::Float32);
-    let reduce = product.reduce(smallvec::smallvec![k_range], ReduceOp::Add);
-    UOp::sink(vec![reduce, m_range, n_range])
+/// `out[r, c] = x[r, c] * s[r]`: row-major elementwise with a per-row broadcast.
+fn row_scaled(rows: i64, cols: i64, dtype: DType) -> Arc<UOp> {
+    let kernel = Ranged::new(&[(rows, AxisType::Global), (cols, AxisType::Global)]);
+    let value = kernel.index(&dtype, rows * cols, plus(times(&kernel.range(0), cols), kernel.range(1)));
+    let scale = kernel.index(&DType::Float32, rows, kernel.range(0));
+    kernel.sink_all(value.cast(DType::Float32).try_mul(&scale).expect("mul"))
+}
+
+/// A doubled row-major load: the shape every LOCAL/UPCAST decision sees.
+fn elementwise_load(shape: &[i64], axis_type: AxisType) -> Arc<UOp> {
+    let kernel = Ranged::new(&shape.iter().map(|&size| (size, axis_type)).collect::<Vec<_>>());
+    let value = kernel.index(&DType::Float32, shape.iter().product(), row_major(kernel.ranges(), shape));
+    kernel.sink_all(plus(value.clone(), value))
+}
+
+/// Elementwise SINK over `axes` GLOBAL axes of extent `size`, summing `axes` loads; the load for `absent` skips that axis, giving it stride zero.
+fn stride_zero_buffers(axes: usize, size: i64, skip: bool) -> Arc<UOp> {
+    let kernel = Ranged::new(&vec![(size, AxisType::Global); axes]);
+    let loads = (0..axes).map(|absent| {
+        let index = (0..axes)
+            .filter(|axis| !(skip && *axis == absent))
+            .map(|axis| times(&kernel.range(axis), size.pow((axes - 1 - axis) as u32)))
+            .fold(UOp::index_const(0), plus);
+        kernel.index(&DType::Float32, size.pow(axes as u32), index)
+    });
+    kernel.sink_all(loads.reduce(plus).expect("one load"))
+}
+
+/// Elementwise SINK with one WEAK axis plus an optional extra axis of `extra`.
+fn default_upcast(size: i64, extra: Option<(i64, AxisType)>) -> Arc<UOp> {
+    let kernel = Ranged::new(&std::iter::once((size, AxisType::Weak)).chain(extra).collect::<Vec<_>>());
+    let index = if extra.is_some() { plus(kernel.range(0), kernel.range(1)) } else { kernel.range(0) };
+    let value = kernel.index(&DType::Float32, size * 64, index);
+    kernel.sink_all(plus(value.clone(), value))
+}
+
+/// `out[row] = sum_c x[row * row_stride + c * reduce_stride]`.
+fn laid_out_reduce(rows: i64, cols: i64, row_stride: i64, reduce_stride: i64, dtype: DType) -> Arc<UOp> {
+    let kernel = Ranged::new(&[(rows, AxisType::Global), (cols, AxisType::Reduce)]);
+    let index = plus(times(&kernel.range(0), row_stride), times(&kernel.range(1), reduce_stride));
+    let value = kernel.index(&dtype, rows * cols, index);
+    kernel.sink(value.reduce(vec![kernel.range(1)].into(), ReduceOp::Add), &[0])
+}
+
+/// `out[c, r] = x[r, c]`: contiguous on one side of every axis, strided on the other.
+fn transposing_copy(rows: i64, cols: i64) -> Arc<UOp> {
+    let kernel = Ranged::new(&[(rows, AxisType::Global), (cols, AxisType::Global)]);
+    let at = |row: usize, col: i64| plus(times(&kernel.range(row), col), kernel.range(1 - row));
+    let value = plus(
+        kernel.index(&DType::Float16, rows * cols, at(0, cols)),
+        kernel.index(&DType::Float16, rows * cols, at(1, rows)),
+    );
+    kernel.sink_all(value)
+}
+
+/// `out[r, c] = sum_t x[(r * cols + c) * taps + t]`: a stencil whose column axis is the innermost reduce.
+fn stencil_reduce(rows: i64, cols: i64, taps: i64) -> Arc<UOp> {
+    let kernel = Ranged::new(&[(rows, AxisType::Global), (cols, AxisType::Global), (taps, AxisType::Reduce)]);
+    let index = plus(plus(times(&kernel.range(0), cols * taps), times(&kernel.range(1), taps)), kernel.range(2));
+    let value = kernel.index(&DType::Float16, rows * cols * taps, index);
+    kernel.sink(value.reduce(vec![kernel.range(2)].into(), ReduceOp::Add), &[0, 1])
+}
+
+// FIXTURES
+
+/// Run `pass` against a fresh scheduler; hand back its verdict and the state.
+fn run(
+    sink: Arc<UOp>,
+    renderer: Renderer,
+    config: &HeuristicsConfig,
+    pass: impl FnOnce(&mut Scheduler, &HeuristicsConfig) -> bool,
+) -> (bool, Scheduler) {
+    let mut scheduler = Scheduler::new(sink, renderer);
+    let applied = pass(&mut scheduler, config);
+    (applied, scheduler)
 }
 
 /// The post-TC opt sequence a matmul gets on `renderer`, as `(op, axis, arg)`.
-fn tc_plan(m: i64, n: i64, k: i64, renderer: Renderer) -> Vec<(OptOps, Option<usize>, svod_ir::OptArg)> {
-    let sink = create_mixed_matmul_pattern(m, n, k);
-    let mut scheduler = Scheduler::new(sink, renderer);
+fn tc_plan(m: i64, n: i64, k: i64, renderer: Renderer) -> Vec<(OptOps, Option<usize>, OptArg)> {
+    let mut scheduler = Scheduler::new(matmul_accum(m, n, k, DType::Float16, DType::Float32), renderer);
     assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()));
     scheduler
         .applied_opts
@@ -161,16 +133,69 @@ fn tc_plan(m: i64, n: i64, k: i64, renderer: Renderer) -> Vec<(OptOps, Option<us
         .collect()
 }
 
-/// `(op, arg)` shorthand for a post-TC UPCAST/LOCAL on axis `axis`.
-fn opt(op: OptOps, axis: usize, arg: usize) -> (OptOps, Option<usize>, svod_ir::OptArg) {
-    (op, Some(axis), svod_ir::OptArg::Int(arg))
+/// `(op, axis, arg)` shorthand for a post-TC UPCAST/LOCAL.
+fn opt(op: OptOps, axis: usize, arg: usize) -> (OptOps, Option<usize>, OptArg) {
+    (op, Some(axis), OptArg::Int(arg))
 }
 
-/// The CUDA `m16n8k16` core holds four accumulators per lane, and the lane
-/// budget is 128, so a GEMM with work to spare grows its warp tile 32-fold —
-/// split 4 (M) by 8 (N) to land on a square 64x64 tile — and stops there. Axis
-/// 0 is the leftover M range, axis 1 the leftover N range; a warp already fills
-/// a CUDA block, so no LOCAL follows.
+/// `(axis type, constant extent)` of a RANGE; `None` when it is not a RANGE.
+fn range_axis(range: &Arc<UOp>) -> Option<(AxisType, i64)> {
+    matches!(range.op(), Op::Range(..)).then(|| (range_axis_type(range), expect_range_extent(range)))
+}
+
+// TENSOR CORES
+
+/// A widening integer cast on the operands is exact under the int8→int32 WMMA,
+#[test_case(DType::Int8, DType::Int32, true; "int8 operands widened to int32 use the integer wmma")]
+#[test_case(DType::Float16, DType::Float32, false; "float16 operands widened to float32 stay scalar")]
+fn try_tensor_cores_sees_through_widening_integer_casts(stored: DType, wide: DType, uses_tc: bool) {
+    let sink = matmul_with(16, 16, 16, stored.clone(), move |value| value.cast(wide.clone()));
+    let (applied, scheduler) = run(sink, Renderer::amd_rdna3(), &HeuristicsConfig::default(), try_tensor_cores);
+    assert_eq!(applied, uses_tc);
+    let wmma_in = first_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))).map(|u| {
+        let Op::Wmma(ops::Wmma { metadata, .. }) = u.op() else { unreachable!() };
+        metadata.dtype_in.clone()
+    });
+    assert_eq!(wmma_in, uses_tc.then_some(stored));
+}
+
+/// A fused elementwise producer on a MUL operand (`relu(A) @ B`) leaves the TC pattern intact.
+#[test]
+fn try_tensor_cores_accepts_fused_operands() {
+    let relu = |value: Arc<UOp>| UOp::alu(BinaryOp::Max, value.clone(), value.const_like(0.0f64));
+    let (applied, scheduler) = run(
+        matmul_with(16, 16, 16, DType::Float16, relu),
+        Renderer::amd_rdna3(),
+        &HeuristicsConfig::default(),
+        try_tensor_cores,
+    );
+    assert!(applied);
+    assert!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
+}
+
+/// A conv-shaped reduce over (channels, taps) takes the tensor core by default:
+#[test_case(64, 5, TcOpt::Relaxed, Some(5); "wide channels with five taps")]
+#[test_case(16, 25, TcOpt::Relaxed, Some(25); "narrow channels with many taps")]
+#[test_case(64, 16, TcOpt::Relaxed, Some(64); "both reduce axes divisible")]
+#[test_case(12, 5, TcOpt::Relaxed, None; "no reduce axis divisible")]
+#[test_case(64, 5, TcOpt::Strict, None; "strict declines the second reduce axis")]
+fn try_tensor_cores_on_conv_shaped_double_reduce(channels: i64, taps: i64, tc_opt: TcOpt, leftover: Option<i64>) {
+    let (applied, scheduler) = run(
+        conv_like_weak(32, 32, channels, taps),
+        Renderer::cuda(),
+        &HeuristicsConfig::builder().tc_opt(tc_opt).build(),
+        try_tensor_cores,
+    );
+    let uses_tc = leftover.is_some();
+    assert_eq!(applied, uses_tc);
+    assert_eq!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))), uses_tc);
+    let Some(leftover) = leftover else { return };
+    let loops: Vec<_> =
+        scheduler.rngs().iter().filter_map(range_axis).filter(|(_, extent)| *extent == leftover).collect();
+    assert_eq!(loops, vec![(AxisType::Reduce, leftover)], "the other reduce axis must survive as a loop");
+}
+
+/// The CUDA `m16n8k16` core holds four accumulators per lane and the lane count picks the tile.
 #[test_case(8192, 3072, 768, &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 8)]; "gigaam 768 to 3072 projection")]
 #[test_case(8192, 768, 3072, &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 8)]; "gigaam 3072 to 768 projection")]
 #[test_case(8192, 48, 768, &[(OptOps::UPCAST, 0, 2), (OptOps::UPCAST, 1, 3)]; "narrow output spends the budget on M")]
@@ -183,61 +208,24 @@ fn cuda_tensor_core_warp_tile(m: i64, n: i64, k: i64, expected: &[(OptOps, usize
 }
 
 /// Every target off CUDA keeps [`TcTilePolicy::FixedStep`], tinygrad's step:
-/// UPCAST M then N by the first of `[5, 4, 3, 2]` that divides, then LOCAL N by
-/// the first of `[4, 2]`. This pins the AMD and Metal codegen, which cannot be
-/// measured here, byte for byte against the sequence that shipped.
-#[test_case(Renderer::amd_rdna3(); "rdna3 wmma")]
-#[test_case(Renderer::amd_rdna4(); "rdna4 wmma")]
-#[test_case(Renderer::amd_cdna3(); "cdna3 mfma")]
-#[test_case(Renderer::amd_cdna4(); "cdna4 mfma")]
-#[test_case(Renderer::metal(); "metal simdgroup")]
-#[test_case(Renderer::intel_xe(); "intel xe dpas")]
-fn non_cuda_tensor_core_tiling_is_the_fixed_step(renderer: Renderer) {
-    assert_eq!(renderer.tc_tile_policy(), TcTilePolicy::FixedStep);
-    let expected = [opt(OptOps::UPCAST, 0, 4), opt(OptOps::UPCAST, 1, 4), opt(OptOps::LOCAL, 1, 4)];
-    assert_eq!(tc_plan(8192, 3072, 768, renderer), expected);
-}
+type FixedStepPlan = &'static [(OptOps, usize, usize)];
+const FIXED_STEP: &[((usize, usize), FixedStepPlan)] = &[
+    ((16, 3), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 3)]),
+    ((16, 20), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 5), (OptOps::LOCAL, 1, 4)]),
+    ((16, 48), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4), (OptOps::LOCAL, 1, 4)]),
+    ((16, 96), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4), (OptOps::LOCAL, 1, 4)]),
+    ((16, 192), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4), (OptOps::LOCAL, 1, 4)]),
+    ((8, 6), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 3), (OptOps::LOCAL, 1, 2)]),
+    ((8, 40), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 5), (OptOps::LOCAL, 1, 4)]),
+    ((8, 96), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4), (OptOps::LOCAL, 1, 4)]),
+    ((8, 192), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4), (OptOps::LOCAL, 1, 4)]),
+    ((8, 384), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 4), (OptOps::LOCAL, 1, 4)]),
+];
 
-/// The post-TC sequence as it stood before [`TcTilePolicy`] existed,
-/// transcribed from that code: UPCAST M then N by the first of `[5, 4, 3, 2]`
-/// that divides the leftover tile count, then LOCAL N by the first of
-/// `[4, 2]`. Axis numbering follows `rngs()`, which drops an axis the moment it
-/// collapses to one tile — so N slides to index 0 once M is fully consumed.
-fn fixed_step_reference(
-    m: i64,
-    n: i64,
-    dims: (usize, usize),
-    has_local: bool,
-) -> Vec<(OptOps, Option<usize>, svod_ir::OptArg)> {
-    let first = |extent: usize, ladder: &[usize]| ladder.iter().copied().find(|f| extent.is_multiple_of(*f));
-    let (mut m_tiles, mut n_tiles) = (m as usize / dims.1, n as usize / dims.0);
-    let mut plan = Vec::new();
-    if m_tiles > 1
-        && let Some(factor) = first(m_tiles, &[5, 4, 3, 2])
-    {
-        plan.push(opt(OptOps::UPCAST, 0, factor));
-        m_tiles /= factor;
-    }
-    let n_axis = usize::from(m_tiles > 1);
-    if n_tiles > 1
-        && let Some(factor) = first(n_tiles, &[5, 4, 3, 2])
-    {
-        plan.push(opt(OptOps::UPCAST, n_axis, factor));
-        n_tiles /= factor;
-    }
-    if has_local
-        && n_tiles > 1
-        && let Some(factor) = first(n_tiles, &[4, 2])
-    {
-        plan.push(opt(OptOps::LOCAL, n_axis, factor));
-    }
-    plan
-}
+const FIXED_STEP_GRID_M: [i64; 3] = [256, 1024, 8192];
+const FIXED_STEP_GRID_N: [i64; 5] = [48, 320, 768, 1536, 3072];
+const FIXED_STEP_GRID_K: [i64; 3] = [320, 768, 3072];
 
-/// Every non-CUDA renderer reproduces [`fixed_step_reference`] exactly, on
-/// every shape — including the ones where the ladder's odd 5 and 3 win and the
-/// ones where an axis collapses and renumbers the next. This is the guard that
-/// the lane-budget rule left AMD, Metal and Intel codegen untouched.
 #[test_case(Renderer::amd_rdna3(), (16, 16); "rdna3 wmma")]
 #[test_case(Renderer::amd_rdna4(), (16, 16); "rdna4 wmma")]
 #[test_case(Renderer::amd_cdna3(), (16, 16); "cdna3 mfma")]
@@ -246,27 +234,21 @@ fn fixed_step_reference(
 #[test_case(Renderer::intel_xe(), (8, 8); "intel xe dpas")]
 fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usize, usize)) {
     assert_eq!(renderer.tc_tile_policy(), TcTilePolicy::FixedStep);
-    for m in [256i64, 1024, 8192] {
-        for n in [48i64, 320, 768, 1536, 3072] {
-            for k in [320i64, 768, 3072] {
-                assert_eq!(
-                    tc_plan(m, n, k, renderer.clone()),
-                    fixed_step_reference(m, n, dims, renderer.has_local),
-                    "{m}x{n}x{k}"
-                );
+    for m in FIXED_STEP_GRID_M {
+        for n in FIXED_STEP_GRID_N {
+            let &(_, plan) = FIXED_STEP
+                .iter()
+                .find(|((width, tiles), _)| (*width, *tiles) == (dims.0, n as usize / dims.0))
+                .unwrap_or_else(|| panic!("no captured plan for {dims:?} and {n}"));
+            let expected: Vec<_> = plan.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
+            for k in FIXED_STEP_GRID_K {
+                assert_eq!(tc_plan(m, n, k, renderer.clone()), expected, "{m}x{n}x{k}");
             }
         }
     }
 }
 
-/// A wider warp tile must never record an UPCAST the renderer would refuse to
-/// replay: beam's cache and `opts_to_apply` both re-apply the recorded list
-/// through `apply_opt`, which rejects an amount over `upcast_max`.
-///
-/// Only [`TcTilePolicy::LaneBudget`] is held to this. The fixed step opens its
-/// ladder at 5 without consulting `upcast_max`, so a 320-wide N already records
-/// an unreplayable `UPCAST 5` on Metal (`upcast_max` 4); that predates this
-/// policy and fixing it would change Metal codegen this machine cannot measure.
+/// A wider warp tile must never record an UPCAST the renderer would refuse to replay.
 #[test_case(8192, 3072, 768; "gigaam projection")]
 #[test_case(8192, 768, 3072; "wide reduce")]
 #[test_case(1024, 320, 768; "an N the odd factors reach for")]
@@ -276,98 +258,165 @@ fn lane_budget_warp_tile_stays_replayable(m: i64, n: i64, k: i64) {
     assert!(matches!(renderer.tc_tile_policy(), TcTilePolicy::LaneBudget { .. }));
     let upcast_max = renderer.upcast_max;
     for (op, _, arg) in tc_plan(m, n, k, renderer) {
-        let svod_ir::OptArg::Int(amount) = arg else { panic!("post-TC opts carry Int args") };
+        let OptArg::Int(amount) = arg else { panic!("post-TC opts carry Int args") };
         assert!(op != OptOps::UPCAST || amount <= upcast_max, "{m}x{n}x{k}: UPCAST {amount} > {upcast_max}");
     }
 }
 
-/// The default level changes nothing for a single-reduce matmul: the same
-/// opts land on the same axes (the recorded TC arg carries the level itself).
+// Every plan the heuristic records must be replayable through `apply_opt`, so
+// its amounts have to stay inside the renderer's caps — for every divisible
+// shape, not only the sampled grid.
+proptest! {
+    #![proptest_config(cheap())]
+    #[test]
+    fn tensor_core_plans_stay_replayable(m in 1u32..=32, n in 1u32..=32, k in 1u32..=8) {
+        let (m, n, k) = (m as i64 * 16, n as i64 * 16, k as i64 * 16);
+        let renderer = Renderer::cuda();
+        let run_once = |renderer: Renderer| {
+            let mut scheduler = Scheduler::new(matmul_accum(m, n, k, DType::Float16, DType::Float32), renderer);
+            try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()).then_some(scheduler.applied_opts)
+        };
+        let Some(opts) = run_once(renderer.clone()) else {
+            prop_assert!(false, "a fully divisible f16 matmul must take the tensor core");
+            unreachable!()
+        };
+        prop_assert_eq!(run_once(renderer.clone()), Some(opts.clone()), "the plan is a function of the shape");
+        for opt in opts {
+            let OptArg::Int(amount) = opt.arg else { continue };
+            prop_assert!(amount > 0, "a split amount is never zero: {opt:?}");
+            match opt.op {
+                OptOps::UPCAST => prop_assert!(amount <= renderer.upcast_max, "UPCAST {amount} over the cap"),
+                OptOps::LOCAL => prop_assert!(amount <= renderer.local_max.unwrap_or(usize::MAX)),
+                _ => {}
+            }
+        }
+    }
+    /// The LOCAL work-group budget holds for any extent, including the padded fallbacks the example table only samples.
+    #[test]
+    fn local_dims_stay_within_their_budget(size in 2usize..300_000) {
+        let mut scheduler = Scheduler::new(elementwise_load(&[size as i64], AxisType::Global), Renderer::cuda());
+        if apply_local_dims(&mut scheduler, &HeuristicsConfig::default()) {
+            let local: i64 = scheduler
+                .rngs()
+                .iter()
+                .filter(|range| range_axis_type(range) == AxisType::Local)
+                .map(|range| expect_range_extent(range))
+                .product();
+            prop_assert!(local <= 128, "LOCAL product {local} over the 128-element budget");
+            prop_assert!(local >= 2, "a LOCAL split smaller than two is not a work-group");
+        }
+    }
+}
+
+/// The default level changes nothing for a single-reduce matmul: the same opts as `Strict`.
 #[test]
 fn try_tensor_cores_default_matches_strict_on_plain_matmul() {
     let plan = |tc_opt: TcOpt| {
-        let sink = create_typed_matmul_pattern(64, 64, 64, DType::Float16, None);
-        let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+        let mut scheduler = Scheduler::new(matmul_with(64, 64, 64, DType::Float16, |v| v), Renderer::cuda());
         assert!(try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().tc_opt(tc_opt).build()));
-        let opts: Vec<_> = scheduler.applied_opts.iter().map(|opt| (opt.op, opt.axis)).collect();
-        let axes: Vec<_> = scheduler.rngs().iter().map(range_axis).collect();
-        (opts, axes)
+        (
+            scheduler.applied_opts.iter().map(|opt| (opt.op, opt.axis)).collect::<Vec<_>>(),
+            scheduler.rngs().iter().map(range_axis).collect::<Vec<_>>(),
+        )
     };
     assert_eq!(HeuristicsConfig::default().tc_opt, TcOpt::Relaxed);
     assert_eq!(plan(TcOpt::default()), plan(TcOpt::Strict));
 }
 
-/// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, unless
-/// `matvec_enabled` turns it off.
-#[test_case(true; "enabled")]
-#[test_case(false; "disabled by config")]
-fn test_apply_matvec_fast_path(enabled: bool) {
-    let sink = create_matvec_like_pattern(64, 128, DType::Float32, None);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
-    let config = HeuristicsConfig::builder().matvec_enabled(enabled).build();
-
-    assert_eq!(apply_matvec_fast_path(&mut scheduler, &config), enabled);
-    for axis in [AxisType::GroupReduce, AxisType::Local, AxisType::Upcast] {
-        assert_eq!(!scheduler.axes_of(&[axis]).is_empty(), enabled, "{axis:?}");
-    }
-}
-
-/// Widened int8 operands, the shape every integer contraction takes after the
-/// early `Cast(Mul)` rewrite, still qualify for the matvec fast path.
+/// Two N axes, a bad one first: `Metal`'s retry must commit the axis choice that divides.
 #[test]
-fn matvec_fast_path_accepts_widened_integer_operands() {
-    let sink = create_matvec_like_pattern(64, 128, DType::Int8, Some(DType::Int32));
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
-
-    assert!(apply_matvec_fast_path(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert!(!scheduler.axes_of(&[AxisType::GroupReduce]).is_empty());
-}
-
-#[test_case(DType::Image { kind: svod_dtype::ImageKind::Float, shape: vec![2, 8, 4] }, true; "image buffer")]
-#[test_case(DType::Float32, false; "plain rank three tensor")]
-fn test_apply_image_upcasts_non_stub_behavior(dtype: DType, expected: bool) {
-    let g = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Global);
-    let shape = svod_ir::shape::shape_to_uop(&smallvec::smallvec![2usize.into(), 8usize.into(), 4usize.into()]);
-    let arg = ParamArg::buffer(0, dtype.clone(), AddrSpace::Global, Some(DeviceSpec::Cpu));
-    let img = UOp::new(Op::Buffer(ops::Buffer { shape, arg: arg.into() }), dtype);
-    let indexed = UOp::index().buffer(img).indices(vec![g.clone()]).call().expect("image index should build");
-    let sink = UOp::sink(vec![indexed, g]);
-
-    let mut scheduler = Scheduler::new(sink, Renderer::cpu());
-    assert_eq!(apply_image_upcasts(&mut scheduler), expected);
-    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), usize::from(expected));
-}
-
-#[test]
-fn test_try_tensor_cores_retries_axis_choices() {
-    let sink = create_tc_retry_pattern();
-    let mut scheduler = Scheduler::new(sink, Renderer::metal());
-
-    let config = HeuristicsConfig::builder().tc_opt(TcOpt::Relaxed).build();
-    let applied = try_tensor_cores(&mut scheduler, &config);
+fn try_tensor_cores_retries_axis_choices() {
+    let (applied, scheduler) = run(
+        two_n_matmul(15, 16),
+        Renderer::metal(),
+        &HeuristicsConfig::builder().tc_opt(TcOpt::Relaxed).build(),
+        try_tensor_cores,
+    );
     assert!(applied, "try_tensor_cores should recover with a later axis choice");
-
-    let tc_opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::TC).expect("TC opt should be recorded");
+    let tc_opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::TC).expect("TC opt recorded");
     assert_eq!(tc_opt.axis, Some(1), "retry should commit the passing axis choice");
 }
 
-/// Elementwise SINK with one WEAK axis plus an optional extra axis of `extra`
-/// type, so `apply_default_upcast`'s gate and axis pick can be exercised.
-fn create_default_upcast_pattern(size: i64, extra: Option<(i64, AxisType)>) -> Arc<UOp> {
-    let weak = UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(0), AxisType::Weak);
-    let buf = UOp::new_buffer(DeviceSpec::Cpu, size as usize * 64, DType::Float32);
-    let (idx, mut sink_srcs) = match extra {
-        Some((extra_size, axis_type)) => {
-            let other = UOp::range_axis(UOp::index_const(extra_size), AxisId::Renumbered(1), axis_type);
-            (weak.try_add(&other).expect("index add"), vec![weak.clone(), other])
-        }
-        None => (weak.clone(), vec![weak.clone()]),
-    };
-    let val = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build");
-    let doubled = val.try_add(&val).expect("add should succeed");
-    sink_srcs.insert(0, doubled);
-    UOp::sink(sink_srcs)
+// MATVEC AND IMAGE
+
+/// The matvec fast path applies GROUP + LOCAL + UPCAST in one shot, and only when the config enables it; widened int8 operands, the shape every integer contraction takes, are accepted with the same splits.
+#[test_case(64, 128, DType::Float32, None, true, true; "enabled")]
+#[test_case(64, 128, DType::Float32, None, false, false; "disabled by config")]
+#[test_case(64, 128, DType::Int8, Some(DType::Int32), true, true; "widened integer operands")]
+fn test_apply_matvec_fast_path(rows: i64, cols: i64, stored: DType, wide: Option<DType>, enabled: bool, applied: bool) {
+    let config = HeuristicsConfig::builder().matvec_enabled(enabled).build();
+    let sink = row_reduce(AxisType::Global, rows, cols, stored, wide);
+    let (returned, scheduler) = run(sink, Renderer::cuda(), &config, apply_matvec_fast_path);
+    assert_eq!(returned, applied);
+    for axis in [AxisType::GroupReduce, AxisType::Local, AxisType::Upcast] {
+        assert_eq!(!scheduler.axes_of(&[axis]).is_empty(), applied, "{axis:?}");
+    }
 }
+
+/// The matvec fast path pads a row axis the row tile does not divide when the padding stays cheap.
+#[test_case(64, Some(&[Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)][..]); "divisible rows are unchanged")]
+#[test_case(51865, Some(&[Opt::padto(0, 16), Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)][..]); "vocabulary rows pad to the tile")]
+#[test_case(17, None; "padding almost doubling the rows is declined")]
+fn matvec_fast_path_pads_the_row_axis(rows: i64, expected: Option<&[Opt]>) {
+    let (applied, scheduler) = run(
+        row_reduce(AxisType::Global, rows, 128, DType::Float32, None),
+        Renderer::cuda(),
+        &HeuristicsConfig::default(),
+        apply_matvec_fast_path,
+    );
+    assert_eq!(applied, expected.is_some());
+    assert_eq!(scheduler.applied_opts, expected.unwrap_or_default());
+}
+
+/// The float image dtype of a rank-3 `shape`.
+fn image_dtype(shape: &[usize]) -> DType {
+    DType::Image { kind: ImageKind::Float, shape: shape.to_vec() }
+}
+
+/// A rank-3 `dtype` buffer of `shape` loaded through `index`.
+fn buffer_pattern(
+    dtype: DType,
+    shape: &[usize],
+    ranges: &[(i64, AxisType)],
+    index: impl Fn(&Ranged) -> Arc<UOp>,
+) -> Arc<UOp> {
+    let kernel = Ranged::new(ranges);
+    let buffer = UOp::new(
+        Op::Buffer(ops::Buffer {
+            shape: svod_ir::shape::shape_to_uop(&shape.iter().map(|&dim| dim.into()).collect()),
+            arg: ParamArg::buffer(0, dtype.clone(), AddrSpace::Global, Some(DeviceSpec::Cpu)).into(),
+        }),
+        dtype,
+    );
+    kernel.sink_all(load(index_of(buffer, index(&kernel))))
+}
+
+/// Both gates have to hold: the buffer's dtype must say image, and the shape it
+/// carries must be the `[.., 4]` rank-3 geometry an image promises.
+#[test_case(image_dtype(&[2, 8, 4]), &[2, 8, 4], &[Opt::upcast(0, 4)]; "trailing channel four upcasts the global axis")]
+#[test_case(image_dtype(&[2, 8, 8]), &[2, 8, 8], &[]; "a trailing dim other than four is not an image")]
+#[test_case(DType::Float32, &[2, 8, 4], &[]; "a plain rank-3 tensor of the image shape is not an image")]
+fn apply_image_upcasts_only_fires_on_an_image_buffer(dtype: DType, shape: &[usize], expected: &[Opt]) {
+    let sink = buffer_pattern(dtype, shape, &[(8, AxisType::Global)], |kernel| kernel.range(0));
+    let (applied, scheduler) = run(sink, Renderer::cpu(), &HeuristicsConfig::default(), |s, _| apply_image_upcasts(s));
+    assert_eq!(applied, !expected.is_empty());
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+#[test]
+fn apply_image_upcasts_unrolls_a_divisible_reduce_axis() {
+    let sink = buffer_pattern(
+        image_dtype(&[2, 8, 4]),
+        &[2, 8, 4],
+        &[(2, AxisType::Global), (8, AxisType::Reduce)],
+        |kernel| plus(times(&kernel.range(0), 8), kernel.range(1)),
+    );
+    let (applied, scheduler) = run(sink, Renderer::cuda(), &HeuristicsConfig::default(), |s, _| apply_image_upcasts(s));
+    assert!(applied, "a reduce axis is not upcastable, so the image path must unroll it");
+    assert_eq!(scheduler.applied_opts, vec![Opt::unroll(0, 4)]);
+}
+
+// DEFAULT / MASKED / UNROLLED UPCASTS
 
 #[test_case(16, None, true; "divisible weak axis upcasts")]
 #[test_case(6, None, false; "size not divisible by four")]
@@ -377,301 +426,219 @@ fn create_default_upcast_pattern(size: i64, extra: Option<(i64, AxisType)>) -> A
 #[test_case(16, Some((8, AxisType::Reduce)), true; "reduce axis does not block the fallback")]
 fn default_upcast_follows_tinygrad_gate(size: i64, extra: Option<(i64, AxisType)>, expected: bool) {
     let pre_existing = usize::from(matches!(extra, Some((_, AxisType::Upcast))));
-    let mut scheduler = Scheduler::new(create_default_upcast_pattern(size, extra), Renderer::cpu());
-
-    assert_eq!(apply_default_upcast(&mut scheduler), expected);
-    assert_eq!(
-        scheduler.axes_of(&[AxisType::Upcast]).len(),
-        pre_existing + usize::from(expected),
-        "UPCAST axis count after the fallback"
-    );
+    let (applied, scheduler) =
+        run(default_upcast(size, extra), Renderer::cpu(), &HeuristicsConfig::default(), |s, _| apply_default_upcast(s));
+    assert_eq!(applied, expected);
+    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), pre_existing + usize::from(expected));
 }
 
 #[test]
 fn default_upcast_picks_the_innermost_upcastable_axis() {
-    // Tinygrad takes `k.upcastable_dims[-1]`; both axes qualify here, and only
-    // the trailing one must be split.
-    let sink = create_default_upcast_pattern(16, Some((8, AxisType::Global)));
-    let mut scheduler = Scheduler::new(sink, Renderer::cpu());
+    let mut scheduler = Scheduler::new(default_upcast(16, Some((8, AxisType::Global))), Renderer::cpu());
     let innermost = *scheduler.upcastable_dims().last().expect("two upcastable dims");
-
     assert!(apply_default_upcast(&mut scheduler));
-    let opt = scheduler.applied_opts.iter().find(|opt| opt.op == OptOps::UPCAST).expect("UPCAST recorded");
-    assert_eq!(opt.axis, Some(innermost));
+    assert_eq!(scheduler.applied_opts, vec![Opt::upcast(innermost, 4)]);
 }
 
-/// Elementwise SINK over `axes` GLOBAL axes of extent `size`, summing `axes`
-/// row-major buffers; with `stride0`, buffer `i` skips axis `i`.
-fn create_stride0_pattern(axes: usize, size: i64, stride0: bool) -> Arc<UOp> {
-    let ranges: Vec<Arc<UOp>> =
-        (0..axes).map(|i| UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(i), AxisType::Global)).collect();
-    let loads: Vec<Arc<UOp>> = (0..axes)
-        .map(|skip| {
-            let idx = ranges
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !(stride0 && *i == skip))
-                .map(|(i, rng)| rng.try_mul(&UOp::index_const(size.pow((axes - 1 - i) as u32))).expect("index mul"))
-                .reduce(|acc, term| acc.try_add(&term).expect("index add"))
-                .expect("at least one axis");
-            let buf = UOp::new_buffer(DeviceSpec::Cpu, size.pow(axes as u32) as usize, DType::Float32);
-            UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build")
-        })
-        .collect();
-    let sum = loads.into_iter().reduce(|acc, load| acc.try_add(&load).expect("add")).expect("one load");
-    UOp::sink(std::iter::once(sum).chain(ranges).collect())
+/// Masked axes collect first and are applied back to front, so an earlier axis is applied last.
+#[test_case(&[4], &[Opt::upcast(0, 4)]; "one masked axis takes its full extent")]
+#[test_case(&[4, 3], &[Opt::upcast(1, 3), Opt::upcast(0, 4)]; "two masked axes apply in reverse")]
+#[test_case(&[7, 7, 7], &[Opt::upcast(1, 7), Opt::upcast(0, 7)]; "the product cap drops the third axis")]
+#[test_case(&[8], &[]; "an extent over seven is not a masked candidate")]
+fn apply_masked_upcasts_collects_then_applies_in_reverse(shape: &[i64], expected: &[Opt]) {
+    let sink = masked_elementwise(shape);
+    let (applied, scheduler) = run(sink, Renderer::cpu(), &HeuristicsConfig::default(), |s, _| apply_masked_upcasts(s));
+    assert_eq!(applied, !expected.is_empty());
+    assert_eq!(scheduler.applied_opts, expected);
 }
 
-/// The stride ranking picks, per round, the stride-0 axis with the fewest and
-/// smallest strides and the smaller of the amounts 3 and 4 that divide it,
-/// until the output shape drops below 1024 elements.
+/// A masked row-major SINK: every axis bounds the `WHERE` condition.
+fn masked_elementwise(shape: &[i64]) -> Arc<UOp> {
+    let kernel = Ranged::new(&shape.iter().map(|&size| (size, AxisType::Global)).collect::<Vec<_>>());
+    let value = kernel.index(&DType::Float32, shape.iter().product(), row_major(kernel.ranges(), shape));
+    let bound = UOp::index_const(*shape.iter().max().expect("at least one axis"));
+    let condition = kernel.ranges().iter().cloned().fold(UOp::index_const(0), plus).try_cmplt(&bound).expect("cmp");
+    kernel.sink_all(UOp::try_where(condition, value, UOp::native_const(0.0f32)).expect("where"))
+}
+
+/// `apply_unroll` fully unrolls a short reduce, halves the ladder for a long one.
+#[test_case(8, &[Opt::unroll(0, 0)]; "a short reduce unrolls fully")]
+#[test_case(32, &[Opt::unroll(0, 0)]; "thirty-two is still short")]
+#[test_case(64, &[Opt::unroll(0, 4)]; "a long reduce unrolls by four")]
+#[test_case(65, &[]; "an extent four does not divide is left alone")]
+fn apply_unroll_follows_the_size_ladder(reduce: i64, expected: &[Opt]) {
+    let sink = laid_out_reduce(4, reduce, reduce, 1, DType::Float32);
+    let (applied, scheduler) = run(sink, Renderer::cuda(), &HeuristicsConfig::default(), |s, _| apply_unroll(s));
+    assert_eq!(applied, !expected.is_empty());
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// Two reduce axes of three: the full unroll of the innermost leaves the outer one tiny too.
+#[test]
+fn apply_unroll_unrolls_a_second_tiny_reduce_axis() {
+    let kernel = Ranged::new(&[(4, AxisType::Global), (3, AxisType::Reduce), (3, AxisType::Reduce)]);
+    let value = kernel.index(&DType::Float32, 36, plus(plus(kernel.range(0), kernel.range(1)), kernel.range(2)));
+    let sink = kernel.sink(value.reduce(vec![kernel.range(1), kernel.range(2)].into(), ReduceOp::Add), &[0]);
+    let (applied, scheduler) = run(sink, Renderer::cuda(), &HeuristicsConfig::default(), |s, _| apply_unroll(s));
+    assert!(applied);
+    assert_eq!(scheduler.applied_opts, vec![Opt::unroll(1, 0), Opt::unroll(0, 0)]);
+}
+
+#[test]
+fn apply_unroll_declines_once_the_upcast_size_is_spent() {
+    // An UPCAST of 8 already sits in the kernel: `upcast_size > 4 && has_unroll`
+    // is the second guard, and the kernel is left untouched.
+    let sink = laid_out_reduce(32, 32, 32, 1, DType::Float32);
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+    apply_opt(&mut scheduler, &Opt::upcast(0, 8), true).expect("UPCAST 8");
+    apply_opt(&mut scheduler, &Opt::unroll(0, 8), true).expect("UNROLL 8");
+    let spent = scheduler.applied_opts.clone();
+    assert!(!apply_unroll(&mut scheduler));
+    assert_eq!(scheduler.applied_opts, spent);
+}
+
+// STRIDE / LAYOUT RANKING
+
+/// The stride ranking picks, per round, the stride-0 axis with the fewest and shortest strides.
 #[test_case(3, 12, true, &[(2, 3)]; "innermost axis by stride sum, amount three first")]
 #[test_case(4, 8, true, &[(3, 4), (2, 4)]; "second round after the shape stays large")]
 #[test_case(3, 12, false, &[]; "no stride-0 buffer means no candidate")]
 fn heuristic_upcasts_rank_by_strides(axes: usize, size: i64, stride0: bool, expected: &[(usize, usize)]) {
-    let mut scheduler = Scheduler::new(create_stride0_pattern(axes, size, stride0), Renderer::cpu());
-
-    assert_eq!(apply_heuristic_upcasts(&mut scheduler), !expected.is_empty());
-    let expected: Vec<Opt> = expected.iter().map(|&(axis, amount)| Opt::upcast(axis, amount)).collect();
-    assert_eq!(scheduler.applied_opts, expected);
+    let (applied, scheduler) =
+        run(stride_zero_buffers(axes, size, stride0), Renderer::cpu(), &HeuristicsConfig::default(), |s, _| {
+            apply_heuristic_upcasts(s)
+        });
+    assert_eq!(applied, !expected.is_empty());
+    assert_eq!(
+        scheduler.applied_opts,
+        expected.iter().map(|&(axis, amount)| Opt::upcast(axis, amount)).collect::<Vec<_>>()
+    );
 }
 
-/// Elementwise SINK over `shape` axes of `axis_type`, loading one row-major
-/// buffer, so every axis is a LOCAL/THREAD candidate without a broadcast.
-fn create_elementwise_pattern(shape: &[i64], axis_type: AxisType) -> Arc<UOp> {
-    let ranges: Vec<Arc<UOp>> = shape
-        .iter()
-        .enumerate()
-        .map(|(i, &size)| UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(i), axis_type))
-        .collect();
-    let mut stride = 1i64;
-    let mut idx = UOp::index_const(0);
-    for (rng, &size) in ranges.iter().zip(shape).rev() {
-        idx = idx.try_add(&rng.try_mul(&UOp::index_const(stride)).expect("index mul")).expect("index add");
-        stride *= size;
-    }
-    let buf = UOp::new_buffer(DeviceSpec::Cpu, stride as usize, DType::Float32);
-    let val = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should build");
-    let doubled = val.try_add(&val).expect("add should succeed");
-    UOp::sink(std::iter::once(doubled).chain(ranges).collect())
+/// `count_strides` reports, per axis, how many buffers address it and the sum of their strides.
+#[test_case(0, (2, 769); "the row axis is strided by the wide buffer and unit by the scale")]
+#[test_case(1, (1, 1); "the column axis is unit-stride in its own buffer only")]
+fn count_strides_reads_the_linearized_index(axis: usize, expected: (usize, usize)) {
+    let scheduler = Scheduler::new(row_scaled(8192, 768, DType::Float32), Renderer::cuda());
+    assert_eq!(count_strides(&scheduler, axis), expected);
 }
 
-/// `out[row] = sum_c x[row * row_stride + c * reduce_stride]`, so the layout a
-/// reduce axis is walked with is a parameter rather than a shape.
-fn create_laid_out_reduce(rows: i64, cols: i64, row_stride: i64, reduce_stride: i64, dtype: DType) -> Arc<UOp> {
-    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
-    let reduce = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Reduce);
-    let term = |rng: &Arc<UOp>, stride: i64| rng.try_mul(&UOp::index_const(stride)).expect("index mul");
-    let idx = term(&row, row_stride).try_add(&term(&reduce, reduce_stride)).expect("index add");
-
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, dtype);
-    let value = UOp::index().buffer(buffer).indices(vec![idx]).call().expect("index should build");
-    let sum = value.reduce(vec![reduce].into(), ReduceOp::Add);
-    UOp::sink(vec![sum, row])
+/// `has_matmul_pattern` demands a `REDUCE(ADD)` of a `MUL` whose operands are indexed loads.
+#[test]
+fn has_matmul_pattern_requires_indexed_mul_operands() {
+    let matmul = Scheduler::new(matmul_with(16, 16, 16, DType::Float32, |v| v), Renderer::cuda());
+    assert!(has_matmul_pattern(&matmul));
+    let constants = Scheduler::new(reduce_sink(&[16], &[16], ReduceOp::Add), Renderer::cuda());
+    assert!(!has_matmul_pattern(&constants));
 }
 
-/// A row reduce with many rows gets a wave split off its reduce axis, so one
-/// wave walks one row together, plus the unroll that widens each lane's burst.
-/// The gate is the layout, not the shape: an axis a buffer strides over, or
-/// one too short to leave a serial loop, stays a per-thread loop, and few
-/// enough rows still take the shared-block path (GROUPTOP 16).
-#[test_case(8192, 768, 768, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "many rows split a warp off the contiguous reduce")]
-#[test_case(8192, 3072, 3072, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a longer row keeps the same split")]
-#[test_case(131072, 1024, 1024, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a softmax row reduce splits too")]
-#[test_case(8192, 32, 32, 1, &[]; "a reduce shorter than one wave stays serial")]
-#[test_case(8192, 768, 1, 8192, &[]; "a strided reduce axis is left alone")]
-#[test_case(1024, 768, 768, 1, &[Opt::grouptop(0, 16)]; "few rows keep the shared-block path")]
+/// `is_masked` fires only for an axis the `WHERE` condition reads.
+#[test_case(0; "the masked axis")]
+#[test_case(1; "the unmasked axis")]
+fn is_masked_follows_the_where_condition(axis: usize) {
+    let kernel = Ranged::new(&[(4, AxisType::Global), (4, AxisType::Global)]);
+    let value = kernel.index(&DType::Float32, 16, plus(times(&kernel.range(0), 4), kernel.range(1)));
+    let condition = kernel.range(axis).try_cmplt(&UOp::index_const(2)).expect("cmp");
+    let sink = kernel.sink_all(UOp::try_where(condition, value, UOp::native_const(0.0f32)).expect("where"));
+    let scheduler = Scheduler::new(sink, Renderer::cuda());
+    // Only the axis the condition reads is masked.
+    assert_eq!(is_masked(&scheduler, 0), axis == 0);
+    assert_eq!(is_masked(&scheduler, 1), axis == 1);
+}
+
+/// Row reduces: many rows get a wave split off the contiguous reduce axis plus an unroll.
+#[test_case(Renderer::cuda(), 8192, 768, 768, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "many rows split a warp off the contiguous reduce")]
+#[test_case(Renderer::cuda(), 8192, 3072, 3072, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a longer row keeps the same split")]
+#[test_case(Renderer::cuda(), 131072, 1024, 1024, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a softmax row reduce splits too")]
+#[test_case(Renderer::cuda(), 8192, 32, 32, 1, &[]; "a reduce shorter than one wave stays serial")]
+#[test_case(Renderer::cuda(), 8192, 768, 1, 8192, &[]; "a strided reduce axis is left alone")]
+#[test_case(Renderer::cuda(), 1024, 768, 768, 1, &[Opt::grouptop(0, 16)]; "few rows keep the shared-block path")]
+#[test_case(Renderer::amd_cdna3(), 8192, 768, 768, 1, &[Opt::group(0, 64), Opt::unroll(1, 4)]; "a CDNA wave is sixty-four lanes wide")]
 fn row_reduces_split_a_wave_off_a_contiguous_reduce(
+    renderer: Renderer,
     rows: i64,
     cols: i64,
     row_stride: i64,
     reduce_stride: i64,
     expected: &[Opt],
 ) {
-    let sink = create_laid_out_reduce(rows, cols, row_stride, reduce_stride, DType::Float16);
-    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+    let mut scheduler =
+        Scheduler::new(laid_out_reduce(rows, cols, row_stride, reduce_stride, DType::Float16), renderer);
     let config = HeuristicsConfig::builder().build();
-
     let grouped = try_grouped_reduction(&mut scheduler, &config);
     assert_eq!(grouped || try_warp_row_reduction(&mut scheduler, &config), !expected.is_empty());
     assert_eq!(scheduler.applied_opts, expected);
 }
 
-/// A CDNA wave is 64 lanes wide, so the split follows the renderer rather than
-/// a hard-coded 32.
-#[test]
-fn the_wave_split_follows_the_renderer_wave_width() {
-    let sink = create_laid_out_reduce(8192, 768, 768, 1, DType::Float16);
-    let mut scheduler = Scheduler::new(sink, Renderer::amd_cdna3());
-
-    assert!(try_warp_row_reduction(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert_eq!(scheduler.applied_opts, vec![Opt::group(0, 64), Opt::unroll(1, 4)]);
-}
-
-/// `out[r, c] = x[r, c] * s[r]`: a row-major elementwise kernel over `dtype`
-/// with a per-row broadcast operand, the shape of a layer-norm epilogue. The
-/// broadcast operand is what lets the upcast heuristic see a stride-0 buffer.
-fn create_row_scaled_pattern(rows: i64, cols: i64, dtype: DType) -> Arc<UOp> {
-    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
-    let col = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Global);
-    let idx = row.try_mul(&UOp::index_const(cols)).and_then(|r| r.try_add(&col)).expect("index should build");
-
-    let wide = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, dtype);
-    let value = UOp::index().buffer(wide).indices(vec![idx]).call().expect("index should build");
-    let rowwise = UOp::new_buffer(DeviceSpec::Cpu, rows as usize, DType::Float32);
-    let scale = UOp::index().buffer(rowwise).indices(vec![row.clone()]).call().expect("index should build");
-
-    let scaled = value.cast(DType::Float32).try_mul(&scale).expect("mul should succeed");
-    UOp::sink(vec![scaled, row, col])
-}
-
-/// An elementwise kernel vectorizes along the axis its buffers walk
-/// contiguously and hands that axis `lidx0`. The LOCAL *sizes* are the ones
-/// this heuristic always picked; what changed is which one is applied first,
-/// and therefore which becomes the fastest thread index — here the contiguous
-/// column axis rather than the row axis. The upcast width follows the element
-/// size: four halves and four floats are both a machine vector, three of
-/// either is not, and four doubles are too wide.
-#[test_case(DType::Float16, &[Opt::upcast(1, 4), Opt::local(1, 16), Opt::local(0, 8)]; "four halves vectorize")]
-#[test_case(DType::Float32, &[Opt::upcast(1, 4), Opt::local(1, 16), Opt::local(0, 8)]; "four floats vectorize")]
-#[test_case(DType::Float64, &[Opt::upcast(1, 3), Opt::local(1, 16), Opt::local(0, 8)]; "four doubles keep the ascending width order")]
-fn elementwise_kernels_vectorize_and_lane_along_the_contiguous_axis(dtype: DType, expected: &[Opt]) {
-    let mut scheduler = Scheduler::new(create_row_scaled_pattern(8192, 768, dtype), Renderer::cuda());
-    let config = HeuristicsConfig::builder().build();
-
-    assert!(apply_heuristic_upcasts(&mut scheduler));
-    assert!(apply_local_dims(&mut scheduler, &config));
-    assert_eq!(scheduler.applied_opts, expected);
-}
-
-/// `out[c, r] = x[r, c]`: a transposing copy, contiguous on one side of every
-/// axis and strided on the other.
-fn create_transpose_pattern(rows: i64, cols: i64) -> Arc<UOp> {
-    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
-    let col = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Global);
-    let at = |a: &Arc<UOp>, stride: i64, b: &Arc<UOp>| {
-        a.try_mul(&UOp::index_const(stride)).and_then(|a| a.try_add(b)).expect("index should build")
-    };
-    let load = |idx: Arc<UOp>| {
-        let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols) as usize, DType::Float16);
-        UOp::index().buffer(buffer).indices(vec![idx]).call().expect("index should build")
-    };
-    let value = load(at(&row, cols, &col)).try_add(&load(at(&col, rows, &row))).expect("add should succeed");
-    UOp::sink(vec![value, row, col])
-}
-
-/// No axis of a transposing copy stays inside a sector in every buffer, so
-/// there is no lane axis to promote and the mapping is left as it was.
-#[test]
-fn a_transposing_copy_keeps_the_previous_local_order() {
-    let mut scheduler = Scheduler::new(create_transpose_pattern(8192, 768), Renderer::cuda());
-
-    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 8), Opt::local(1, 16)]);
-}
-
-/// `out[r, c] = sum_k x[(r * cols + c) * taps + k]`: a stencil whose column
-/// axis would qualify as the lane axis on its stride alone.
-fn create_stencil_reduce(rows: i64, cols: i64, taps: i64) -> Arc<UOp> {
-    let row = UOp::range_axis(UOp::index_const(rows), AxisId::Renumbered(0), AxisType::Global);
-    let col = UOp::range_axis(UOp::index_const(cols), AxisId::Renumbered(1), AxisType::Global);
-    let tap = UOp::range_axis(UOp::index_const(taps), AxisId::Renumbered(2), AxisType::Reduce);
-    let idx = row
-        .try_mul(&UOp::index_const(cols * taps))
-        .and_then(|r| r.try_add(&col.try_mul(&UOp::index_const(taps))?))
-        .and_then(|r| r.try_add(&tap))
-        .expect("index should build");
-
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, (rows * cols * taps) as usize, DType::Float16);
-    let value = UOp::index().buffer(buffer).indices(vec![idx]).call().expect("index should build");
-    let sum = value.reduce(vec![tap].into(), ReduceOp::Add);
-    UOp::sink(vec![sum, row, col])
-}
-
-/// Where a reduce loop sits inside the block, the block shape decides more than
-/// the thread mapping — a stencil's halo and the loop's own reuse ride on it
-/// too — and promoting the lane axis measured worse on GigaAM's convolution.
-/// Such a kernel keeps the order it had, even though its column axis spans only
-/// one sector.
-#[test]
-fn a_reducing_kernel_keeps_the_previous_local_order() {
-    let mut scheduler = Scheduler::new(create_stencil_reduce(8192, 768, 5), Renderer::cuda());
-
-    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 8), Opt::local(1, 16)]);
-}
-
-/// The vector-width preference is for lane-parallel backends only: a CPU
-/// kernel keeps the ascending amount order, so CPU code generation is
-/// untouched.
-#[test]
-fn the_vector_width_preference_is_gpu_only() {
-    let mut scheduler = Scheduler::new(create_row_scaled_pattern(8192, 768, DType::Float16), Renderer::cpu());
-
-    assert!(apply_heuristic_upcasts(&mut scheduler));
-    assert_eq!(scheduler.applied_opts, vec![Opt::upcast(1, 3)]);
-}
-
-/// A global axis none of the standard LOCAL sizes divides gets the largest
-/// divisor within the budget when that fills the warps better, and is
-/// padded to a real block size otherwise; divisible axes are unchanged.
-#[test_case(51865, &[Opt::padto(0, 32), Opt::local(0, 32)]; "whisper vocabulary pads seven elements to 32")]
-#[test_case(10007, &[Opt::padto(0, 32), Opt::local(0, 32)]; "prime extent pads to 32")]
-#[test_case(385, &[Opt::local(0, 77)]; "5·7·11 keeps its exact divisor 77")]
-#[test_case(12, &[Opt::local(0, 4)]; "candidate list still wins for 12")]
-#[test_case(96, &[Opt::local(0, 32)]; "candidate list still wins for 96")]
-#[test_case(1024, &[Opt::local(0, 32)]; "candidate list still wins for 1024")]
-#[test_case(25, &[Opt::local(0, 25)]; "tie keeps the exact divisor")]
-fn local_dims_fall_back_for_undividable_axes(size: i64, expected: &[Opt]) {
-    let mut scheduler = Scheduler::new(create_elementwise_pattern(&[size], AxisType::Global), Renderer::cuda());
-
-    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert_eq!(scheduler.applied_opts, expected);
-}
-
-/// The lane-efficiency model follows the renderer's wave width: a padded
-/// 32-thread block fills a whole warp on CUDA and RDNA but half a wave on
-/// CDNA, where the exact divisor 115 (of 5·11·23·41) then wins.
-#[test_case(Renderer::cuda(), &[Opt::padto(0, 32), Opt::local(0, 32)]; "warp32 pads")]
-#[test_case(Renderer::amd_rdna3(), &[Opt::padto(0, 32), Opt::local(0, 32)]; "wave32 pads")]
-#[test_case(Renderer::amd_cdna3(), &[Opt::local(0, 115)]; "wave64 keeps the divisor")]
-fn local_fallback_scores_lanes_per_wave(renderer: Renderer, expected: &[Opt]) {
-    let mut scheduler = Scheduler::new(create_elementwise_pattern(&[51865], AxisType::Global), renderer);
-
-    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert_eq!(scheduler.applied_opts, expected);
-}
-
-/// The decoder logits shape `[2, 51865]`: the vocabulary axis is padded and
-/// localized, and the row axis still folds into the same block.
-///
-/// The vocabulary axis is the one the buffer walks contiguously, so it leads
-/// and lands on `lidx0` — a warp then reads 32 adjacent logits. The row axis
-/// costs a whole vocabulary row per lane and follows.
-#[test]
-fn local_dims_pad_the_vocabulary_axis_beside_the_row_local() {
-    let mut scheduler = Scheduler::new(create_elementwise_pattern(&[2, 51865], AxisType::Global), Renderer::cuda());
-
-    assert!(apply_local_dims(&mut scheduler, &HeuristicsConfig::builder().build()));
-    assert_eq!(scheduler.applied_opts, vec![Opt::padto(1, 32), Opt::local(1, 32), Opt::local(0, 2)]);
-    assert_eq!(scheduler.full_shape(), vec![1621, 32, 2]);
-}
-
-/// The matvec fast path pads a row axis the row tile does not divide when
-/// the padding is cheap, and declines when it is not.
-#[test_case(64, Some(&[Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)][..]); "divisible rows are unchanged")]
-#[test_case(51865, Some(&[Opt::padto(0, 16), Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)][..]); "vocabulary rows pad to the tile")]
-#[test_case(17, None; "padding almost doubling the rows is declined")]
-fn matvec_fast_path_pads_the_row_axis(rows: i64, expected: Option<&[Opt]>) {
-    let sink = create_matvec_like_pattern(rows, 128, DType::Float32, None);
+/// The grouped-reduction threshold separates the two paths: at or below it the reduction groups.
+#[test_case(4, 4, 128, false, true; "a small output groups")]
+#[test_case(32, 32, 128, false, true; "1024 outputs are inside the default threshold")]
+#[test_case(32, 32, 128, true, false; "disable_locals drops the threshold to 240")]
+#[test_case(1024, 128, 128, false, false; "a large output is above the threshold")]
+fn grouped_reduction_threshold_is_config_gated(rows: i64, cols: i64, reduce: i64, disable_locals: bool, grouped: bool) {
+    let config = HeuristicsConfig::builder().disable_locals(disable_locals).build();
+    let sink = reduce_sink(&[rows, cols], &[reduce], ReduceOp::Add);
     let mut scheduler = Scheduler::new(sink, Renderer::cuda());
-
-    assert_eq!(apply_matvec_fast_path(&mut scheduler, &HeuristicsConfig::builder().build()), expected.is_some());
-    assert_eq!(scheduler.applied_opts, expected.unwrap_or_default());
+    assert_eq!(try_grouped_reduction(&mut scheduler, &config), grouped);
 }
 
-/// CPU threading pads a loop axis no thread count divides (otherwise it runs
-/// on one core); an axis some count divides keeps that count.
+/// An elementwise kernel vectorizes along the axis its buffers walk contiguously.
+#[test_case(Renderer::cuda(), DType::Float16, &[Opt::upcast(1, 4), Opt::local(1, 16), Opt::local(0, 8)]; "four halves vectorize")]
+#[test_case(Renderer::cuda(), DType::Float32, &[Opt::upcast(1, 4), Opt::local(1, 16), Opt::local(0, 8)]; "four floats vectorize")]
+#[test_case(Renderer::cuda(), DType::Float64, &[Opt::upcast(1, 3), Opt::local(1, 16), Opt::local(0, 8)]; "four doubles keep the ascending width order")]
+#[test_case(Renderer::cpu(), DType::Float16, &[Opt::upcast(1, 3)]; "a CPU kernel keeps the ascending order")]
+fn elementwise_kernels_vectorize_and_lane_along_the_contiguous_axis(
+    renderer: Renderer,
+    dtype: DType,
+    expected: &[Opt],
+) {
+    let mut scheduler = Scheduler::new(row_scaled(8192, 768, dtype), renderer);
+    let config = HeuristicsConfig::builder().build();
+    assert!(apply_heuristic_upcasts(&mut scheduler));
+    apply_local_dims(&mut scheduler, &config);
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// Where the axes' buffers stride both ways (a transposing copy), or a reduce spans axes, the previous order stands.
+#[test_case(false; "a transposing copy")]
+#[test_case(true; "a reducing kernel")]
+fn a_strided_or_reducing_kernel_keeps_the_previous_local_order(reducing: bool) {
+    let sink = if reducing { stencil_reduce(8192, 768, 5) } else { transposing_copy(8192, 768) };
+    let (applied, scheduler) = run(sink, Renderer::cuda(), &HeuristicsConfig::default(), apply_local_dims);
+    assert!(applied);
+    assert_eq!(scheduler.applied_opts, vec![Opt::local(0, 8), Opt::local(1, 16)]);
+}
+
+/// LOCAL sizing: a global axis none of the standard sizes divides gets the largest exact divisor (padding when nearly
+/// none exists), the lane-efficiency model follows the renderer's wave width, the vocabulary axis is padded beside the
+/// row local, and at most three LOCALs apply, lane axis first.
+#[test_case(Renderer::cuda(), &[51865], &[Opt::padto(0, 32), Opt::local(0, 32)], None; "whisper vocabulary pads seven elements to 32")]
+#[test_case(Renderer::amd_rdna3(), &[51865], &[Opt::padto(0, 32), Opt::local(0, 32)], None; "wave32 pads")]
+#[test_case(Renderer::amd_cdna3(), &[51865], &[Opt::local(0, 115)], None; "wave64 keeps the divisor")]
+#[test_case(Renderer::cuda(), &[10007], &[Opt::padto(0, 32), Opt::local(0, 32)], None; "prime extent pads to 32")]
+#[test_case(Renderer::cuda(), &[385], &[Opt::local(0, 77)], None; "5·7·11 keeps its exact divisor 77")]
+#[test_case(Renderer::cuda(), &[12], &[Opt::local(0, 4)], None; "candidate list still wins for 12")]
+#[test_case(Renderer::cuda(), &[96], &[Opt::local(0, 32)], None; "candidate list still wins for 96")]
+#[test_case(Renderer::cuda(), &[1024], &[Opt::local(0, 32)], None; "candidate list still wins for 1024")]
+#[test_case(Renderer::cuda(), &[25], &[Opt::local(0, 25)], None; "tie keeps the exact divisor")]
+#[test_case(Renderer::cuda(), &[2, 51865], &[Opt::padto(1, 32), Opt::local(1, 32), Opt::local(0, 2)], Some(&[1621, 32, 2]); "vocabulary axis padded beside the row local")]
+#[test_case(Renderer::cuda(), &[8, 8, 8, 8], &[Opt::local(3, 8), Opt::local(1, 2), Opt::local(2, 8)], None; "at most three, lane axis first")]
+fn local_dims_pad_and_split_the_lane_axis(
+    renderer: Renderer,
+    shape: &[i64],
+    expected: &[Opt],
+    full_shape: Option<&[i64]>,
+) {
+    let (applied, scheduler) =
+        run(elementwise_load(shape, AxisType::Global), renderer, &HeuristicsConfig::default(), apply_local_dims);
+    assert!(applied);
+    assert_eq!(scheduler.applied_opts, expected);
+    if let Some(full_shape) = full_shape {
+        assert_eq!(scheduler.full_shape(), full_shape);
+    }
+}
+
+/// CPU threading pads a loop axis no thread count divides (otherwise it runs serially).
 #[test_case(10007, 512, &[Opt::padto(0, 32), Opt::thread(0, 32)]; "prime rows pad to 32 threads")]
 #[test_case(51865, 512, &[Opt::thread(0, 5)]; "a dividing count is still preferred")]
 #[test_case(96, 65536, &[Opt::thread(0, 32)]; "divisible rows are unchanged")]
@@ -680,10 +647,76 @@ fn threading_pads_undividable_loop_axes(rows: i64, cols: i64, expected: &[Opt]) 
     let mut renderer = Renderer::cpu();
     // Renderer::cpu() caps threads at the host core count; these expectations need 32.
     renderer.global_max = Some(vec![32]);
-
-    let sink = create_row_reduce_pattern(AxisType::Weak, rows, cols, DType::Float32, None);
-    let mut scheduler = Scheduler::new(sink, renderer);
-
-    assert_eq!(apply_threading(&mut scheduler, 32), !expected.is_empty());
+    let (applied, scheduler) = run(
+        row_reduce(AxisType::Weak, rows, cols, DType::Float32, None),
+        renderer,
+        &HeuristicsConfig::default(),
+        |s, _| apply_threading(s, 32),
+    );
+    assert_eq!(applied, !expected.is_empty());
     assert_eq!(scheduler.applied_opts, expected);
+}
+
+// MATMUL OUTPUT TILING
+
+/// Register blocking wants two output axes at least four wide, and picks the widest divisible factor.
+#[test_case(16, 16, 16, true, &[Opt::upcast(0, 8), Opt::upcast(1, 8)]; "square output takes the widest factor")]
+#[test_case(14, 6, 16, true, &[Opt::upcast(0, 7), Opt::upcast(1, 6)]; "odd extents pick their own factor")]
+#[test_case(16, 16, 16, false, &[]; "output_upcast disabled declines")]
+fn apply_matmul_tiling_picks_the_widest_divisible_factor(
+    m: i64,
+    n: i64,
+    k: i64,
+    output_upcast: bool,
+    expected: &[Opt],
+) {
+    let config = HeuristicsConfig::builder().output_upcast(output_upcast).build();
+    let (applied, scheduler) =
+        run(matmul_with(m, n, k, DType::Float16, |v| v), Renderer::cuda(), &config, apply_matmul_tiling);
+    assert_eq!(applied, !expected.is_empty());
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// A single output axis cannot be 2D-tiled, and the legacy alias delegates.
+#[test]
+fn apply_matmul_tiling_needs_two_output_axes_and_the_alias_delegates() {
+    let config = HeuristicsConfig::default();
+    let one_axis = row_reduce(AxisType::Global, 16, 16, DType::Float16, None);
+    let (applied, _) = run(one_axis, Renderer::cuda(), &config, apply_matmul_tiling);
+    assert!(!applied, "one output axis is not a 2D tile");
+    let sink = matmul_with(7, 6, 16, DType::Float16, |v| v);
+    let (_, tiled) = run(sink.clone(), Renderer::cuda(), &config, apply_matmul_tiling);
+    assert!(!tiled.applied_opts.is_empty());
+    let (alias, aliased) = run(sink, Renderer::cuda(), &config, apply_matmul_output_upcasting);
+    assert!(alias);
+    assert_eq!(aliased.applied_opts, tiled.applied_opts);
+}
+
+// FULL PIPELINE ORDER
+
+/// The pipeline stops the moment it groups: no masked upcast, unroll, local or thread is tried.
+#[test]
+fn hand_coded_optimizations_stops_after_grouping() {
+    let sink = reduce_sink(&[4, 4, 128], &[128], ReduceOp::Add);
+    let mut scheduler = Scheduler::new(sink, Renderer::cuda());
+    hand_coded_optimizations(&mut scheduler, &HeuristicsConfig::default());
+    assert_eq!(scheduler.applied_opts, vec![Opt::grouptop(0, 16)]);
+    assert!(scheduler.group_for_reduces() > 0);
+}
+
+/// Tensor cores are tried first and, when they land, no later stage runs.
+#[test]
+fn hand_coded_optimizations_returns_after_tensor_cores() {
+    let mut scheduler = Scheduler::new(matmul_with(64, 64, 64, DType::Float16, |v| v), Renderer::cuda());
+    hand_coded_optimizations(&mut scheduler, &HeuristicsConfig::default());
+    assert_eq!(scheduler.applied_opts.first().map(|opt| opt.op), Some(OptOps::TC));
+    assert!(scheduler.axes_of(&[AxisType::Local]).is_empty(), "post-TC tiling must not stack a block");
+}
+
+/// A plain elementwise kernel walks the whole ladder in order: upcast, local.
+#[test]
+fn hand_coded_optimizations_runs_the_elementwise_ladder_in_order() {
+    let mut scheduler = Scheduler::new(elementwise_load(&[1024], AxisType::Global), Renderer::cuda());
+    hand_coded_optimizations(&mut scheduler, &HeuristicsConfig::default());
+    assert_eq!(scheduler.applied_opts, vec![Opt::upcast(0, 4), Opt::local(0, 32)]);
 }

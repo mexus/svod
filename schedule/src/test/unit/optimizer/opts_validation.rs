@@ -1,576 +1,221 @@
-//! Ported tests from Tinygrad's test_kernel_opts.py
-//!
-//! These tests validate that optimization operations (OptOps) work correctly.
-//! Each test is documented with its original Tinygrad source for reference.
-//!
-//! Note: These tests focus on structural correctness (axis types, shapes, counts)
-//! since svod doesn't yet have execution/runtime infrastructure for numerical
-//! validation.
+//! Ported from tinygrad's `test_kernel_opts.py`: the structural contract of
+//! each `OptOps` application (axis kinds and counts), not its numerics.
 
+use std::sync::Arc;
+
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
+use test_case::test_case;
+
+use crate::optimizer::error::OptError;
 use crate::optimizer::{Opt, Renderer, Scheduler, apply_opt};
-use crate::test::helpers::*;
-use svod_ir::ops;
-use svod_ir::{AxisId, AxisType, DType, ReduceOp, UOp};
+use crate::test::support::prelude::*;
 
-/// Port of Tinygrad test_kernel_opts.py::test_upcasts (lines 37-47)
-///
-/// Original test creates elementwise operations on 16×16 tensors and validates
-/// that UPCAST optimization works with amounts 2, 4, and 8.
-///
-/// This validates that:
-/// - UPCAST splits a Global axis into (Global, Upcast)
-/// - Different upcast amounts work correctly
-/// - Axis types are correct after transformation
-///
-/// Original Tinygrad code:
-/// ```python
-/// def test_upcasts(self):
-///   N = 16
-///   Tensor.manual_seed(1772)
-///   a = Tensor.rand(N, N)
-///   b = Tensor.rand(N, N)
-///   r = (a+b).sqrt() * ((a+1).exp())
-///   helper_linearizer_opt(r, [
-///     [Opt(OptOps.UPCAST, 0, 2)],
-///     [Opt(OptOps.UPCAST, 0, 4)],
-///     [Opt(OptOps.UPCAST, 0, 8)],
-///   ])
-/// ```
-#[test]
-fn test_upcasts() {
-    // Create a simple pattern to upcast (16x16 elementwise)
-    let pattern = create_elementwise_pattern(&[16, 16]);
-    let renderer = Renderer::cpu();
+/// A `WeakInt` RANGE with a constant extent, the typing `Ranged` uses for every
+/// axis so the scheduler's own splits keep it.
+fn axis(size: i64, id: usize, axis_type: AxisType) -> Arc<UOp> {
+    UOp::range_axis(UOp::index_const(size), AxisId::Renumbered(id), axis_type)
+}
 
-    // Test upcast by 2
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::upcast(0, 2), true);
-        assert!(result.is_ok(), "UPCAST by 2 should succeed: {:?}", result.err());
+/// `SINK[RANGE(sizes)..]` over `sizes` GLOBAL axes — no compute source, so the
+/// scheduler's `full_shape` is exactly the axis list.
+fn global_sink(sizes: &[i64]) -> Arc<UOp> {
+    UOp::sink(sizes.iter().enumerate().map(|(id, &size)| axis(size, id, AxisType::Global)).collect())
+}
 
-        // Should now have 3 axes after upcast
-        assert_eq!(sched.shape_len(), 3, "Should have 3 axes after upcast by 2");
+/// `SINK[REDUCE(const, reduce axes), GLOBAL globals]`.
+fn reduce_over(globals: &[i64], reduces: &[i64], op: ReduceOp) -> Arc<UOp> {
+    let axes: Vec<_> =
+        reduces.iter().enumerate().map(|(id, &size)| axis(size, globals.len() + id, AxisType::Reduce)).collect();
+    let compute = UOp::native_const(1.0f32).reduce(axes.into(), op);
+    let sources =
+        std::iter::once(compute).chain(globals.iter().enumerate().map(|(id, &size)| axis(size, id, AxisType::Global)));
+    UOp::sink(sources.collect())
+}
 
-        // After upcast, the axis order is determined by priority sorting
-        // Upcast has lower priority than Global, so axes will be reordered
-        // Let's just verify we have the right axis types and one upcast axis
-        assert_axis_count(&sched, AxisType::Upcast, 1);
-        assert_axis_count(&sched, AxisType::Global, 2);
+/// Apply `opt` to a fresh scheduler over `sink`, panicking on a rejection.
+#[track_caller]
+fn applied(sink: Arc<UOp>, renderer: Renderer, opt: &Opt) -> Scheduler {
+    let mut scheduler = Scheduler::new(sink, renderer);
+    apply_opt(&mut scheduler, opt, true).unwrap_or_else(|error| panic!("{opt} must apply: {error:?}"));
+    scheduler
+}
 
-        // Verify at least one upcast axis exists with size 2
-        let upcast_axes = sched.axes_of(&[AxisType::Upcast]);
-        assert_eq!(upcast_axes.len(), 1, "Should have exactly one upcast axis");
+/// Apply every opt in `opts` to a fresh scheduler and check the resulting axis
+/// counts.
+fn assert_opts_apply(sink: Arc<UOp>, renderer: Renderer, opts: &[Opt], expected: &[(AxisType, usize)]) {
+    let mut scheduler = Scheduler::new(sink, renderer);
+    for opt in opts {
+        apply_opt(&mut scheduler, opt, true).unwrap_or_else(|error| panic!("{opt} must apply: {error:?}"));
     }
-
-    // Test upcast by 4
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::upcast(0, 4), true);
-        assert!(result.is_ok(), "UPCAST by 4 should succeed: {:?}", result.err());
-
-        // Should have 3 axes with one upcast
-        assert_eq!(sched.shape_len(), 3, "Should have 3 axes after upcast by 4");
-        assert_axis_count(&sched, AxisType::Upcast, 1);
-        assert_axis_count(&sched, AxisType::Global, 2);
-    }
-
-    // Test upcast by 8
-    {
-        let mut sched = Scheduler::new(pattern, renderer);
-        let result = apply_opt(&mut sched, &Opt::upcast(0, 8), true);
-        assert!(result.is_ok(), "UPCAST by 8 should succeed: {:?}", result.err());
-
-        // Should have 3 axes with one upcast
-        assert_eq!(sched.shape_len(), 3, "Should have 3 axes after upcast by 8");
-        assert_axis_count(&sched, AxisType::Upcast, 1);
-        assert_axis_count(&sched, AxisType::Global, 2);
+    for &(axis, count) in expected {
+        assert_eq!(scheduler.axes_of(&[axis]).len(), count, "{axis:?} after {opts:?}");
     }
 }
 
-/// Port of Tinygrad test_kernel_opts.py::test_full_upcast (lines 49-56)
-///
-/// Original test creates elementwise operations on a 4-element tensor and validates
-/// that UPCAST can fully upcast the entire dimension (size 4, upcast by 4).
-///
-/// This validates that:
-/// - UPCAST can consume an entire axis
-/// - The resulting Global axis has size 1
-/// - The Upcast axis has the full original size
-///
-/// Original Tinygrad code:
-/// ```python
-/// def test_full_upcast(self):
-///   Tensor.manual_seed(1772)
-///   a = Tensor.rand(4)
-///   b = Tensor.rand(4)
-///   r = (a+b).sqrt() * ((a+1).exp())
-///   helper_linearizer_opt(r, [
-///     [Opt(OptOps.UPCAST, 0, 4)],
-///   ])
-/// ```
-#[test]
-fn test_full_upcast() {
-    // Create a simple 1D pattern (size 4)
-    let pattern = create_elementwise_pattern(&[4]);
-    let renderer = Renderer::cpu();
+/// UPCAST splits a Global axis into `(Global, Upcast)`; a split that consumes
+/// the full axis leaves no Global behind.
+#[test_case(&[16, 16], 2, &[8, 16, 2], 2; "upcast by two")]
+#[test_case(&[16, 16], 4, &[4, 16, 4], 2; "upcast by four")]
+#[test_case(&[16, 16], 8, &[2, 16, 8], 2; "upcast by eight")]
+#[test_case(&[4], 4, &[4], 0; "a full upcast consumes its axis")]
+fn upcast_splits_the_global_axis(shape: &[i64], amount: usize, full_shape: &[i64], globals: usize) {
+    let scheduler = applied(global_sink(shape), Renderer::cpu(), &Opt::upcast(0, amount));
 
-    let mut sched = Scheduler::new(pattern, renderer);
-
-    // Upcast the entire dimension (4 → 1×4)
-    let result = apply_opt(&mut sched, &Opt::upcast(0, 4), true);
-    assert!(result.is_ok(), "Full UPCAST should succeed: {:?}", result.err());
-
-    // After filtering, should have 1 axis: Upcast(4) (Global(1) filtered out)
-    assert_eq!(sched.shape_len(), 1, "Should have 1 axis after full upcast (Global(1) filtered)");
-    assert_shape_equal(&sched, &[4]);
-
-    // Check axis types
-    assert_axes_equal(&sched, &[AxisType::Upcast]);
-
-    // Verify upcast count (Global(1) filtered out by compute_rngs)
-    assert_axis_count(&sched, AxisType::Upcast, 1);
-    assert_axis_count(&sched, AxisType::Global, 0);
+    assert_eq!(scheduler.full_shape(), full_shape);
+    assert_eq!(scheduler.axes_of(&[AxisType::Global]).len(), globals);
+    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), 1);
 }
 
-/// Port of Tinygrad test_kernel_opts.py::test_local_and_grouped_reduce (lines 11-35)
-///
-/// Original test creates a reduction pattern and validates LOCAL and GROUPTOP optimizations.
-/// Tests single opts and combinations of LOCAL + GROUPTOP + UPCAST + UNROLL.
-///
-/// This validates that:
-/// - LOCAL splits Global axes for GPU workgroup parallelism
-/// - GROUPTOP splits Reduce axes for two-stage reduction
-/// - Multiple LOCAL and GROUPTOP operations can be combined
-/// - Complex optimization sequences work correctly
-///
-/// Original Tinygrad code:
-/// ```python
-/// def test_local_and_grouped_reduce(self):
-///   N = 128
-///   Tensor.manual_seed(1882)
-///   a = Tensor.rand(4, 4, N, N)
-///   b = Tensor.rand(4, 4, N)
-///   r = (b.sqrt() + ((a+1).sum(axis=3).exp()))
-///   helper_linearizer_opt(r, [
-///     [Opt(OptOps.LOCAL, 0, 2)],
-///     [Opt(OptOps.LOCAL, 0, 8)],
-///     [Opt(OptOps.LOCAL, 0, 16)],
-///     [Opt(OptOps.GROUPTOP, 0, 2)],
-///     [Opt(OptOps.GROUPTOP, 0, 32)],
-///     [Opt(OptOps.GROUPTOP, 0, 64)],
-///     [Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.GROUPTOP, 0, 2)],
-///     [Opt(OptOps.LOCAL, 0, 16), Opt(OptOps.GROUPTOP, 0, 16)],
-///     ...
-///   ])
-/// ```
-#[test]
-fn test_local_and_grouped_reduce() {
-    // Create a reduction pattern matching Tinygrad's structure:
-    // Output shape: [4, 4, 128], Reduce axis: 128
-    // This mimics: result[4,4,128] = sum(data[4,4,128,128], axis=3)
-    let pattern = create_reduce_with_globals(&[4, 4, 128], 128, ReduceOp::Add);
-    let renderer = Renderer::cuda(); // GPU backend with local memory support
-
-    // Test single LOCAL with amount 2
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::local(0, 2), true);
-        assert!(result.is_ok(), "LOCAL by 2 should succeed: {:?}", result.err());
-
-        // Should have split Global axis 0 (size=4) into (Global=2, Local=2)
-        assert_axis_count(&sched, AxisType::Local, 1);
-        // Still have 3 global axes (one split, two unchanged)
-        assert_axis_count(&sched, AxisType::Global, 3);
-    }
-
-    // Test single LOCAL with amount 8 (on axis 2, size=128)
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        // LOCAL on axis 2 (size=128) splits it into (Global=16, Local=8)
-        let result = apply_opt(&mut sched, &Opt::local(2, 8), true);
-        assert!(result.is_ok(), "LOCAL(2, 8) should succeed: {:?}", result.err());
-        assert_axis_count(&sched, AxisType::Local, 1);
-        assert_axis_count(&sched, AxisType::Global, 3);
-    }
-
-    // Test single LOCAL with amount 16 (on axis 2, size=128)
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        // LOCAL on axis 2 (size=128) splits it into (Global=8, Local=16)
-        let result = apply_opt(&mut sched, &Opt::local(2, 16), true);
-        assert!(result.is_ok(), "LOCAL(2, 16) should succeed: {:?}", result.err());
-        assert_axis_count(&sched, AxisType::Local, 1);
-        assert_axis_count(&sched, AxisType::Global, 3);
-    }
-
-    // Test single GROUPTOP with amount 2
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        // GROUPTOP operates on reduce axes (logical index)
-        let result = apply_opt(&mut sched, &Opt::grouptop(0, 2), true);
-        assert!(result.is_ok(), "GROUPTOP by 2 should succeed: {:?}", result.err());
-
-        // Should have split Reduce into (Reduce, GroupReduce)
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test single GROUPTOP with amount 32
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::grouptop(0, 32), true);
-        assert!(result.is_ok(), "GROUPTOP by 32 should succeed");
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test single GROUPTOP with amount 64
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::grouptop(0, 64), true);
-        assert!(result.is_ok(), "GROUPTOP by 64 should succeed");
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test combination: LOCAL + GROUPTOP
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-
-        // Apply LOCAL first
-        let result = apply_opt(&mut sched, &Opt::local(0, 2), true);
-        assert!(result.is_ok(), "LOCAL should succeed");
-
-        // Then apply GROUPTOP
-        let result = apply_opt(&mut sched, &Opt::grouptop(0, 2), true);
-        assert!(result.is_ok(), "GROUPTOP after LOCAL should succeed");
-
-        // Should have both Local and GroupReduce axes
-        assert_axis_count(&sched, AxisType::Local, 1);
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test combination: LOCAL(16) + GROUPTOP(16)
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-
-        // LOCAL on axis 2 (size=128), divisible by 16
-        apply_opt(&mut sched, &Opt::local(2, 16), true).unwrap();
-        // GROUPTOP on reduce axis (logical index 0)
-        apply_opt(&mut sched, &Opt::grouptop(0, 16), true).unwrap();
-
-        assert_axis_count(&sched, AxisType::Local, 1);
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test complex combination: LOCAL + GROUPTOP + UPCAST + UNROLL
-    {
-        let mut sched = Scheduler::new(pattern, renderer);
-
-        // Apply optimizations in sequence
-        // LOCAL on axis 2 (size=128), split to (Global=64, Local=2)
-        apply_opt(&mut sched, &Opt::local(2, 2), true).unwrap();
-        // GROUPTOP on reduce axis (size=128), split to (GroupReduce=2, Reduce=64)
-        apply_opt(&mut sched, &Opt::grouptop(0, 2), true).unwrap();
-
-        // UPCAST on an axis with size ≥4
-        // After LOCAL(2,2) and GROUPTOP(0,2), we have:
-        // - Global axes: sizes [4, 4, 64] (from splitting axis 2)
-        // - Local: size 2
-        // - GroupReduce: size 2
-        // - Reduce: size 64
-        // We can upcast axis 0 (size=4) by 2 or 4
-        apply_opt(&mut sched, &Opt::upcast(0, 2), true).unwrap();
-
-        // UNROLL on reduce axis (logical index in unrollable dims)
-        // This will convert GroupReduce → Unroll
-        let unrollable = sched.unrollable_dims();
-        if !unrollable.is_empty() {
-            // Try to unroll by 2
-            let _ = apply_opt(&mut sched, &Opt::unroll(0, 2), true);
-        }
-
-        // Verify we have multiple optimization types
-        // Note: UNROLL converts GroupReduce → Unroll, so check for Unroll instead
-        assert!(!sched.axes_of(&[AxisType::Local]).is_empty());
-        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
-        assert!(!sched.axes_of(&[AxisType::Upcast]).is_empty());
-    }
+/// LOCAL, GROUPTOP, UPCAST and UNROLL compose, in any order, on a reduce whose
+/// split factors keep every axis under its budget.
+#[test_case(&[Opt::local(0, 2)], &[(AxisType::Local, 1), (AxisType::Global, 3)]; "LOCAL on the leading axis")]
+#[test_case(&[Opt::local(2, 8)], &[(AxisType::Local, 1), (AxisType::Global, 3)]; "LOCAL by eight")]
+#[test_case(&[Opt::local(2, 16)], &[(AxisType::Local, 1), (AxisType::Global, 3)]; "LOCAL by sixteen")]
+#[test_case(&[Opt::grouptop(0, 2)], &[(AxisType::GroupReduce, 1)]; "GROUPTOP by two")]
+#[test_case(&[Opt::grouptop(0, 32)], &[(AxisType::GroupReduce, 1)]; "GROUPTOP by thirty-two")]
+#[test_case(&[Opt::grouptop(0, 64)], &[(AxisType::GroupReduce, 1)]; "GROUPTOP by sixty-four")]
+#[test_case(&[Opt::local(0, 2), Opt::grouptop(0, 2)], &[(AxisType::Local, 1), (AxisType::GroupReduce, 1)]; "LOCAL then GROUPTOP")]
+#[test_case(&[Opt::local(2, 16), Opt::grouptop(0, 16)], &[(AxisType::Local, 1), (AxisType::GroupReduce, 1)]; "LOCAL sixteen then GROUPTOP sixteen")]
+#[test_case(
+    &[Opt::local(2, 2), Opt::grouptop(0, 2), Opt::upcast(0, 2), Opt::unroll(0, 2)],
+    &[(AxisType::Local, 1), (AxisType::Upcast, 1), (AxisType::Unroll, 1), (AxisType::GroupReduce, 0)];
+    "the full ladder folds the group into the unroll"
+)]
+fn local_and_grouped_reduce_compose(opts: &[Opt], expected: &[(AxisType, usize)]) {
+    assert_opts_apply(reduce_over(&[4, 4, 128], &[128], ReduceOp::Add), Renderer::cuda(), opts, expected);
 }
 
-/// Port of Tinygrad test_kernel_opts.py::test_double_reduce (lines 89-111)
-///
-/// Original test creates a 4D tensor (8, 128, 8, 128) and reduces over axes (1, 3),
-/// resulting in shape (8, 8). Tests various combinations of GROUPTOP, LOCAL, UPCAST,
-/// and UNROLL optimizations on double reduction patterns.
-///
-/// This validates that:
-/// - GROUPTOP works on multiple reduction axes independently
-/// - LOCAL and GROUPTOP can be combined on different axes
-/// - Complex optimization sequences (LOCAL + GROUPTOP + UPCAST + UNROLL) work correctly
-/// - Double reductions handle various optimization strategies
-///
-/// Original Tinygrad code:
-/// ```python
-/// def test_double_reduce(self):
-///   N = 128
-///   Tensor.manual_seed(1552)
-///   a = Tensor.rand(8, N, 8, N)
-///   r = a.sum(axis=(1,3))
-///   helper_linearizer_opt(r, [
-///     [Opt(OptOps.GROUPTOP, 0, 2)],
-///     [Opt(OptOps.GROUPTOP, 0, 32)],
-///     [Opt(OptOps.GROUPTOP, 1, 2)],
-///     [Opt(OptOps.GROUPTOP, 1, 32)],
-///     [Opt(OptOps.GROUPTOP, 0, 2), Opt(OptOps.GROUPTOP, 1, 2)],
-///     [Opt(OptOps.GROUPTOP, 0, 16), Opt(OptOps.GROUPTOP, 1, 2)],
-///     [Opt(OptOps.GROUPTOP, 0, 4), Opt(OptOps.GROUPTOP, 1, 64)],
-///     [Opt(OptOps.GROUPTOP, 0, 16), Opt(OptOps.GROUPTOP, 1, 2), Opt(OptOps.UNROLL, 0, 4)],
-///     [Opt(OptOps.GROUPTOP, 0, 2), Opt(OptOps.GROUPTOP, 1, 32), Opt(OptOps.UNROLL, 2, 4)],
-///     [Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.LOCAL, 1, 4), Opt(OptOps.GROUPTOP, 0, 4), Opt(OptOps.GROUPTOP, 1, 4)],
-///     [Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.LOCAL, 1, 4), Opt(OptOps.GROUPTOP, 0, 2), Opt(OptOps.GROUPTOP, 1, 32), Opt(OptOps.UNROLL, 1, 4)],
-///     [Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.GROUPTOP, 0, 8), Opt(OptOps.GROUPTOP, 1, 4), Opt(OptOps.UPCAST, 0, 2)],
-///     [Opt(OptOps.LOCAL, 0, 2), Opt(OptOps.LOCAL, 1, 2), Opt(OptOps.GROUPTOP, 0, 8), Opt(OptOps.GROUPTOP, 1, 4), Opt(OptOps.UPCAST, 0, 2), Opt(OptOps.UNROLL, 0, 4), Opt(OptOps.UNROLL, 1, 4)],
-///     [Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.LOCAL, 1, 4), Opt(OptOps.GROUPTOP, 0, 4), Opt(OptOps.GROUPTOP, 1, 4), Opt(OptOps.UPCAST, 0, 2), Opt(OptOps.UPCAST, 0, 2)], # no globals
-///   ])
-/// ```
-#[test]
-fn test_double_reduce() {
-    // Create pattern matching Tinygrad's structure:
-    // Tensor(8, 128, 8, 128).sum(axis=(1,3)) -> Result(8, 8)
-    // Global axes: [8, 8], Reduce axes: [128, 128]
-    let pattern = create_double_reduce_with_globals(&[8, 8], &[128, 128], ReduceOp::Add);
-    let renderer = Renderer::cuda(); // GPU backend with local/shared memory
-
-    // Test 1: Single GROUPTOP on first reduce axis (logical index 0)
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::grouptop(0, 2), true);
-        assert!(result.is_ok(), "GROUPTOP(0, 2) should succeed: {:?}", result.err());
-        // Should split first Reduce axis (size 128) into (GroupReduce=2, Reduce=64)
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test 2: GROUPTOP on first reduce axis with larger factor
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::grouptop(0, 32), true);
-        assert!(result.is_ok(), "GROUPTOP(0, 32) should succeed");
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test 3: GROUPTOP on second reduce axis (logical index 1)
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::grouptop(1, 2), true);
-        assert!(result.is_ok(), "GROUPTOP(1, 2) should succeed");
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test 4: GROUPTOP on second reduce axis with larger factor
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        let result = apply_opt(&mut sched, &Opt::grouptop(1, 32), true);
-        assert!(result.is_ok(), "GROUPTOP(1, 32) should succeed");
-        assert_axis_count(&sched, AxisType::GroupReduce, 1);
-    }
-
-    // Test 5: GROUPTOP on both reduce axes
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::grouptop(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 2), true).unwrap();
-        // Should have 2 GroupReduce axes
-        assert_axis_count(&sched, AxisType::GroupReduce, 2);
-    }
-
-    // Test 6: GROUPTOP with asymmetric factors
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::grouptop(0, 16), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 2), true).unwrap();
-        assert_axis_count(&sched, AxisType::GroupReduce, 2);
-    }
-
-    // Test 7: GROUPTOP with different asymmetric factors
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::grouptop(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 64), true).unwrap();
-        assert_axis_count(&sched, AxisType::GroupReduce, 2);
-    }
-
-    // Test 8: GROUPTOP + UNROLL combination
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::grouptop(0, 16), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::unroll(0, 4), true).unwrap();
-
-        // Verify that we have multiple optimization types
-        // Note: UNROLL may convert GroupReduce→Unroll, so we check for presence not exact counts
-        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
-        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
-    }
-
-    // Test 9: GROUPTOP + UNROLL on different axis
-    // Comment from Tinygrad: "Checking how it works with 2 grouped_reduces + upcasts."
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::grouptop(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 32), true).unwrap();
-        apply_opt(&mut sched, &Opt::unroll(2, 4), true).unwrap();
-
-        // Verify optimizations were applied successfully
-        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
-        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
-    }
-
-    // Test 10: LOCAL + GROUPTOP on both axes
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        // LOCAL on both Global axes (size 8 each)
-        apply_opt(&mut sched, &Opt::local(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::local(1, 4), true).unwrap();
-        // GROUPTOP on both Reduce axes
-        apply_opt(&mut sched, &Opt::grouptop(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 4), true).unwrap();
-
-        assert_axis_count(&sched, AxisType::Local, 2);
-        assert_axis_count(&sched, AxisType::GroupReduce, 2);
-    }
-
-    // Test 11: Complex combination - LOCAL + GROUPTOP + UNROLL
-    // Comment from Tinygrad: "Checking how it works with 2 grouped_reduces + upcasts + locals."
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::local(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::local(1, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 32), true).unwrap();
-        apply_opt(&mut sched, &Opt::unroll(1, 4), true).unwrap();
-
-        // Verify we have all expected optimization types
-        assert_axis_count(&sched, AxisType::Local, 2);
-        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
-        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
-    }
-
-    // Test 12: LOCAL + GROUPTOP + UPCAST
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::local(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::local(1, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(0, 8), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 4), true).unwrap();
-        // UPCAST on Global axis 0 (now size 4 after LOCAL split)
-        apply_opt(&mut sched, &Opt::upcast(0, 2), true).unwrap();
-
-        assert_axis_count(&sched, AxisType::Local, 2);
-        assert_axis_count(&sched, AxisType::GroupReduce, 2);
-        assert_axis_count(&sched, AxisType::Upcast, 1);
-    }
-
-    // Test 13: Complex combination - LOCAL + GROUPTOP + UPCAST + UNROLL (2x)
-    // Comment from Tinygrad: "Checking how it works with 2 grouped_reduces + upcasts + locals."
-    {
-        let mut sched = Scheduler::new(pattern.clone(), renderer.clone());
-        apply_opt(&mut sched, &Opt::local(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::local(1, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(0, 8), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::upcast(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::unroll(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::unroll(1, 4), true).unwrap();
-
-        // Verify we have all expected optimization types
-        assert_axis_count(&sched, AxisType::Local, 2);
-        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
-        assert_axis_count(&sched, AxisType::Upcast, 1);
-        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
-    }
-
-    // Test 14: "no globals" - LOCAL + GROUPTOP + double UPCAST
-    // Original Tinygrad comment: "# no globals"
-    {
-        let mut sched = Scheduler::new(pattern, renderer);
-        apply_opt(&mut sched, &Opt::local(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::local(1, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(0, 4), true).unwrap();
-        apply_opt(&mut sched, &Opt::grouptop(1, 4), true).unwrap();
-
-        // Apply UPCAST(0, 2) twice to fully upcast both Global axes
-        // Each UPCAST splits Global(2) → Global(1) + Upcast(2)
-        // After compute_rngs() filtering, Global(1) axes are excluded from rngs()
-        // This matches Tinygrad's behavior where vmax==0 ranges are filtered
-        apply_opt(&mut sched, &Opt::upcast(0, 2), true).unwrap();
-        apply_opt(&mut sched, &Opt::upcast(0, 2), true).unwrap();
-
-        // Verify "no globals" - all Global axes filtered out (size-1 ranges excluded)
-        assert_axis_count(&sched, AxisType::Global, 0);
-        assert_axis_count(&sched, AxisType::Local, 2);
-        assert_axis_count(&sched, AxisType::GroupReduce, 2);
-        assert_axis_count(&sched, AxisType::Upcast, 2);
-    }
+/// The same ladder on a double reduce `(8, 128, 8, 128) -> (8, 8)`: GROUPTOP
+/// folds each reduce axis independently.
+#[test_case(&[Opt::grouptop(0, 2)], &[(AxisType::GroupReduce, 1)]; "the first reduce axis")]
+#[test_case(&[Opt::grouptop(0, 32)], &[(AxisType::GroupReduce, 1)]; "the first reduce axis, wide")]
+#[test_case(&[Opt::grouptop(1, 2)], &[(AxisType::GroupReduce, 1)]; "the second reduce axis")]
+#[test_case(&[Opt::grouptop(1, 32)], &[(AxisType::GroupReduce, 1)]; "the second reduce axis, wide")]
+#[test_case(&[Opt::grouptop(0, 2), Opt::grouptop(1, 2)], &[(AxisType::GroupReduce, 2)]; "both reduce axes")]
+#[test_case(&[Opt::grouptop(0, 4), Opt::grouptop(1, 64)], &[(AxisType::GroupReduce, 2)]; "asymmetric factors")]
+#[test_case(&[Opt::grouptop(0, 16), Opt::grouptop(1, 2), Opt::unroll(0, 4)], &[(AxisType::Unroll, 1), (AxisType::GroupReduce, 2), (AxisType::Reduce, 2)]; "GROUPTOP then UNROLL")]
+#[test_case(&[Opt::local(0, 4), Opt::local(1, 4), Opt::grouptop(0, 4), Opt::grouptop(1, 4)], &[(AxisType::Local, 2), (AxisType::GroupReduce, 2)]; "both axes local and grouped")]
+#[test_case(
+    &[Opt::local(0, 2), Opt::local(1, 2), Opt::grouptop(0, 8), Opt::grouptop(1, 4), Opt::upcast(0, 2)],
+    &[(AxisType::Local, 2), (AxisType::GroupReduce, 2), (AxisType::Upcast, 1)];
+    "with an upcast"
+)]
+#[test_case(
+    &[Opt::local(0, 4), Opt::local(1, 4), Opt::grouptop(0, 4), Opt::grouptop(1, 4), Opt::upcast(0, 2), Opt::upcast(0, 2)],
+    &[(AxisType::Local, 2), (AxisType::GroupReduce, 2), (AxisType::Upcast, 2), (AxisType::Global, 0)];
+    "no globals left"
+)]
+// The deep ladders below: `real_axis` remaps a logical axis index onto the
+// physical one after every split, so a renumbering regression only shows up once
+// enough splits have accumulated ahead of the axis an opt names.
+#[test_case(
+    &[Opt::grouptop(0, 2), Opt::grouptop(1, 32), Opt::unroll(2, 4)],
+    &[(AxisType::Global, 2), (AxisType::GroupReduce, 2), (AxisType::Reduce, 2), (AxisType::Unroll, 1)];
+    "UNROLL names an axis both GROUPTOPs pushed along"
+)]
+#[test_case(
+    &[Opt::local(0, 4), Opt::local(1, 4), Opt::grouptop(0, 2), Opt::grouptop(1, 32), Opt::unroll(1, 4)],
+    &[
+        (AxisType::Global, 2),
+        (AxisType::Local, 2),
+        (AxisType::GroupReduce, 2),
+        (AxisType::Reduce, 2),
+        (AxisType::Unroll, 1),
+    ];
+    "two LOCALs and two GROUPTOPs before the UNROLL"
+)]
+#[test_case(
+    &[
+        Opt::local(0, 2),
+        Opt::local(1, 2),
+        Opt::grouptop(0, 8),
+        Opt::grouptop(1, 4),
+        Opt::upcast(0, 2),
+        Opt::unroll(0, 4),
+        Opt::unroll(1, 4),
+    ],
+    &[
+        (AxisType::Global, 2),
+        (AxisType::Local, 2),
+        (AxisType::GroupReduce, 1),
+        (AxisType::Reduce, 2),
+        (AxisType::Upcast, 1),
+        (AxisType::Unroll, 2),
+    ];
+    "the seven-opt ladder folds one group into an unroll"
+)]
+fn double_reduce_handles_each_reduce_axis(opts: &[Opt], expected: &[(AxisType, usize)]) {
+    assert_opts_apply(reduce_over(&[8, 8], &[128, 128], ReduceOp::Add), Renderer::cuda(), opts, expected);
 }
 
-/// `Opt::upcast(_, 0)` (arg=0 = "use full axis size") must reach `shift_to`
-/// for symbolic-end Ranges instead of being pre-rejected with the old
-/// "requires constant axis size" error.
-///
-/// `resolve_full_axis` resolves `vmax+1` via `VminVmaxProperty` on any
-/// Range. Downstream `shift_to` still enforces static divisibility, so
-/// non-divisor-friendly symbolic Ranges fail with `SymbolicDivisionError` —
-/// the correct guard at the correct layer, not a silent drop at the resolver.
+/// Axis counts alone cannot tell a correct renumbering from one that split the
+/// wrong axis by the right factor, so the deepest ladder pins the extents too.
 #[test]
-fn test_full_upcast_no_longer_pre_rejects_symbolic_end() {
-    let const_val = UOp::native_const(1.0f32);
-    let symbolic_end = UOp::variable("b".into(), 1, 4, DType::Int32);
-    let range = UOp::new(
-        svod_ir::Op::Range(ops::Range {
-            end: symbolic_end.clone(),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Global,
-            deps: smallvec::smallvec![],
-        }),
-        symbolic_end.dtype(),
-    );
-    let pattern = UOp::sink(vec![const_val, range]);
+fn the_deep_ladder_splits_the_axes_it_names() {
+    let opts = [
+        Opt::local(0, 2),
+        Opt::local(1, 2),
+        Opt::grouptop(0, 8),
+        Opt::grouptop(1, 4),
+        Opt::upcast(0, 2),
+        Opt::unroll(0, 4),
+        Opt::unroll(1, 4),
+    ];
+    let mut scheduler = Scheduler::new(reduce_over(&[8, 8], &[128, 128], ReduceOp::Add), Renderer::cuda());
+    for opt in &opts {
+        apply_opt(&mut scheduler, opt, true).unwrap_or_else(|error| panic!("{opt} must apply: {error:?}"));
+    }
 
-    let mut sched = Scheduler::new(pattern, Renderer::cpu());
-
-    let result = apply_opt(&mut sched, &Opt::upcast(0, 0), true);
-    let err = result.expect_err("symbolic non-divisor Range should fail at shift_to, not resolve");
-    let err_str = format!("{err:?}");
-    // Old behavior: ValidationFailedSnafu "requires constant axis size".
-    // Post-Fix-A: SymbolicDivisionError from shift_to (resolver succeeded;
-    // the divisibility check downstream is the correct rejection).
-    assert!(err_str.contains("SymbolicDivisionError"), "Expected SymbolicDivisionError from shift_to, got: {err_str}");
-    assert!(
-        !err_str.contains("requires constant axis size"),
-        "resolve_full_axis must no longer pre-reject symbolic Ranges: {err_str}"
-    );
+    assert_eq!(scheduler.full_shape(), vec![2, 4, 2, 2, 2, 2, 16, 32, 4, 4]);
+    assert_eq!(scheduler.applied_opts, opts);
 }
 
-/// `Opt::upcast(_, 0)` on a const-end Range resolves identically to the
-/// prior strict path (`vmax+1 == const_end`).
+/// `Opt::upcast(_, 0)` resolves the full axis size through `vmax`.
 #[test]
-fn test_full_upcast_const_end_unchanged() {
-    let pattern = create_elementwise_pattern(&[8]);
-    let mut sched = Scheduler::new(pattern, Renderer::cpu());
+fn full_axis_upcast_resolves_the_constant_end() {
+    let scheduler = applied(global_sink(&[8]), Renderer::cpu(), &Opt::upcast(0, 0));
 
-    let result = apply_opt(&mut sched, &Opt::upcast(0, 0), true);
-    assert!(result.is_ok(), "arg=0 UPCAST on const Range should succeed: {:?}", result.err());
-
-    assert_axis_count(&sched, AxisType::Upcast, 1);
-    assert_axis_count(&sched, AxisType::Global, 0);
+    assert_eq!(scheduler.full_shape(), vec![8]);
+    assert_eq!(scheduler.axes_of(&[AxisType::Upcast]).len(), 1);
+    assert_eq!(scheduler.axes_of(&[AxisType::Global]).len(), 0);
 }
 
-/// PADTO carries no reduce-op guard: tinygrad #16562 pads with Invalid instead of
-/// restricting the reduce to ADD (`postrange.py` PADTO, `test_padto_max`).
-#[test_case::test_case(ReduceOp::Add; "add")]
-#[test_case::test_case(ReduceOp::Max; "max")]
-#[test_case::test_case(ReduceOp::Mul; "mul")]
-fn test_padto_is_reduce_op_agnostic(reduce_op: ReduceOp) {
-    let pattern = create_reduce_with_globals(&[4, 4, 17], 17, reduce_op);
-    let mut sched = Scheduler::new(pattern, Renderer::cuda());
-    let result = apply_opt(&mut sched, &Opt::padto(2, 32), true);
-    assert!(result.is_ok(), "PADTO must not depend on the reduce op: {:?}", result.err());
+/// A symbolic `Range` end is no longer pre-rejected by the resolver; the
+/// full-axis upcast still fails at `shift_to`.
+#[test]
+fn full_axis_upcast_rejects_a_symbolic_end_at_shift_to() {
+    let range = range_symbolic(UOp::variable("b".into(), 1, 4, DType::Int32), 0);
+    let mut scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1.0f32), range]), Renderer::cpu());
+
+    let error = apply_opt(&mut scheduler, &Opt::upcast(0, 0), true).expect_err("a symbolic non-divisor fails");
+    assert!(matches!(error, OptError::SymbolicDivisionError { .. }), "{error:?}");
+}
+
+/// PADTO carries no reduce-op guard: tinygrad #16562 pads with Invalid instead
+/// of the reduce op's identity.
+#[test_case(ReduceOp::Add; "add")]
+#[test_case(ReduceOp::Max; "max")]
+#[test_case(ReduceOp::Mul; "mul")]
+fn padto_is_reduce_op_agnostic(reduce_op: ReduceOp) {
+    let scheduler = applied(reduce_over(&[4, 4], &[17], reduce_op), Renderer::cuda(), &Opt::padto(2, 32));
+
+    assert_eq!(scheduler.full_shape()[2], 32);
+    assert!(scheduler.applied_opts.contains(&Opt::padto(2, 32)));
+}
+
+/// PADTO's two rejections, each reported rather than raised: a symbolic axis has
+/// no constant extent to round up, and a zero alignment has no rounding at all.
+/// PADTO is the one `OptOps` arm whose amount does not pass through
+/// `resolve_full_axis`, so a zero from an author-supplied `opts_to_apply` reaches
+/// `apply_padto` directly and must be turned back there — reaching `div_ceil`
+/// would abort the process over a user-authored opt list.
+#[test_case(|| range_symbolic(UOp::variable("n".into(), 1, 4, DType::Int32), 0), Opt::padto(0, 32), "can only pad constant-sized axes"; "a symbolic axis")]
+#[test_case(|| axis(17, 0, AxisType::Reduce), Opt::padto(0, 0), "alignment must be non-zero"; "a zero alignment")]
+fn padto_reports_its_rejections(range: fn() -> Arc<UOp>, opt: Opt, reason: &str) {
+    let mut scheduler = Scheduler::new(UOp::sink(vec![UOp::native_const(1.0f32), range()]), Renderer::cuda());
+
+    let error = apply_opt(&mut scheduler, &opt, true).expect_err("PADTO must be rejected");
+    assert!(matches!(error, OptError::ValidationFailed { op: "PADTO", reason: got } if got == reason), "{error:?}");
+    assert!(scheduler.applied_opts.is_empty(), "a rejected opt is not recorded");
 }

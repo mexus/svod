@@ -355,6 +355,12 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// 2. Create validity condition: idx < old_size
 /// 3. Add WHERE-Invalid validity to all INDEX ops using this range
 fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Result<(), OptError> {
+    // PADTO is the one opt whose amount does not go through `resolve_full_axis`,
+    // so a zero from an author-supplied `opts_to_apply` would reach `div_ceil`
+    // and abort the process rather than be rejected.
+    if alignment == 0 {
+        return ValidationFailedSnafu { op: "PADTO", reason: "alignment must be non-zero" }.fail();
+    }
     let (end, axis_id, axis_type) = match rng.op() {
         Op::Range(ops::Range { end, axis_id, axis_type, .. }) => (end.clone(), axis_id.clone(), *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),

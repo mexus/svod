@@ -21,6 +21,7 @@ pub mod origin;
 pub mod patterns;
 pub mod pipeline;
 pub mod pipeline_integration;
+pub mod properties;
 pub mod range_load_guards;
 pub mod range_merging;
 pub mod realize_map;

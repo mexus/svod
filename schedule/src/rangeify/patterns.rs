@@ -601,11 +601,13 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         reduce @ Reduce { src, ranges, reduce_op: reduce_op @ (ReduceOp::Add | ReduceOp::Max | ReduceOp::Mul), num_axes } => {
-            assert!(
-                ranges.iter().all(|r| matches!(r.op(), Op::Range(..))),
-                "reduce_unparented: all reduce ranges must be RANGE ops, got: {:?}",
-                ranges.iter().map(|r| r.op().as_ref().to_string()).collect::<Vec<_>>()
-            );
+            // `dead_loop_patterns` folds a trip-1 RANGE to its only value and
+            // `IndexingContext::new_range` never builds one, so a CONST in the range
+            // list is a single point: unparented by construction, scaling by one.
+            // Anything else is a shape this rule has no trip count for.
+            if !ranges.iter().all(|r| matches!(r.op(), Op::Range(..) | Op::Const(..))) {
+                return None;
+            }
             let src_ranges = src.in_scope_ranges();
             let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
 
@@ -621,15 +623,13 @@ pub(crate) fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
 
             match reduce_op {
                 ReduceOp::Add => {
-                    for range in &unparented {
-                        let size = get_range_size(range)?;
+                    for size in unparented.iter().filter_map(get_range_size) {
                         let size_casted = cast_to_dtype(&size, &result.dtype())?;
                         result = result.try_mul(&size_casted).ok()?;
                     }
                 }
                 ReduceOp::Mul => {
-                    for range in &unparented {
-                        let size = get_range_size(range)?;
+                    for size in unparented.iter().filter_map(get_range_size) {
                         let size_casted = cast_to_dtype(&size, &result.dtype())?;
                         result = result.try_pow(&size_casted).ok()?;
                     }
@@ -1393,25 +1393,26 @@ fn try_reduce_collapse(
     // NE: idx != r with zero in true_val, expression in false_val
     // EQ: idx == r with expression in true_val, zero in false_val
     // Also handles .or_casted(): unwraps CAST around the range operand.
-    {
-        let (idx, cmp_range, expr) = match cond.op() {
-            // NE: where(idx != range_side, 0, expr).
-            Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
-                Some((idx, ne_range, false_val))
+    //
+    // A shape that is not NE/EQ over this range must FALL THROUGH to Pattern 4:
+    // an `And` condition is exactly what the two-sided rule below is written for.
+    if let Some((idx, cmp_range, expr)) = match cond.op() {
+        // NE: where(idx != range_side, 0, expr).
+        Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
+            Some((idx, ne_range, false_val))
+        }
+        // EQ: where(idx == range_side, expr, 0) — Svod-specific
+        Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
+            if no_range(lhs) {
+                Some((lhs, rhs, true_val))
+            } else if no_range(rhs) {
+                Some((rhs, lhs, true_val))
+            } else {
+                None
             }
-            // EQ: where(idx == range_side, expr, 0) — Svod-specific
-            Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
-                if no_range(lhs) {
-                    Some((lhs, rhs, true_val))
-                } else if no_range(rhs) {
-                    Some((rhs, lhs, true_val))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }?;
-
+        }
+        _ => None,
+    } {
         let actual_range = if let Op::Cast(ops::Cast { src, .. }) = cmp_range.op() { src } else { cmp_range };
         if Arc::ptr_eq(actual_range, range) {
             return gated_collapse_core(idx, range, end, expr);

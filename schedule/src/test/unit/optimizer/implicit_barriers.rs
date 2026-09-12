@@ -1,170 +1,210 @@
 //! White-box tests over `crate::optimizer::implicit_barriers`: RAW/WAR barrier
-//! inference and its interaction with renderer-supplied rewrite capabilities.
+//! inference and the buffer-aliasing walk that decides which accesses meet.
 
-use crate::optimizer::early_decomposition_patterns;
-use crate::optimizer::implicit_barriers::add_implicit_barriers;
-use smallvec::{SmallVec, smallvec};
 use std::sync::Arc;
-use svod_dtype::{AddrSpace, DType};
-use svod_ir::ops;
-use svod_ir::rewrite::graph_rewrite;
-use svod_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ParamArg, RendererOps, UOp};
 
+use smallvec::smallvec;
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{AxisType, Op, UOp, ops};
+use test_case::test_case;
+
+use crate::optimizer::implicit_barriers::add_implicit_barriers;
+use crate::test::support::prelude::*;
+
+/// A rank-1 buffer in `addrspace`; only global storage carries a device.
 fn buffer(slot: usize, addrspace: AddrSpace) -> Arc<UOp> {
-    UOp::new(
-        Op::Param(ops::Param {
-            shape: svod_ir::shape::shape_to_uop(&smallvec::smallvec![8usize.into()]),
-            arg: ParamArg::buffer(slot, DType::Float32, addrspace, None).into(),
-        }),
-        DType::Float32,
-    )
+    let device = (addrspace == AddrSpace::Global).then_some(DeviceSpec::Cpu);
+    UOp::buffer(slot, 8, DType::Float32, addrspace, device)
 }
 
-fn index(buffer: Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
-    UOp::index().buffer(buffer).indices(vec![offset]).call().unwrap()
-}
-
-fn rewrite(root: Arc<UOp>) -> Arc<UOp> {
-    add_implicit_barriers(root)
-}
-
-#[test]
-fn renderer_extra_matcher_local_dependency_precedes_barrier_inference() {
-    let extra = crate::patterns! {
-        Noop => {
-            let local = buffer(0, AddrSpace::Local);
-            let store = index(local.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
-            Some(local.after(smallvec![store]))
-        },
+/// `INDEX(wrapper(memory), offset)` — built directly so a non-buffer wrapper can
+/// stand in for the buffer the aliasing walk must see through.
+fn wrapped_index(kind: usize, memory: Arc<UOp>, offset: Arc<UOp>) -> Arc<UOp> {
+    let wrapped = match kind {
+        0 => memory,
+        1 => memory.cast(DType::Float16),
+        2 => UOp::new(Op::Reshape(ops::Reshape { src: memory, new_shape: UOp::index_const(1) }), DType::Float32),
+        3 => memory.after(smallvec![]),
+        4 => memory.mselect(0),
+        5 => UOp::new(Op::BitCast(ops::BitCast { src: memory, dtype: DType::Float16 }), DType::Float16),
+        6 => UOp::mstack(smallvec![memory.clone(), memory]),
+        other => panic!("unknown wrapper {other}"),
     };
-    let renderer = crate::optimizer::Renderer::cpu().with_rewrite_capabilities(RendererOps::all(), None, Some(extra));
-    let rewritten = graph_rewrite(renderer.extra_matcher().unwrap(), UOp::new(Op::Noop, DType::Void), &mut ());
-    let result = crate::optimizer::finish_final_rewrite(rewritten);
-
-    assert!(
-        matches!(result.op(), Op::After(ops::After { deps, .. })
-        if matches!(deps.as_slice(), [barrier] if matches!(barrier.op(), Op::Barrier(..)))),
-        "{}",
-        result.tree()
-    );
+    UOp::new(Op::Index(ops::Index { buffer: wrapped, indices: smallvec![offset] }), DType::Float32)
 }
 
-#[test]
-fn renderer_supported_ops_control_decomposition() {
-    let x = UOp::const_(DType::UInt64, ConstValue::UInt(1));
-    let key = UOp::const_(DType::UInt64, ConstValue::UInt(2));
-    let threefry = UOp::new(Op::Binary(BinaryOp::Threefry, x, key), DType::UInt64);
+// RAW BARRIERS (AFTER)
 
-    let supported = RendererOps::all();
-    let unchanged = graph_rewrite(&early_decomposition_patterns(&supported), threefry.clone(), &mut ());
-    assert!(matches!(unchanged.op(), Op::Binary(BinaryOp::Threefry, ..)));
+/// A LOCAL `AFTER` whose dependency chain holds an unbarriered store gets a
+/// BARRIER around that store; global memory is not thread-shared.
+#[test_case(AddrSpace::Local, true; "local memory is barriered")]
+#[test_case(AddrSpace::Global, false; "global memory is not thread-shared")]
+fn after_store_barrier_follows_the_addrspace(addrspace: AddrSpace, barriered: bool) {
+    let memory = buffer(0, addrspace);
+    let stored = index_of(memory.clone(), index_const(0)).store(UOp::native_const(1.0f32));
+    let result = add_implicit_barriers(memory.clone().after(smallvec![stored.clone()]));
 
-    let mut unsupported = RendererOps::all();
-    unsupported.binary.remove(&BinaryOp::Threefry);
-    let decomposed = graph_rewrite(&early_decomposition_patterns(&unsupported), threefry, &mut ());
-    assert!(!decomposed.toposort().iter().any(|uop| matches!(uop.op(), Op::Binary(BinaryOp::Threefry, ..))));
-
-    let erf = UOp::native_const(0.5f32).erf().unwrap();
-    let native = graph_rewrite(&early_decomposition_patterns(&supported), erf.clone(), &mut ());
-    assert!(matches!(native.op(), Op::Unary(svod_ir::UnaryOp::Erf, _)));
-
-    unsupported.unary.remove(&svod_ir::UnaryOp::Erf);
-    let decomposed = graph_rewrite(&early_decomposition_patterns(&unsupported), erf, &mut ());
-    assert!(!decomposed.toposort().iter().any(|uop| matches!(uop.op(), Op::Unary(svod_ir::UnaryOp::Erf, _))));
-}
-
-#[test]
-fn local_after_store_gets_raw_barrier() {
-    let local = buffer(0, AddrSpace::Local);
-    let store = index(local.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
-    let result = rewrite(local.after(smallvec![store.clone()]));
-
-    let Op::After(ops::After { passthrough, deps }) = result.op() else { panic!("expected AFTER") };
-    assert!(Arc::ptr_eq(passthrough, &local));
-    assert!(matches!(deps.as_slice(), [barrier]
-        if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps }) if Arc::ptr_eq(src, &store) && deps.is_empty())));
-}
-
-#[test]
-fn global_after_store_does_not_get_barrier() {
-    let global = buffer(0, AddrSpace::Global);
-    let store = index(global.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
-    let result = rewrite(global.after(smallvec![store.clone()]));
-
-    assert!(matches!(result.op(), Op::After(ops::After { deps, .. })
-        if matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &store))));
-}
-
-#[test]
-fn local_store_and_load_get_war_barrier_for_all_loop_axes() {
-    for (slot, axis_type) in [AxisType::Reduce, AxisType::Weak, AxisType::Loop].into_iter().enumerate() {
-        let local = buffer(slot, AddrSpace::Local);
-        let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(slot), axis_type);
-        let load = UOp::load().index(index(local.clone(), range.clone())).call();
-        let store = index(local, range.clone()).store_value(load.clone());
-        let result = rewrite(store.end(smallvec![range.clone()]));
-
-        let Op::End(ops::End { computation, ranges }) = result.op() else { panic!("expected END") };
-        assert!(matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
-            if Arc::ptr_eq(src, &store) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &load))));
-        assert!(matches!(ranges.as_slice(), [closed] if Arc::ptr_eq(closed, &range)));
+    let (passthrough, deps) = expect_after(&result);
+    assert_same!(passthrough, memory);
+    if barriered {
+        assert!(matches!(deps.as_slice(), [barrier]
+            if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps })
+                if Arc::ptr_eq(src, &stored) && deps.is_empty())));
+    } else {
+        assert!(matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &stored)));
     }
 }
 
+/// A LOCAL store of `value` at `offset`, optionally already barriered.
+fn local_store(offset: i64, value: f32, barriered: bool) -> Arc<UOp> {
+    let memory = buffer(0, AddrSpace::Local);
+    let stored = index_of(memory, index_const(offset)).store(UOp::native_const(value));
+    if barriered { stored.barrier(smallvec![]) } else { stored }
+}
+
+/// `barrier_from_sources` takes the first dependency as the BARRIER source and
+/// wraps the rest, whether or not one of them already carries a BARRIER.
+#[test_case(false; "an unbarriered list")]
+#[test_case(true; "a partly barriered list")]
+fn raw_barrier_keeps_every_dependency(barriered: bool) {
+    let memory = buffer(0, AddrSpace::Local);
+    let first = index_of(memory.clone(), index_const(0)).store(UOp::native_const(1.0f32));
+    let second = local_store(1, 2.0, barriered);
+    let result = add_implicit_barriers(memory.after(smallvec![first.clone(), second.clone()]));
+
+    let (_, deps) = expect_after(&result);
+    assert!(matches!(deps.as_slice(), [barrier]
+        if matches!(barrier.op(), Op::Barrier(ops::Barrier { src, deps })
+            if Arc::ptr_eq(src, &first) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &second)))));
+}
+
+/// A dependency list that is already fully barriered is left alone.
+#[test]
+fn existing_barrier_is_not_reinferred() {
+    let explicit = local_store(0, 1.0, true);
+    let result = add_implicit_barriers(buffer(0, AddrSpace::Local).after(smallvec![explicit.clone()]));
+
+    assert!(matches!(result.op(), Op::After(ops::After { deps, .. })
+        if matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &explicit))));
+}
+
+// WAR BARRIERS (END)
+
+/// A LOCAL buffer written and read across at least two iterations of a loop gets
+/// a WAR BARRIER whose source is the store and whose dependency is the load.
+#[test_case(AxisType::Reduce; "reduce loop")]
+#[test_case(AxisType::Weak; "weak loop")]
+#[test_case(AxisType::Loop; "plain loop")]
+fn local_store_and_load_get_a_war_barrier(axis_type: AxisType) {
+    let memory = buffer(0, AddrSpace::Local);
+    let range = range(4, axis_type, 0);
+    let loaded = load(index_of(memory.clone(), range.clone()));
+    let stored = index_of(memory, range.clone()).store(loaded.clone());
+    let result = add_implicit_barriers(stored.end(smallvec![range.clone()]));
+
+    let (computation, ranges) = expect_end(&result);
+    assert!(matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
+        if Arc::ptr_eq(src, &stored) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &loaded))));
+    assert!(matches!(ranges.as_slice(), [closed] if Arc::ptr_eq(closed, &range)));
+}
+
+/// An END whose computation is itself a load participates in WAR detection.
 #[test]
 fn end_computation_load_participates_in_war_detection() {
-    let local = buffer(0, AddrSpace::Local);
-    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Weak);
-    let store = index(local.clone(), range.clone()).store_value(UOp::native_const(1.0f32));
-    let load = UOp::load().index(index(local.after(smallvec![store]), range.clone())).call();
-    let result = rewrite(load.end(smallvec![range]));
+    let memory = buffer(0, AddrSpace::Local);
+    let range = range(4, AxisType::Weak, 0);
+    let stored = index_of(memory.clone(), range.clone()).store(UOp::native_const(1.0f32));
+    let loaded = load(index_of(memory.after(smallvec![stored]), range.clone()));
+    let result = add_implicit_barriers(loaded.end(smallvec![range]));
 
-    assert!(
-        matches!(result.op(), Op::End(ops::End { computation, .. })
+    assert!(matches!(result.op(), Op::End(ops::End { computation, .. })
         if matches!(computation.op(), Op::Barrier(ops::Barrier { src, deps })
-            if matches!(src.op(), Op::Load(..))
-                && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, src)))),
-        "{}",
-        result.tree()
-    );
+            if matches!(src.op(), Op::Load(..)) && matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, src)))));
 }
 
-/// A WAR barrier is only needed for a local buffer read and written across at least
-/// two iterations of the same range.
-#[test_case::test_case(AddrSpace::Local, 0; "range with no second iteration")]
-#[test_case::test_case(AddrSpace::Global, 4; "global memory is not thread-shared")]
+/// A barrier is only needed for a local buffer read and written across at least
+/// two iterations: a single iteration and global memory both stay clean.
+#[test_case(AddrSpace::Local, 1; "a range with a single iteration")]
+#[test_case(AddrSpace::Global, 4; "global memory is not thread-shared")]
 fn no_war_barrier_without_a_local_cross_iteration_hazard(addrspace: AddrSpace, extent: i64) {
     let memory = buffer(0, addrspace);
-    let range = UOp::range_axis(UOp::index_const(extent), AxisId::Renumbered(0), AxisType::Weak);
-    let load = UOp::load().index(index(memory.clone(), range.clone())).call();
-    let store = index(memory, range.clone()).store_value(load);
-    let result = rewrite(store.clone().end(smallvec![range]));
+    let range = range(extent, AxisType::Weak, 0);
+    let loaded = load(index_of(memory.clone(), range.clone()));
+    let stored = index_of(memory, range.clone()).store(loaded);
+    let result = add_implicit_barriers(stored.clone().end(smallvec![range]));
 
-    assert!(matches!(result.op(), Op::End(ops::End { computation, .. }) if Arc::ptr_eq(computation, &store)));
+    let (computation, _) = expect_end(&result);
+    assert_same!(computation, stored);
 }
 
+#[test]
+fn no_war_barrier_for_a_symbolic_loop_of_possibly_zero_extent() {
+    let memory = buffer(0, AddrSpace::Local);
+    let range = range_symbolic(UOp::variable("n".into(), 0, 0, DType::Int32), 0);
+    let loaded = load(index_of(memory.clone(), range.clone()));
+    let stored = index_of(memory, range.clone()).store(loaded);
+    let result = add_implicit_barriers(stored.clone().end(smallvec![range]));
+
+    let (computation, _) = expect_end(&result);
+    assert_same!(computation, stored);
+}
+
+/// A global load does not meet a local store: only the same buffer counts.
 #[test]
 fn unrelated_global_load_does_not_match_local_store() {
     let local = buffer(0, AddrSpace::Local);
     let global = buffer(1, AddrSpace::Global);
-    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Weak);
-    let store = index(local, range.clone()).store_value(UOp::native_const(1.0f32));
-    let load = UOp::load().index(index(global, range.clone())).call();
-    let computation = UOp::sink(vec![store, load]);
-    let result = rewrite(computation.clone().end(smallvec![range]));
+    let range = range(4, AxisType::Weak, 0);
+    let stored = index_of(local, range.clone()).store(UOp::native_const(1.0f32));
+    let loaded = load(index_of(global, range.clone()));
+    let computation = UOp::sink(vec![stored, loaded]);
+    let result = add_implicit_barriers(computation.clone().end(smallvec![range]));
 
-    assert!(
-        matches!(result.op(), Op::End(ops::End { computation: rewritten, .. }) if Arc::ptr_eq(rewritten, &computation))
-    );
+    let (rewritten, _) = expect_end(&result);
+    assert_same!(rewritten, computation);
 }
 
+/// A graph with no local STORE is returned untouched, without a rewrite walk.
 #[test]
-fn existing_barrier_is_not_reinferred() {
-    let local = buffer(0, AddrSpace::Local);
-    let store = index(local.clone(), UOp::index_const(0)).store_value(UOp::native_const(1.0f32));
-    let explicit = store.barrier(SmallVec::new());
-    let result = rewrite(local.after(smallvec![explicit.clone()]));
+fn a_graph_without_a_local_store_is_returned_untouched() {
+    let range = range(4, AxisType::Weak, 0);
+    let root = load(index_of(buffer(0, AddrSpace::Global), range.clone())).end(smallvec![range]);
 
-    assert!(matches!(result.op(), Op::After(ops::After { deps, .. })
-        if matches!(deps.as_slice(), [dep] if Arc::ptr_eq(dep, &explicit))));
+    assert_same!(add_implicit_barriers(root.clone()), root);
+}
+
+/// `access_buffer` follows every aliasing wrapper; a `BITCAST` is deliberately
+/// not one of them.
+#[test_case(0, 0, true; "a bare access on both sides")]
+#[test_case(1, 0, true; "a casted store")]
+#[test_case(0, 1, true; "a casted load")]
+#[test_case(2, 0, true; "a reshaped store")]
+#[test_case(3, 0, true; "an after-wrapped store")]
+#[test_case(4, 4, true; "an mselect access on both sides")]
+#[test_case(6, 6, true; "an mstack access on both sides")]
+#[test_case(5, 5, false; "a bitcast is not an alias the walk follows")]
+fn access_buffer_follows_aliasing_wrappers(store_kind: usize, load_kind: usize, barriered: bool) {
+    let local = buffer(0, AddrSpace::Local);
+    let range = range(4, AxisType::Weak, 0);
+    let loaded = load(wrapped_index(load_kind, local.clone(), range.clone()));
+    let stored = wrapped_index(store_kind, local, range.clone()).store(loaded);
+    let result = add_implicit_barriers(stored.end(smallvec![range]));
+
+    let (computation, _) = expect_end(&result);
+    assert_eq!(matches!(computation.op(), Op::Barrier(..)), barriered, "{}", result.tree());
+}
+
+/// A store in a different buffer's scope does not bar a reduce over another one:
+/// the store does not reference the inner range, so the inner END stays clean.
+#[test]
+fn a_local_store_outside_the_loop_scope_does_not_bar_it() {
+    let local = buffer(0, AddrSpace::Local);
+    let outer = range(4, AxisType::Weak, 0);
+    let inner = range(4, AxisType::Weak, 1);
+    let stored = index_of(local.clone(), outer).store(UOp::native_const(1.0f32));
+    let loaded = load(index_of(local, inner.clone()));
+    let result = add_implicit_barriers(UOp::sink(vec![stored, loaded]).end(smallvec![inner]));
+
+    assert!(matches!(result.op(), Op::End(ops::End { computation, .. })
+        if matches!(computation.op(), Op::Sink(..))));
 }

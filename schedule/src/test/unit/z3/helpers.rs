@@ -1,41 +1,56 @@
-//! Test helpers for Z3 verification tests.
+//! Z3 test helpers.
+//!
+//! `check() == Sat` after asserting an equality only proves it has a solution, while
+//! refuting the negation (`check() == Unsat`) proves it holds for every input: every
+//! rewrite and converter test should use the latter.
 
 use std::sync::Arc;
 
-use svod_ir::UOp;
+use svod_ir::{TypedPatternMatcher, UOp};
+use z3::SatResult;
+use z3::ast::{Bool, Int};
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::symbolic_simple;
+use crate::z3::CounterExample;
 use crate::z3::verify::verify_equivalence;
 
-/// Verify that a pattern simplifies correctly and is semantically equivalent.
-///
-/// This helper:
-/// 1. Applies symbolic simplification to the input
-/// 2. Verifies the result is semantically equivalent using Z3
-/// 3. Returns the simplified expression for further assertions
-pub fn verify_simplifies_to(expr: Arc<UOp>, expected: Arc<UOp>) -> Arc<UOp> {
-    let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
-
-    // Verify semantic equivalence
-    verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
-
-    // Also check structural equality with expected (optional but helpful for debugging)
-    if !Arc::ptr_eq(&simplified, &expected) {
-        // If not pointer-equal, they might still be structurally equivalent
-        // This is okay - Z3 verification is the source of truth
-    }
-
+/// Rewrite `expr` with `matcher` and prove the result equivalent to the input.
+#[track_caller]
+pub fn verify_roundtrip(matcher: &TypedPatternMatcher, expr: Arc<UOp>) -> Arc<UOp> {
+    let simplified = graph_rewrite(matcher, expr.clone(), &mut ());
+    verify_equivalence(&expr, &simplified).expect("the rewrite must preserve semantics");
     simplified
 }
 
-/// Verify that simplification preserves semantics (even if structure changes).
-pub fn verify_preserves_semantics(expr: Arc<UOp>) -> Arc<UOp> {
-    let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+/// Prove `lhs == rhs` for every input, in a fresh solver.
+#[track_caller]
+pub fn assert_valid(lhs: &Int, rhs: &Int) {
+    assert_valid_in(&z3::Solver::new(), lhs, rhs);
+}
 
-    verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
+/// Prove `lhs == rhs` in `solver`, whose asserted constraints are the assumptions.
+#[track_caller]
+pub fn assert_valid_in(solver: &z3::Solver, lhs: &Int, rhs: &Int) {
+    solver.push();
+    solver.assert(lhs.eq(rhs).not());
+    let result = solver.check();
+    solver.pop(1);
+    assert_eq!(result, SatResult::Unsat, "expected {lhs} == {rhs} to hold for every input");
+}
 
-    simplified
+/// Prove `lhs == rhs` for booleans.
+#[track_caller]
+pub fn assert_valid_bool(lhs: &Bool, rhs: &Bool) {
+    let solver = z3::Solver::new();
+    solver.assert(lhs.eq(rhs).not());
+    assert_eq!(solver.check(), SatResult::Unsat, "expected {lhs} == {rhs} to hold for every input");
+}
+
+/// Disprove an equivalence and return the exact failure mode.
+#[track_caller]
+pub fn assert_not_equivalent(lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> CounterExample {
+    match verify_equivalence(lhs, rhs) {
+        Err(error) => error,
+        Ok(()) => panic!("expected a counterexample, but the expressions were proven equivalent"),
+    }
 }

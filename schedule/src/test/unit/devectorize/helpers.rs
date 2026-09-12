@@ -1,127 +1,92 @@
-//! Builders and assertion helpers shared by the devectorizer tests.
-
-use std::sync::Arc;
-
-use smallvec::SmallVec;
-use svod_dtype::{AddrSpace, DType, ScalarDType};
-use svod_ir::types::ConstValue;
-use svod_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
-
-use crate::devectorize::{bool_storage_patterns, devectorize, no_vectorized_alu};
+//! The one fixture surface for the devectorizer and its neighbours: pass entry points, shaped/WMMA builders, and the
+//! toposort assertions they share.
+use crate::devectorize::{bool_storage_patterns, devectorize, devectorize_patterns, no_vectorized_alu};
 use crate::optimizer::Renderer;
 use crate::rewrite::graph_rewrite;
-use svod_ir::ops;
-
-pub fn apply_devectorize(uop: &Arc<UOp>) -> Arc<UOp> {
-    devectorize(uop, &Renderer::cpu())
+use crate::spec::SpecError;
+pub use crate::test::support::prelude::*;
+use smallvec::{SmallVec, smallvec};
+use std::sync::Arc;
+use svod_dtype::{AddrSpace, DType, DeviceSpec};
+use svod_ir::{Op, ParamArg, RendererDevice, SInt, UOp, WmmaMetadata, WmmaUpcastAxes, ops};
+/// A structured codegen PARAM, the form `spec.rs` and the shaped-INDEX rules use. Distinct from the prelude's
+/// `param`, which takes a size instead of an address space and a device.
+pub fn codegen_param(slot: usize, dtype: DType, addrspace: AddrSpace, device: Option<DeviceSpec>) -> Arc<UOp> {
+    let arg = ParamArg::buffer(slot, dtype.clone(), addrspace, device);
+    UOp::new(Op::Param(ops::Param { shape: UOp::stack(SmallVec::new()), arg: arg.into() }), dtype)
 }
-
-/// Bool LOAD/STORE -> uint8 storage only.
+/// A PARAM with no address space: `INDEX` over it is what the devectorizer splits.
+pub fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
+    UOp::param(buffer.id as usize, buffer.buffer_size().unwrap_or(1024), buffer.dtype(), None)
+}
+/// `INDEX(PARAM(buffer), STACK(offsets))` — the shaped address the pass splits.
+pub fn shaped_addr(buffer: &Arc<UOp>, offsets: impl IntoIterator<Item = i64>) -> Arc<UOp> {
+    let lanes: SmallVec<[Arc<UOp>; 4]> = offsets.into_iter().map(index_const).collect();
+    UOp::new(
+        Op::Index(ops::Index { buffer: buffer_to_define(buffer), indices: smallvec![UOp::stack(lanes)] }),
+        DType::Scalar(buffer.dtype().base()),
+    )
+}
+pub fn iota_addr(buffer: &Arc<UOp>, count: usize) -> Arc<UOp> {
+    shaped_addr(buffer, 0..count as i64)
+}
+/// A `count`-lane Float32 STACK reshaped to `shape`; `tag` keeps operands distinct.
+pub fn shaped_f32(tag: &str, count: usize, shape: &[usize]) -> Arc<UOp> {
+    let values = UOp::stack((0..count).map(|i| UOp::var(format!("{tag}_{i}"), DType::Float32, -100, 100)).collect());
+    values.try_reshape(&shape.iter().copied().map(SInt::Const).collect()).expect("reshape shape must match the source")
+}
+/// `RESHAPE(src, shape)`.
+pub fn reshape_to(src: &Arc<UOp>, shape: &[usize]) -> Arc<UOp> {
+    src.try_reshape(&shape.iter().copied().map(SInt::Const).collect()).expect("reshape shape must match the source")
+}
+/// `16x16x16` Float32 CPU WMMA metadata.
+pub fn wmma_metadata(name: &str, upcast_axes: Option<WmmaUpcastAxes>) -> WmmaMetadata {
+    WmmaMetadata {
+        name: name.into(),
+        dims: (16, 16, 16),
+        dtype_in: DType::Float32,
+        dtype_out: DType::Float32,
+        device: RendererDevice::Cpu,
+        threads: 32,
+        upcast_axes,
+        reduce_axes: vec![],
+    }
+}
+/// A WMMA with the `[6]`-lane test operand on both inputs.
+pub fn wmma_default(c: Arc<UOp>) -> Arc<UOp> {
+    let operand = shaped_f32("operand", 6, &[6]);
+    UOp::wmma(operand.clone(), operand, c, wmma_metadata("test", None))
+}
+/// `Bool` LOAD/STORE -> uint8 storage, BitCast(Bool) -> CAST.
 pub fn apply_bool_storage(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite(bool_storage_patterns(), uop.clone(), &mut ())
 }
-
+pub fn apply_devectorize(uop: &Arc<UOp>) -> Arc<UOp> {
+    devectorize(uop, &Renderer::cpu())
+}
+pub fn apply_devectorize_patterns(uop: Arc<UOp>) -> Arc<UOp> {
+    graph_rewrite(devectorize_patterns(), uop, &mut ())
+}
 pub fn apply_no_vectorized_alu(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite(no_vectorized_alu(), uop.clone(), &mut ())
 }
-
 /// REDUCE -> accumulator (`reduce_to_acc`).
 pub fn apply_pm_reduce(uop: &Arc<UOp>) -> Arc<UOp> {
-    use crate::devectorize::{ReduceContext, pm_reduce};
-    let mut ctx = ReduceContext::default();
-    graph_rewrite(&pm_reduce(), uop.clone(), &mut ctx)
+    graph_rewrite(&crate::devectorize::pm_reduce(), uop.clone(), &mut crate::devectorize::ReduceContext::default())
 }
-
-pub fn create_buffer(size: usize) -> Arc<UOp> {
-    create_buffer_typed(size, ScalarDType::Float32)
+pub fn apply_gater(root: &Arc<UOp>) -> Arc<UOp> {
+    graph_rewrite(&crate::late::pm_move_gates_from_index(), root.clone(), &mut ())
 }
-
-pub fn create_buffer_typed(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, DType::Scalar(scalar))
+pub fn apply_final_rewrite(root: Arc<UOp>) -> Arc<UOp> {
+    graph_rewrite(crate::optimizer::final_rewrite_patterns(), root, &mut ())
 }
-
-pub fn create_bool_buffer(size: usize) -> Arc<UOp> {
-    create_buffer_typed(size, ScalarDType::Bool)
+pub fn apply_spec_program(root: &Arc<UOp>) -> Result<(), SpecError> {
+    crate::spec::type_verify(root, &crate::spec::spec_program())
 }
-
-/// `INDEX(buffer, [idx])` with a scalar index.
-pub fn create_index(buffer: Arc<UOp>, idx: i64) -> Arc<UOp> {
-    let idx_uop = UOp::const_(DType::Index, ConstValue::Int(idx));
-    UOp::index().buffer(buffer).indices(vec![idx_uop]).call().unwrap()
+pub fn assert_no_invalid(root: &Arc<UOp>) {
+    assert!(!root.toposort().iter().any(UOp::is_invalid_marker), "unexpected Invalid marker:\n{}", root.tree());
 }
-
-/// Convert a BUFFER to a codegen PARAM. In production this happens during kernel
-/// splitting; the shaped-INDEX rules only fire on PARAM.
-pub fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let size = buffer.buffer_size().unwrap_or(1024);
-    UOp::param(id, size, buffer.dtype(), None)
-}
-
-/// `INDEX(PARAM, STACK(offsets))` — the shaped memory address the devectorizer splits.
-pub fn create_vector_index(buffer: Arc<UOp>, offsets: impl IntoIterator<Item = i64>) -> Arc<UOp> {
-    let indices: SmallVec<[Arc<UOp>; 4]> =
-        offsets.into_iter().map(|offset| UOp::const_(DType::Index, ConstValue::Int(offset))).collect();
-    let idx_dtype = buffer.dtype().base();
-    let define = buffer_to_define(&buffer);
-    UOp::new(
-        Op::Index(ops::Index { buffer: define, indices: smallvec::smallvec![UOp::stack(indices)] }),
-        DType::Scalar(idx_dtype),
-    )
-}
-
-pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
-    create_vector_index(buffer, 0..count as i64)
-}
-
-pub fn create_load(index: Arc<UOp>) -> Arc<UOp> {
-    UOp::load().index(index).call()
-}
-
-pub fn create_store(index: Arc<UOp>, value: Arc<UOp>) -> Arc<UOp> {
-    index.store(value)
-}
-
-pub fn create_float_const(value: f64) -> Arc<UOp> {
-    UOp::const_(DType::Float32, ConstValue::Float(value))
-}
-
-pub fn create_bool_const(value: bool) -> Arc<UOp> {
-    UOp::const_(DType::Bool, ConstValue::Bool(value))
-}
-
-pub fn create_vector_float_iota(count: usize) -> Arc<UOp> {
-    create_vector_float_values((0..count).map(|i| i as f64).collect())
-}
-
-pub fn create_vector_float_values(values: Vec<f64>) -> Arc<UOp> {
-    UOp::stack(values.into_iter().map(|v| UOp::const_(DType::Float32, ConstValue::Float(v))).collect())
-}
-
-pub fn create_vector_bool(values: Vec<bool>) -> Arc<UOp> {
-    UOp::stack(values.into_iter().map(|v| UOp::const_(DType::Bool, ConstValue::Bool(v))).collect())
-}
-
-pub fn create_reduce(src: Arc<UOp>, ranges: Vec<Arc<UOp>>, reduce_op: ReduceOp) -> Arc<UOp> {
-    src.reduce(ranges.into_iter().collect(), reduce_op)
-}
-
-/// Parallel axes carry `Index`; sequential ones carry `WeakInt`, as the schedulers build them.
-pub fn create_range(end: i64, axis_id: usize, axis_type: AxisType) -> Arc<UOp> {
-    let dtype = match axis_type {
-        AxisType::Global | AxisType::Local => DType::Index,
-        _ => DType::WeakInt,
-    };
-    UOp::range_axis(UOp::const_(dtype, ConstValue::Int(end)), AxisId::Renumbered(axis_id), axis_type)
-}
-
-pub fn create_range_reduce(end: i64, axis_id: usize) -> Arc<UOp> {
-    create_range(end, axis_id, AxisType::Reduce)
-}
-
-/// The number of scalar elements `uop` carries: from its shape when it has one,
-/// from its mechanical vector width otherwise.
+/// The scalar count `uop` carries: its shape product, else its mechanical vector width.
 pub fn assert_vcount(uop: &Arc<UOp>, expected: usize) {
     let count = uop
         .shape()
@@ -131,34 +96,15 @@ pub fn assert_vcount(uop: &Arc<UOp>, expected: usize) {
         .unwrap_or_else(|| uop.dtype().vcount());
     assert_eq!(count, expected, "element count mismatch: expected {expected}, got {count}");
 }
-
-pub fn assert_is_load(uop: &Arc<UOp>) {
-    assert!(matches!(uop.op(), Op::Load(..)), "Expected LOAD, got {:?}", uop.op());
+pub fn loads(uop: &Arc<UOp>) -> usize {
+    count(uop, |node| matches!(node.op(), Op::Load(..)))
 }
-
-pub fn assert_is_index(uop: &Arc<UOp>) {
-    assert!(matches!(uop.op(), Op::Index(..)), "Expected INDEX, got {:?}", uop.op());
+pub fn stores(uop: &Arc<UOp>) -> usize {
+    count(uop, |node| matches!(node.op(), Op::Store(..)))
 }
-
-pub fn count_ops<F>(uop: &Arc<UOp>, predicate: F) -> usize
-where
-    F: Fn(&Arc<UOp>) -> bool,
-{
-    uop.toposort().iter().filter(|node| predicate(node)).count()
+pub fn ends(uop: &Arc<UOp>) -> usize {
+    count(uop, |node| matches!(node.op(), Op::End(..)))
 }
-
-pub fn count_loads(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Load(..)))
-}
-
-pub fn count_stores(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Store(..)))
-}
-
-pub fn count_define_regs(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(AddrSpace::Reg)))
-}
-
-pub fn count_ends(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |u| matches!(u.op(), Op::End(..)))
+pub fn regs(uop: &Arc<UOp>) -> usize {
+    count(uop, |node| matches!(node.op(), Op::Buffer(ops::Buffer { arg, .. }) if arg.addrspace == Some(AddrSpace::Reg)))
 }

@@ -1,7 +1,6 @@
-//! Multi-oracle property tests combining known properties, dtype-invariance, and Z3 verification.
-//!
-//! This module implements the most comprehensive testing strategy by using multiple
-//! independent oracles to verify optimization correctness.
+//! Z3-backed oracles (`--features z3`): a formal equivalence check for the rewrites the
+//! structural and algebraic properties only sample. Timeouts and conversion failures are
+//! not counterexamples, but `Found` never is.
 
 use std::sync::Arc;
 
@@ -11,267 +10,167 @@ use svod_dtype::DType;
 use svod_ir::UOp;
 use svod_ir::types::ConstValue;
 
-use crate::rewrite::graph_rewrite;
-use crate::symbolic::symbolic_simple;
-use crate::z3::verify_equivalence;
+use crate::symbolic::symbolic;
+use crate::test::property::checks::{same_value, shape};
+use crate::test::support::prelude::*;
+use crate::z3::{CounterExample, verify_equivalence};
 
-// Import generators from ir crate
 use svod_ir::test::property::generators::*;
 
-// ============================================================================
-// Multi-Oracle Testing
-// ============================================================================
+/// Whether Z3 *proved* the rewrite equivalent. An unsupported operation or a timeout is
+/// not a failure — the converter does not model the whole IR — but a counterexample is,
+/// and it fails here rather than being folded into the verdict.
+fn z3_proves_equivalent(original: &Arc<UOp>, rewritten: &Arc<UOp>) -> Result<bool, TestCaseError> {
+    match verify_equivalence(original, rewritten) {
+        Ok(()) => Ok(true),
+        Err(CounterExample::ConversionFailed { .. } | CounterExample::Timeout) => Ok(false),
+        Err(CounterExample::Found { .. }) => Err(TestCaseError::fail(format!(
+            "Z3 found a counterexample:\noriginal:  {}\nrewritten: {}",
+            original.tree(),
+            rewritten.tree()
+        ))),
+    }
+}
+
+/// [`z3_proves_equivalent`], discarding the verdict: a proof is welcome, a declined one is
+/// tolerated, a counterexample fails.
+fn assert_z3_equivalent(original: &Arc<UOp>, rewritten: &Arc<UOp>) -> Result<(), TestCaseError> {
+    z3_proves_equivalent(original, rewritten).map(drop)
+}
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
+    // The Z3 oracles are slow per case but each one is a formal proof; these are the
+    // budgets they were written with, which `cheap()` had cut by half.
+    #![proptest_config(proptest_config(500))]
 
-    /// Test optimization with all three oracles:
-    /// 1. Known property (algebraic identity)
-    /// 2. DType invariance (test across widened types)
-    /// 3. Z3 verification (formal proof)
+    /// Every known-property graph must reduce to the known answer — in value, so that
+    /// an equivalent-but-unfolded form is reported as a missed fold and not as a wrong
+    /// answer — and Z3 must prove the rewrite equivalent. Z3 sees the graph rebuilt at
+    /// Int32: at UInt8 the IR's `x - x` is `x + x*255`, which wraps and looks like a
+    /// counterexample to an unbounded solver.
     #[test]
-    fn multi_oracle_known_property(kpg in arb_known_property_graph()) {
+    fn known_property_graphs_reduce_to_their_expected_value(kpg in arb_known_property_graph()) {
         let graph = kpg.build();
-        let matcher = symbolic_simple();
-
-        // Oracle 1: Known property - verify expected simplification (if it happens)
-        let simplified = graph_rewrite(&matcher, graph.clone(), &mut ());
-
-        // Note: Not all patterns are implemented, so we don't require simplification
-        // We just verify that IF simplification occurs, it's correct
+        let simplified = rewrite(symbolic(), graph.clone());
         if let Some(expected) = kpg.expected_result() {
-            // Only assert if actually simplified (not just returned original)
-            if !Arc::ptr_eq(&simplified, &graph) {
-                // If it simplified to something, it should match expected OR be semantically equivalent
-                // (we don't require exact pointer equality as different equivalent forms are ok)
-                let is_expected = Arc::ptr_eq(&simplified, &expected);
-
-                // Check for zero constant (Int(0) or UInt(0) both represent zero)
-                let is_zero = |cv: &ConstValue| matches!(cv, ConstValue::Int(0) | ConstValue::UInt(0));
-                let is_constant_zero = matches!(simplified.op(), svod_ir::Op::Const(cv) if is_zero(&cv.0))
-                    && matches!(expected.op(), svod_ir::Op::Const(cv) if is_zero(&cv.0));
-
-                prop_assert!(is_expected || is_constant_zero,
-                    "Simplified result should match expected. Got: {:?}, Expected: {:?}",
-                    simplified.op(), expected.op());
-            }
+            same_value(&graph, &expected)?;
+            same_value(&simplified, &expected)?;
         }
-
-        // Oracle 2: DType invariance - widen types and verify
-        // (Skip for now as it requires more complex graph transformation)
-
-        // Oracle 3: Z3 verification - prove equivalence
-        let result = verify_equivalence(&graph, &simplified);
-        match result {
-            Ok(()) => {}, // Verification succeeded
-            Err(e) => {
-                // Only fail on counterexamples, not on conversion failures
-                // (some operations may not be supported by Z3 converter yet)
-                if matches!(e, crate::z3::CounterExample::Found { .. }) {
-                    prop_assert!(false, "Z3 found counterexample: {}", e);
-                }
-            }
-        }
+        let (signed, _) = known_property_at(&kpg, DType::Int32);
+        let signed_rewritten = rewrite(symbolic(), signed.clone());
+        same_value(&signed, &signed_rewritten)?;
+        assert_z3_equivalent(&signed, &signed_rewritten)?;
     }
 
-    /// Test that identity eliminations are Z3-verified
+    /// The identity elimination `x + 0 = x` is pointer-identical and Z3-proven.
     #[test]
     fn z3_verify_identity_add_zero(x in arb_var_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = UOp::new(
-            svod_ir::Op::Binary(svod_ir::types::BinaryOp::Add, Arc::clone(&x), zero),
-            DType::Int32,
-        );
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
-
-        // Should simplify to x
+        let expr = x.try_add(&zero).expect("ADD accepts matching dtypes");
+        let simplified = rewrite(Matchers::simple(), expr.clone());
         prop_assert!(Arc::ptr_eq(&simplified, &x));
-
-        // Z3 should verify equivalence
-        verify_equivalence(&expr, &simplified)
-            .expect("Z3 should verify x + 0 = x");
+        verify_equivalence(&expr, &simplified).expect("Z3 should verify x + 0 = x");
     }
 
-    /// Test that zero propagation is Z3-verified
+    /// Zero propagation `x * 0 = 0` is pointer-identical and Z3-proven.
     #[test]
     fn z3_verify_zero_mul(x in arb_var_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = x.try_mul(&zero).unwrap();
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
-
-        // Should simplify to 0
+        let expr = x.try_mul(&zero).expect("MUL accepts matching dtypes");
+        let simplified = rewrite(Matchers::simple(), expr.clone());
         prop_assert!(Arc::ptr_eq(&simplified, &zero));
-
-        // Z3 should verify equivalence
-        verify_equivalence(&expr, &simplified)
-            .expect("Z3 should verify x * 0 = 0");
+        verify_equivalence(&expr, &simplified).expect("Z3 should verify x * 0 = 0");
     }
 
-    /// Test that self-division is Z3-verified (for x ≠ 0)
+    /// Self-division is `1` whenever the declared range excludes zero, and Z3 proves
+    /// the rule is sound.
     #[test]
     fn z3_verify_self_div(name in "[a-z]", min_val in 1i64..100, range_size in 1i64..100) {
-        // Create variable with min_val >= 1 to avoid division by zero
         let x = UOp::var(&name, DType::Int32, min_val, min_val + range_size);
-
-        let expr = UOp::new(
-            svod_ir::Op::Binary(svod_ir::types::BinaryOp::FloorDiv, Arc::clone(&x), Arc::clone(&x)),
-            DType::Int32,
-        );
-
-        let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
-
-        // Should simplify to 1
-        match simplified.op() {
-            svod_ir::Op::Const(cv) => {
-                prop_assert_eq!(cv.0, ConstValue::Int(1));
-            }
-            _ => prop_assert!(false, "x / x should simplify to 1"),
-        }
-
-        // Z3 should verify equivalence
-        verify_equivalence(&expr, &simplified)
-            .expect("Z3 should verify x / x = 1 for x ≠ 0");
+        let expr = x.try_div(&x).expect("a nonzero variable is a legal divisor");
+        let simplified = rewrite(Matchers::simple(), expr.clone());
+        assert_const!(simplified, 1);
+        verify_equivalence(&expr, &simplified).expect("Z3 should verify x / x = 1 for x != 0");
     }
 
-    /// Test arithmetic trees with Z3 verification.
-    ///
-    /// Uses bounded constants to avoid overflow mismatches between
-    /// Z3's unbounded integers and our IR's wrapping semantics.
+    /// Z3 over whole arithmetic trees, where the structural properties cannot
+    /// enumerate the input space. Bounded constants keep Z3's unbounded integers
+    /// inside the IR's wrapping semantics.
     #[test]
     fn z3_verify_arithmetic_optimization(graph in arb_arithmetic_tree_bounded_up_to(DType::Int32, 3)) {
-        let matcher = symbolic_simple();
-        let optimized = graph_rewrite(&matcher, graph.clone(), &mut ());
-
-        // Z3 should verify equivalence
-        let result = verify_equivalence(&graph, &optimized);
-
-        match result {
-            Ok(()) => {}, // Verification succeeded
-            Err(e) => {
-                match e {
-                    crate::z3::CounterExample::Found { .. } => {
-                        prop_assert!(false, "Z3 found counterexample: {}", e);
-                    }
-                    crate::z3::CounterExample::ConversionFailed { .. } => {
-                        // Some operations may not be supported yet - skip
-                    }
-                    crate::z3::CounterExample::Timeout => {
-                        // Timeout is acceptable for complex expressions
-                    }
-                }
-            }
-        }
+        let optimized = rewrite(Matchers::simple(), graph.clone());
+        assert_z3_equivalent(&graph, &optimized)?;
     }
-}
 
-// ============================================================================
-// DType Widening Oracle
-// ============================================================================
+}
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(300))]
+    #![proptest_config(proptest_config(300))]
 
-    /// Test that optimization is sound across dtype widening.
+    /// The dtype-widening oracle: a rewrite that fires at the narrowest member of a
+    /// family must fire identically at the widest, and both must be Z3-provable.
     ///
-    /// If we widen all dtypes (Int32 -> Int64), the optimization should
-    /// produce equivalent results.
+    /// Pointer equality with the expected form is claimed only for the rules with a unique
+    /// form and a non-float family: `x - x` is narrowed through CASTs the term combiner does
+    /// not see through at the widest member, and `x + 0.0` is deliberately *not* the identity
+    /// under IEEE 754.
     #[test]
-    fn dtype_widening_preserves_optimization(
-        kpg in arb_known_property_graph(),
-        family in arb_dtype_family(),
-    ) {
-        let narrowest = family.narrowest();
-        let widest = family.widest();
-
-        // Build graph with narrowest dtype
-        let narrow_graph = rebuild_with_dtype(&kpg, narrowest.clone());
-        let wide_graph = rebuild_with_dtype(&kpg, widest.clone());
-
-        let matcher = symbolic_simple();
-
-        // Optimize both
-        let narrow_opt = graph_rewrite(&matcher, narrow_graph.clone(), &mut ());
-        let wide_opt = graph_rewrite(&matcher, wide_graph.clone(), &mut ());
-
-        // Both should have same structure (just different dtypes)
-        // We verify this by checking if they simplify to the same form
-        let narrow_simplified_form = optimization_form(&narrow_opt);
-        let wide_simplified_form = optimization_form(&wide_opt);
-
-        prop_assert_eq!(narrow_simplified_form, wide_simplified_form,
-            "Optimization should preserve form across dtype widening");
-
-        // If Z3 can verify the narrow version, it should verify the wide version
-        let narrow_result = verify_equivalence(&narrow_graph, &narrow_opt);
-        let wide_result = verify_equivalence(&wide_graph, &wide_opt);
-
-        match (narrow_result, wide_result) {
-            (Ok(()), Ok(())) => {}, // Both verified
-            (Ok(()), Err(e)) => {
-                prop_assert!(false,
-                    "Narrow dtype verified but wide dtype failed: {}", e);
-            }
-            (Err(_), Ok(())) => {}, // Narrow failed but wide succeeded (acceptable)
-            (Err(_), Err(_)) => {}, // Both failed (acceptable if conversion issues)
+    fn dtype_widening_keeps_the_rewrite_and_its_proof(kpg in arb_known_property_graph(), family in arb_dtype_family()) {
+        let (narrow, narrow_expected) = known_property_at(&kpg, family.narrowest());
+        let (wide, wide_expected) = known_property_at(&kpg, family.widest());
+        let (narrow_rewritten, wide_rewritten) = (rewrite(symbolic(), narrow.clone()), rewrite(symbolic(), wide.clone()));
+        same_value(&narrow, &narrow_rewritten)?;
+        same_value(&wide, &wide_rewritten)?;
+        if matches!(family, DTypeFamily::SignedInt) {
+            // Only the signed family has an exact unbounded-integer encoding. Beyond "no
+            // counterexample either way", the two verdicts are related: the narrow and the
+            // wide member differ only in a dtype the converter does not even encode, so a
+            // proof at the narrow width that the wide one cannot reproduce — a conversion
+            // failure included — means the rewrite itself changed shape with the width.
+            let narrow_proven = z3_proves_equivalent(&narrow, &narrow_rewritten)?;
+            let wide_proven = z3_proves_equivalent(&wide, &wide_rewritten)?;
+            prop_assert!(
+                !narrow_proven || wide_proven,
+                "{:?} verified at {:?} but not at {:?}\nnarrow: {}\nwide:   {}",
+                kpg,
+                family.narrowest(),
+                family.widest(),
+                narrow_rewritten.tree(),
+                wide_rewritten.tree()
+            );
+        }
+        // The structural shape of a rewriting *result*, ignoring the dtype that distinguishes a
+        // family's members.
+        fn bare(uop: &Arc<UOp>) -> Vec<(svod_ir::op::OpMask, Vec<usize>)> {
+            shape(uop, |_| ()).into_iter().map(|(mask, (), children)| (mask, children)).collect()
+        }
+        if !matches!(family, DTypeFamily::Float) {
+            let (Some(narrow_expected), Some(wide_expected)) = (narrow_expected, wide_expected) else { return Ok(()) };
+            prop_assert_eq!(bare(&narrow_rewritten), bare(&narrow_expected), "narrow");
+            prop_assert_eq!(bare(&wide_rewritten), bare(&wide_expected), "wide");
         }
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Rebuild a known property graph with a different dtype.
-fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Arc<UOp> {
-    match kpg {
-        KnownPropertyGraph::AddZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            let zero = UOp::native_const(0i64);
-            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Add, x, zero), dtype)
+/// `kpg` rebuilt at `dtype`, preserving the operation the generator chose, together with
+/// the structural shape of the form it must reduce to (`None` when there is no unique form).
+fn known_property_at(kpg: &KnownPropertyGraph, dtype: DType) -> (Arc<UOp>, Option<Arc<UOp>>) {
+    let x = UOp::var("x", dtype.clone(), 0, 100);
+    let constant = |value: i64| UOp::const_(dtype.clone(), ConstValue::Int(value));
+    let expected = match kpg {
+        KnownPropertyGraph::AddZero { .. } | KnownPropertyGraph::MulOne { .. } | KnownPropertyGraph::SubZero { .. } => {
+            Some(x.clone())
         }
-        KnownPropertyGraph::MulOne { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            let one = UOp::native_const(1i64);
-            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Mul, x, one), dtype)
-        }
-        KnownPropertyGraph::SubZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            let zero = UOp::native_const(0i64);
-            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Sub, x, zero), dtype)
-        }
-        KnownPropertyGraph::MulZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            let zero = UOp::native_const(0i64);
-            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Mul, x, zero), dtype)
-        }
-        KnownPropertyGraph::SubSelf { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Sub, Arc::clone(&x), x), dtype)
-        }
-        KnownPropertyGraph::AddSelf { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            UOp::new(svod_ir::Op::Binary(svod_ir::types::BinaryOp::Add, Arc::clone(&x), x), dtype)
-        }
-    }
-}
-
-/// Get a simplified form descriptor for comparing optimization results.
-///
-/// Returns: (op_type, is_const, is_var, child_count)
-fn optimization_form(uop: &Arc<UOp>) -> (String, bool, bool, usize) {
-    use svod_ir::Op;
-
-    match uop.op() {
-        Op::Const(_) => ("const".to_string(), true, false, 0),
-        Op::DefineVar(..) => ("var".to_string(), false, true, 0),
-        Op::Unary(op, _) => (format!("unary_{:?}", op), false, false, 1),
-        Op::Binary(op, _, _) => (format!("binary_{:?}", op), false, false, 2),
-        Op::Ternary(op, _, _, _) => (format!("ternary_{:?}", op), false, false, 3),
-        _ => ("other".to_string(), false, false, 0),
-    }
+        KnownPropertyGraph::MulZero { .. } => Some(UOp::const_(dtype.clone(), ConstValue::Int(0))),
+        KnownPropertyGraph::SubSelf { .. } | KnownPropertyGraph::AddSelf { .. } => None,
+    };
+    let graph = match kpg {
+        KnownPropertyGraph::AddZero { .. } => x.try_add(&constant(0)).expect("ADD"),
+        KnownPropertyGraph::MulOne { .. } => x.try_mul(&constant(1)).expect("MUL"),
+        KnownPropertyGraph::SubZero { .. } => x.try_sub(&constant(0)).expect("SUB"),
+        KnownPropertyGraph::MulZero { .. } => x.try_mul(&constant(0)).expect("MUL"),
+        KnownPropertyGraph::SubSelf { .. } => x.try_sub(&x).expect("SUB"),
+        KnownPropertyGraph::AddSelf { .. } => x.try_add(&x).expect("ADD"),
+    };
+    (graph, expected)
 }

@@ -1,38 +1,82 @@
 use super::*;
+use std::sync::Arc;
 use svod_dtype::DType;
-use svod_ir::types::ConstValue;
 use test_case::test_case;
 
-fn loop_end(value: Arc<UOp>, ranges: &[Arc<UOp>]) -> Arc<UOp> {
-    value.end(ranges.iter().cloned().collect())
+use crate::test::support::prelude::*;
+
+/// `value` inside a loop that closes `ranges`.
+fn loop_(value: Arc<UOp>, ranges: impl IntoIterator<Item = Arc<UOp>>) -> Arc<UOp> {
+    value.end(ranges.into_iter().collect())
 }
 
-fn float(value: f32) -> Arc<UOp> {
-    UOp::const_(DType::Float32, ConstValue::Float(value as f64))
+/// A loop body that carries no computation, so only the closed range matters.
+fn counted(range: &Arc<UOp>) -> Arc<UOp> {
+    loop_(UOp::native_const(1.0f32), [range.clone()])
 }
 
 /// Ranges closed by the same END are not chained: predecessor edges only come from loops
-/// that actually follow one another.
+/// that actually follow one another, so the first loop of a group has no predecessor.
 #[test_case(1; "one range")]
-#[test_case(2; "two sibling ranges")]
+#[test_case(2; "two ranges closed together")]
 fn ranges_closed_by_one_end_have_no_predecessor_edges(count: usize) {
-    let end = UOp::index_const(10);
-    let ranges: Vec<_> = (0..count).map(|axis| UOp::range(end.clone(), axis)).collect();
-    let ctx = CFGContext::new(&UOp::sink(vec![loop_end(float(1.0), &ranges)]));
-
+    let ranges: Vec<_> = (0..count).map(|axis| global_range(10, axis)).collect();
+    let ctx = CFGContext::new(&UOp::sink(vec![loop_(UOp::native_const(1.0f32), ranges.iter().cloned())]));
     assert!(!ctx.has_edges());
+    assert_eq!(ctx.edge_count(), 0);
+    assert!(ranges.iter().all(|range| ctx.get_predecessor(range).is_none()));
 }
 
-/// The inner END depends on the outer range, so the loops nest rather than being siblings
-/// and the outer range keeps no predecessor.
+/// The positive path: the second sibling RANGE must wait for the first sibling's END.
 #[test]
-fn a_nested_range_is_not_a_sibling_of_its_parent() {
-    let end = UOp::index_const(10);
-    let outer_range = UOp::range(end.clone(), 1);
-    let inner_value = float(1.0).add(&outer_range.cast(DType::Float32));
-    let outer_end = loop_end(loop_end(inner_value, &[UOp::range(end, 0)]), std::slice::from_ref(&outer_range));
+fn a_second_sibling_range_waits_for_the_first_end() {
+    let (first, second) = (global_range(10, 0), global_range(10, 1));
+    let first_end = counted(&first);
+    let ctx = CFGContext::new(&UOp::sink(vec![first_end.clone(), counted(&second)]));
+    assert_eq!(ctx.edge_count(), 1);
+    assert!(ctx.has_edges());
+    assert_same!(Arc::clone(ctx.get_predecessor(&second).expect("the second sibling must be ordered")), first_end);
+    assert!(ctx.get_predecessor(&first).is_none(), "the first sibling starts the group");
+}
 
-    let ctx = CFGContext::new(&UOp::sink(vec![outer_end]));
+/// Siblings are ordered by how many of the other siblings they depend on, not by toposort
+/// order: `dependent` closes `base` yet must still follow the independent sibling.
+#[test]
+fn sibling_edges_follow_dependency_count_not_toposort_order() {
+    let (base_range, dependent_range, independent_range) =
+        (global_range(10, 0), global_range(10, 1), global_range(10, 2));
+    let base = counted(&base_range);
+    let dependent = loop_(base.clone(), [dependent_range.clone()]);
+    let independent = counted(&independent_range);
+    let ctx = CFGContext::new(&UOp::sink(vec![base.clone(), dependent, independent.clone()]));
+    assert_eq!(ctx.edge_count(), 2);
+    assert_same!(Arc::clone(ctx.get_predecessor(&independent_range).expect("independent follows base")), base);
+    let after_independent = ctx.get_predecessor(&dependent_range).expect("dependent must follow independent");
+    assert_same!(Arc::clone(after_independent), independent);
+    assert!(ctx.get_predecessor(&base_range).is_none());
+}
 
-    assert!(ctx.get_predecessor(&outer_range).is_none());
+/// An END nested inside another END is not a sibling of its parent: its RANGE waits for the
+/// parent's RANGE, and the parent keeps no predecessor.
+#[test]
+fn an_inner_range_waits_for_its_parent_range() {
+    let (inner_range, outer_range) = (global_range(10, 0), global_range(10, 1));
+    let body = UOp::native_const(1.0f32).add(&outer_range.cast(DType::Float32));
+    let inner_end = loop_(body, [inner_range.clone()]);
+    let ctx = CFGContext::new(&UOp::sink(vec![loop_(inner_end, [outer_range.clone()])]));
+    assert_eq!(ctx.edge_count(), 1);
+    let inner_predecessor = ctx.get_predecessor(&inner_range).expect("the inner loop waits for its parent");
+    assert_same!(Arc::clone(inner_predecessor), outer_range);
+    assert!(ctx.get_predecessor(&outer_range).is_none(), "the parent is not a sibling of its own body");
+}
+
+/// An edge that would close a cycle is malformed input: the predecessor's subtree already
+/// contains the RANGE the later sibling closes.
+#[test]
+#[should_panic(expected = "would create cycle")]
+fn an_edge_that_would_close_a_cycle_is_rejected() {
+    let (closed, consumed) = (global_range(10, 0), global_range(10, 1));
+    let first = loop_(UOp::native_const(1.0f32).add(&consumed.cast(DType::Float32)), [closed]);
+    let second = counted(&consumed);
+    let _ = CFGContext::new(&UOp::sink(vec![first, second]));
 }

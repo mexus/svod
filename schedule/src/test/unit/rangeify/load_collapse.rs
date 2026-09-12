@@ -1,285 +1,261 @@
-//! Tests for pm_load_collapse (Stage 2) - REDUCE with conditional patterns.
+//! `pm_load_collapse`: bounding a REDUCE(Add) by the conditions its body is gated on.
 //!
-//! These tests verify that REDUCE operations with conditional/gated loads
-//! are correctly collapsed into simpler expressions.
+//! Every row drives the real entry point (`reduce_load_collapse`, which is what
+//! `pm_load_collapse`'s REDUCE rule calls) and asserts the folded constant, so a
+//! row cannot pass when the pattern stops firing.
 
 use std::sync::Arc;
 
 use smallvec::smallvec;
-use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
+use svod_dtype::{DType, DeviceSpec};
+use svod_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp};
+use test_case::test_case;
 
-use crate::pattern::RewriteResult;
-use crate::rangeify::patterns::pm_load_collapse;
+use super::helpers::{assert_const_float, reduce_range, rewritten};
+use crate::rangeify::patterns::{build_reduce_load_collapse_matcher, pm_load_collapse};
+use crate::rangeify::reduce_load_collapse;
+use crate::test::support::prelude::{Bindings, fold_at};
 
-/// Create a range for testing.
-fn test_range(end: i64) -> Arc<UOp> {
-    UOp::range_axis(UOp::index_const(end), AxisId::Renumbered(0), AxisType::Reduce)
+const END: i64 = 10;
+
+fn one() -> Arc<UOp> {
+    UOp::native_const(1.0f32)
 }
 
-/// Create a REDUCE(Add, src, [range]).
-fn reduce_add(src: Arc<UOp>, range: Arc<UOp>) -> Arc<UOp> {
-    src.reduce(smallvec![range], ReduceOp::Add)
+fn zero() -> Arc<UOp> {
+    UOp::const_(DType::Float32, ConstValue::Float(0.0))
 }
 
-#[test]
-fn test_bounded_sum_below() {
-    // Pattern: sum(val for i in range(10) if i < 5) → 5 * val
-    // Represented as: REDUCE(Add, WHERE(r < 5, val, 0), [r])
-    let range = test_range(10);
-    let cut = UOp::index_const(5);
-    let cond = range.try_cmplt(&cut).expect("cmplt");
-
-    let val = UOp::native_const(1.0f32);
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
-    let reduce = reduce_add(where_expr, range.clone());
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce, &mut ());
-
-    if let RewriteResult::Rewritten(collapsed) = result {
-        // Should be: 5 * val = 5.0
-        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE");
-    } else {
-        // Pattern may not match if implementation differs
-        // This is acceptable for initial implementation
-    }
+/// The overflow rule keys on a `WeakInt` sum, which is what an address built from
+/// an `Index` load has; the buffer itself needs `Index` storage.
+fn index_buffer(size: usize) -> Arc<UOp> {
+    UOp::new_buffer(DeviceSpec::Cpu, size, DType::Index)
 }
 
-#[test]
-fn test_bounded_sum_above() {
-    // Pattern: sum(val for i in range(10) if i >= 3) → (10 - 3) * val = 7 * val
-    // Represented as: REDUCE(Add, WHERE(r < 3, 0, val), [r])
-    let range = test_range(10);
-    let cut = UOp::index_const(3);
-    let cond = range.try_cmplt(&cut).expect("cmplt");
-
-    let val = UOp::native_const(1.0f32);
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    // Note: WHERE(r < 3, 0, val) means "0 when r < 3, val otherwise"
-    let where_expr = UOp::try_where(cond, zero, val.clone()).expect("where");
-    let reduce = reduce_add(where_expr, range.clone());
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce, &mut ());
-
-    if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE");
-    }
+/// The two gated forms a bound can take: an exclusive upper bound (`r < cut`)
+/// and an inclusive lower bound (`r >= lower`).
+#[derive(Clone, Copy)]
+enum Bound {
+    Below(i64),
+    From(i64),
 }
 
-#[test]
-fn test_nested_reduce_collapsed_by_full_algorithm() {
-    // pm_load_collapse now uses the full reduce_load_collapse algorithm
-    // (matching Tinygrad), which CAN collapse nested reduces via
-    // reduce_unparented: the outer range is not referenced by the inner
-    // reduce, so it gets multiplied out.
-    //
-    // REDUCE(ADD, REDUCE(ADD, 1.0, [range(5)]), [range(10)])
-    //   → inner: 1.0 * 5 = 5.0
-    //   → outer: 5.0 * 10 = 50.0
-    let inner_range = test_range(5);
-    let outer_range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
-
-    let val = UOp::native_const(1.0f32);
-    let inner_reduce = reduce_add(val, inner_range);
-    let outer_reduce = reduce_add(inner_reduce, outer_range);
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&outer_reduce, &mut ());
-
-    // The full algorithm should successfully collapse this
-    assert!(matches!(result, RewriteResult::Rewritten(_)), "Full reduce_load_collapse should collapse nested reduces");
-}
-
-#[test]
-fn test_non_add_reduce_not_collapsed() {
-    // Only Add reduces are handled
-    let range = test_range(10);
-    let val = UOp::native_const(1.0f32);
-    let reduce_mul = val.reduce(smallvec![range], ReduceOp::Mul);
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce_mul, &mut ());
-
-    assert!(matches!(result, RewriteResult::NoMatch), "Mul reduces should not be handled by load collapse");
-}
-
-#[test]
-fn test_arithmetic_lifting_add() {
-    // Pattern: (x + y) < c → x < (c - y) when y, c are range-free
-    let x = UOp::index_const(5); // Pretend this depends on range
-    let y = UOp::index_const(3);
-    let c = UOp::index_const(10);
-
-    let add = x.try_add(&y).expect("add");
-    let cond = add.try_cmplt(&c).expect("cmplt");
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&cond, &mut ());
-
-    // The pattern may or may not match depending on no_range check
-    // x is a const so it's range-free too, which means this won't transform
-    assert!(
-        matches!(result, RewriteResult::NoMatch | RewriteResult::Rewritten(_)),
-        "Arithmetic lifting should be attempted"
-    );
-}
-
-// ============================================================================
-// New Stage 2 patterns tests
-// ============================================================================
-
-#[test]
-fn test_two_sided_bounds() {
-    // Pattern: sum(val for i in range(10) if 2 <= i < 7) → (7 - 2) * val = 5 * val
-    // Represented as: REDUCE(Add, WHERE((NOT(r < 2) AND (r < 7)), val, 0), [r])
-    let range = test_range(10);
-    let lower = UOp::index_const(2);
-    let upper = UOp::index_const(7);
-
-    // NOT(r < lower) = (r >= lower)
-    let lt_lower = range.try_cmplt(&lower).expect("cmplt");
-    let ge_lower = lt_lower.not();
-
-    // r < upper
-    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
-
-    // (r >= lower) AND (r < upper)
-    let cond = ge_lower.and_(&lt_upper);
-
-    let val = UOp::native_const(1.0f32);
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
-    let reduce = reduce_add(where_expr, range.clone());
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce, &mut ());
-
-    if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE for two-sided bounds");
-    }
-}
-
-#[test]
-fn test_mul_casted_bool() {
-    // Pattern: x * bool.cast() → bool.where(x, 0)
-    let gate = UOp::const_(DType::Bool, ConstValue::Int(1)); // true
-    let gate_cast = gate.cast(DType::Float32);
-    let x = UOp::native_const(5.0f32);
-
-    let mul = x.try_mul(&gate_cast).expect("mul");
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&mul, &mut ());
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be WHERE(gate, x, 0)
-        assert!(matches!(rewritten.op(), Op::Ternary(svod_ir::TernaryOp::Where, ..)), "Should convert to WHERE");
-    }
-}
-
-#[test]
-fn test_ne_lifting() {
-    // Pattern: (x + y) != c → x != (c - y) when no_range(y, c)
-    let x = UOp::index_const(5);
-    let y = UOp::index_const(3);
-    let c = UOp::index_const(10);
-
-    let add = x.try_add(&y).expect("add");
-    let ne = add.try_cmpne(&c).expect("cmpne");
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&ne, &mut ());
-
-    // Both x, y, c are consts (range-free), so pattern should match
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be x != (c - y) = x != 7
-        if let Op::Binary(svod_ir::BinaryOp::Ne, lhs, rhs) = rewritten.op() {
-            // lhs should be x (or equivalent)
-            // rhs should be c - y = 7
-            assert_eq!(lhs.dtype(), DType::Index, "LHS should be Index dtype");
-            assert_eq!(rhs.dtype(), DType::Index, "RHS should be Index dtype");
+impl Bound {
+    fn apply(self, range: &Arc<UOp>) -> Arc<UOp> {
+        match self {
+            Bound::Below(cut) => range.try_cmplt(&UOp::index_const(cut)).expect("cmplt"),
+            Bound::From(lower) => range.try_cmpge(&UOp::index_const(lower)).expect("cmpge"),
         }
     }
 }
 
+/// `where(r < cut, 1, 0)` keeps the first `cut` steps; `where(r >= lower, 1, 0)`
+/// keeps `end - lower`. The pass emits a full `min(max(.., 0), end)` clamp rather
+/// than a bare subtraction, so the edge rows below cover the clamping.
+#[test_case(Bound::Below(5), 5.0 ; "upper bound inside the extent")]
+#[test_case(Bound::Below(0), 0.0 ; "upper bound at zero")]
+#[test_case(Bound::Below(12), 10.0 ; "upper bound clamped to the extent")]
+#[test_case(Bound::From(3), 7.0 ; "lower bound")]
+#[test_case(Bound::From(0), 10.0 ; "lower bound at zero")]
+#[test_case(Bound::From(12), 0.0 ; "lower bound past the extent")]
+fn a_gated_reduce_folds_to_the_counted_extent(bound: Bound, expected: f32) {
+    let range = reduce_range(END, 0);
+    let body = UOp::try_where(bound.apply(&range), one(), zero()).expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("a single-range gated ADD must collapse");
+    assert_const_float(&folded, expected);
+}
+
+/// Only ADD is bounded. The body reads the range, so the unparented fold (which
+/// would legitimately fold a range-free MUL) cannot mask the answer.
 #[test]
-fn test_two_sided_bounds_lower_gt_upper() {
-    // Edge case: lower > upper should produce count of 0
-    // Pattern: sum(val for i in range(10) if 7 <= i < 2) → 0 * val = 0
-    let range = test_range(10);
-    let lower = UOp::index_const(7); // lower > upper
-    let upper = UOp::index_const(2);
+fn a_non_add_reduce_is_not_collapsed() {
+    let range = reduce_range(END, 0);
+    let body = range.cast(DType::Float32).mul(&one());
+    let collapsed = reduce_load_collapse(&body, std::slice::from_ref(&range));
+    assert!(collapsed.is_none(), "only ADD reduces are bounded");
+    rewritten_is_no_match(&body.reduce(smallvec![range], ReduceOp::Mul));
+}
 
-    let lt_lower = range.try_cmplt(&lower).expect("cmplt");
-    let ge_lower = lt_lower.not();
-    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
-    let cond = ge_lower.and_(&lt_upper);
+/// The outer matcher must decline the same non-ADD REDUCE the entry point does.
+#[track_caller]
+fn rewritten_is_no_match(reduce: &Arc<UOp>) {
+    assert!(
+        matches!(pm_load_collapse().rewrite(reduce, &mut ()), svod_ir::RewriteResult::NoMatch),
+        "only ADD reduces reach the collapse: {}",
+        reduce.tree()
+    );
+}
 
-    let val = UOp::native_const(1.0f32);
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
-    let reduce = reduce_add(where_expr, range.clone());
+/// Two nested reduces fold one extent at a time: the inner `1.0 * 5`, the outer
+/// `5.0 * 10`.
+#[test]
+fn nested_unparented_reduces_fold_to_the_product_of_their_extents() {
+    let outer = reduce_range(END, 1);
+    let inner = reduce_range(5, 0);
+    let body = one().reduce(smallvec![inner], ReduceOp::Add);
+    let folded = reduce_load_collapse(&body, &[outer]).expect("the outer range is unparented");
+    assert_const_float(&folded, 50.0);
+}
 
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce, &mut ());
+/// A gated index picks one step out of the range: `sum(where(idx == r, expr, 0))`
+/// becomes `expr[r := idx]`, guarded by the index being in bounds.
+#[test_case(3 ; "in-bounds index")]
+#[test_case(0 ; "index at the lower edge")]
+#[test_case(9 ; "index at the upper edge")]
+fn an_eq_gated_body_collapses_to_the_indexed_value(index: i64) {
+    let range = reduce_range(END, 0);
+    let idx = UOp::define_var("idx".to_string(), index, index);
+    let value = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let body = UOp::try_where(idx.try_cmpeq(&range).expect("cmpeq"), value, zero()).expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("an EQ-gated ADD must collapse");
+    assert_const_float(&folded, 3.0);
+}
 
-    // Should collapse to a multiplication by 0 (or constant 0)
-    if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE");
+/// The NE twin keeps exactly the indexed step too.
+#[test]
+fn a_ne_gated_body_collapses_to_the_indexed_value() {
+    let range = reduce_range(END, 0);
+    let idx = UOp::define_var("idx".to_string(), 4, 4);
+    let value = UOp::const_(DType::Float32, ConstValue::Float(2.5));
+    let body = UOp::try_where(idx.try_cmpne(&range).expect("cmpne"), zero(), value).expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("an NE-gated ADD must collapse");
+    assert_const_float(&folded, 2.5);
+}
+
+/// The gate may depend on a scalar PARAM: `sum(where(p == 1 && r < 5, 2, 0))`
+/// factors the parameter out of the collapsed count. Pinning the exact tree is
+/// what catches a factor that silently disappears.
+#[test]
+fn a_parameter_in_the_gate_is_factored_out_of_the_count() {
+    let range = reduce_range(END, 0);
+    let param = UOp::param(0, 1, DType::Int32, None);
+    let gate = param.try_cmpeq(&UOp::native_const(1i32)).expect("cmpeq").and_(&Bound::Below(5).apply(&range));
+    let body = UOp::try_where(gate, UOp::native_const(2.0f32), zero()).expect("gate");
+
+    let folded = rewritten(&pm_load_collapse(), &body.reduce(smallvec![range], ReduceOp::Add), &mut ());
+    let Op::Ternary(svod_ir::TernaryOp::Where, condition, value, otherwise) = folded.op() else {
+        panic!("expected WHERE(PARAM == 1, 5.0 * 2.0, 0.0), got {}", folded.tree())
+    };
+    assert!(matches!(condition.op(), Op::Binary(BinaryOp::Eq, ..)), "the gate survives as a parameter test");
+    assert_const_float(value, 10.0);
+    assert_const_float(otherwise, 0.0);
+}
+
+/// Index-overflow protection (`Lt(Add(x, y), c)` → `Lt(x, c - y)`) exists to keep
+/// a computed address out of the right-hand side: the side that carries the load
+/// must stay put, and only a range-free summand may become part of the bound.
+/// That is exactly what the guard selects, so the loaded operand is the one the
+/// rule is for.
+#[test]
+fn an_index_overflow_bound_keeps_the_loaded_side_on_the_left() {
+    let loaded = UOp::load().index(crate::test::support::build::index(index_buffer(16), 0)).call();
+    let address = loaded.cast(DType::WeakInt);
+    let offset = UOp::index_const(3);
+    let condition = address.try_add(&offset).expect("weak index add").try_cmplt(&UOp::index_const(10)).expect("cmplt");
+
+    let folded = rewritten(&pm_load_collapse(), &condition, &mut ());
+    let Op::Binary(BinaryOp::Lt, moved, bound) = folded.op() else {
+        panic!("expected Lt(x, c - y), got {}", folded.tree())
+    };
+    assert!(Arc::ptr_eq(moved, &address), "the loaded address must stay on the left");
+    assert_eq!(fold_eval(bound), ConstValue::Int(7), "the bound becomes 10 - 3");
+}
+
+/// The value a constant-only subtree folds to.
+#[track_caller]
+fn fold_eval(uop: &Arc<UOp>) -> ConstValue {
+    fold_at(uop, &Bindings::none()).unwrap_or_else(|| panic!("expected a constant, got {}", uop.tree()))
+}
+
+/// The two AST shapes a lower bound arrives in. `(r < lower).logical_not()` is what
+/// a lowered PAD emits; `r >= lower` is what the tensor front end builds directly.
+#[derive(Clone, Copy)]
+enum LowerForm {
+    NotLt,
+    Ge,
+}
+
+impl LowerForm {
+    fn at_least(self, range: &Arc<UOp>, lower: i64) -> Arc<UOp> {
+        match self {
+            LowerForm::NotLt => Bound::Below(lower).apply(range).not(),
+            LowerForm::Ge => Bound::From(lower).apply(range),
+        }
     }
 }
 
-#[test]
-fn test_two_sided_bounds_ge_form() {
-    // Test using direct GE (>=) form instead of NOT(LT)
-    // This requires a range with GE comparison
-    let range = test_range(10);
-    let lower = UOp::index_const(3);
-    let upper = UOp::index_const(8);
-
-    // Use GE directly: r >= lower
-    let ge_lower = range.try_cmpge(&lower).expect("cmpge");
-    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
-    let cond = ge_lower.and_(&lt_upper);
-
-    let val = UOp::native_const(1.0f32);
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
-    let reduce = reduce_add(where_expr, range.clone());
-
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce, &mut ());
-
-    if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE with GE form");
-    }
+/// `sum(where(lo <= r < hi, 1, 0))` is the width of the window the two bounds cut
+/// out of `[0, end)`: `min(end, hi) - max(0, lo)`, floored at zero
+/// (`website/docs/architecture/optimizations/range-optimization.md:110`). Both
+/// clamps need their own rows, since a window that hangs off either end of the
+/// extent is what a padded load looks like.
+#[test_case(LowerForm::NotLt, 2, 7, 5.0 ; "not-lt window inside the extent")]
+#[test_case(LowerForm::Ge, 3, 8, 5.0 ; "ge window inside the extent")]
+#[test_case(LowerForm::NotLt, 0, 10, 10.0 ; "not-lt window covering the extent")]
+#[test_case(LowerForm::Ge, 0, 10, 10.0 ; "ge window covering the extent")]
+#[test_case(LowerForm::NotLt, -4, 14, 10.0 ; "a window hanging off both ends is clamped")]
+#[test_case(LowerForm::Ge, -4, 14, 10.0 ; "the ge form clamps the same way")]
+#[test_case(LowerForm::NotLt, 7, 2, 0.0 ; "lower past upper is empty")]
+#[test_case(LowerForm::Ge, 12, 15, 0.0 ; "a window past the extent is empty")]
+#[test_case(LowerForm::Ge, 4, 4, 0.0 ; "a zero-width window is empty")]
+fn a_two_sided_gate_folds_to_the_width_of_the_window(form: LowerForm, lower: i64, upper: i64, expected: f32) {
+    let range = reduce_range(END, 0);
+    let condition = form.at_least(&range, lower).and_(&Bound::Below(upper).apply(&range));
+    let body = UOp::try_where(condition, one(), zero()).expect("gate");
+    let folded = reduce_load_collapse(&body, &[range]).expect("a two-sided gated ADD must collapse");
+    assert_const_float(&folded, expected);
+    assert_eq!(
+        expected,
+        (0..END).filter(|step| *step >= lower && *step < upper).count() as f32,
+        "the brute-force count"
+    );
 }
 
+/// The NE lifting rule (`(x + y) != c` → `x != (c - y)`) only exists in the
+/// extended `reduce_load_collapse` matcher, so this drives that matcher directly
+/// on both the lifted node and its range-dependent twin.
 #[test]
-fn test_two_sided_bounds_at_range_edges() {
-    // Edge case: bounds at exactly 0 and end
-    // Pattern: sum(val for i in range(10) if 0 <= i < 10) → 10 * val
-    let range = test_range(10);
-    let lower = UOp::index_const(0);
-    let upper = UOp::index_const(10);
+fn a_range_free_ne_is_lifted_out_of_the_addition() {
+    let scalar = UOp::define_var("in0".to_string(), 0, 31);
+    let condition = scalar.try_add(&UOp::index_const(4)).expect("add").try_cmpne(&UOp::index_const(9)).expect("cmpne");
 
-    let lt_lower = range.try_cmplt(&lower).expect("cmplt");
-    let ge_lower = lt_lower.not();
-    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
-    let cond = ge_lower.and_(&lt_upper);
+    let folded = rewritten(&build_reduce_load_collapse_matcher(), &condition, &mut ());
+    let Op::Binary(BinaryOp::Ne, left, right) = folded.op() else { panic!("expected Ne, got {}", folded.tree()) };
+    assert!(Arc::ptr_eq(left, &scalar), "the range-free scalar is isolated on the left");
+    assert_eq!(fold_eval(right), ConstValue::Int(5), "the lifted bound must fold to 9 - 4 = 5");
+}
 
-    let val = UOp::native_const(1.0f32);
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
-    let reduce = reduce_add(where_expr, range.clone());
+/// The same rule over a range-dependent sum must keep the range on the left
+/// instead of folding it into the bound.
+#[test]
+fn an_ne_over_a_range_keeps_the_range_on_the_left() {
+    let range = reduce_range(END, 0);
+    let condition = range.try_add(&UOp::index_const(4)).expect("add").try_cmpne(&UOp::index_const(9)).expect("cmpne");
+    let folded = rewritten(&build_reduce_load_collapse_matcher(), &condition, &mut ());
+    let Op::Binary(BinaryOp::Ne, left, _) = folded.op() else { panic!("expected Ne, got {}", folded.tree()) };
+    assert!(
+        left.toposort().iter().any(|node| matches!(node.op(), Op::Range(..))),
+        "the range cannot be folded away: {}",
+        folded.tree()
+    );
+}
 
-    let matcher = pm_load_collapse();
-    let result = matcher.rewrite(&reduce, &mut ());
+/// `x * gate:bool.cast()` reads as a WHERE: the product is skipped where the gate
+/// is false, which is the only form the collapse can count.
+#[test]
+fn a_multiplication_by_a_cast_bool_becomes_a_where() {
+    let gate = UOp::var("gate", DType::Bool, 0, 1);
+    let product = UOp::native_const(3i32).mul(&gate.cast(DType::Int32));
 
-    if let RewriteResult::Rewritten(collapsed) = result {
-        assert!(!matches!(collapsed.op(), Op::Reduce(..)), "Should have eliminated REDUCE for full range");
-    }
+    let folded = reduce_load_collapse(&product, &[reduce_range(END, 0)]).expect("the product must lower");
+    let Op::Binary(BinaryOp::Mul, lowered, count) = folded.op() else {
+        panic!("expected the lowered WHERE scaled by the extent, got {}", folded.tree())
+    };
+    let Op::Ternary(svod_ir::TernaryOp::Where, condition, value, otherwise) = lowered.op() else {
+        panic!("expected x * gate.cast() to lower to WHERE, got {}", lowered.tree())
+    };
+    assert!(Arc::ptr_eq(condition, &gate), "the gate becomes the condition");
+    assert!(Arc::ptr_eq(value, &UOp::native_const(3i32)), "the product keeps its scale");
+    assert_eq!(super::helpers::const_value(otherwise), ConstValue::Int(0));
+    assert_eq!(super::helpers::const_value(count), ConstValue::Int(END));
 }

@@ -1,19 +1,25 @@
 //! Kernel-shape pin for weak-dtype constant folding.
 //!
-//! resnet50 layer4 3x3 conv (`r_16_32_7_7_512_3_3`, the worst devectorize blow-up in
-//! the model): input [1,512,7,7], weight [512,512,3,3], pad 1. Without the weak arm of
+//! resnet50 layer4 3x3 conv (`r_16_32_7_7_512_3_3`, the worst devectorize blow-up in the
+//! model): input [1,512,7,7], weight [512,512,3,3], pad 1. Without the weak arm of
 //! `fold_const_alu` every folded index constant survives devectorize.
+
+use std::sync::Arc;
+
+use smallvec::smallvec;
+use svod_dtype::DType;
+use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
 
 use crate::optimizer::{Opt, Renderer, Scheduler, apply_opt, apply_pre_optimization};
 use crate::rewrite::graph_rewrite;
-use smallvec::smallvec;
-use std::sync::Arc;
-use svod_dtype::DType;
-use svod_ir::{AxisId, AxisType, ReduceOp, UOp};
+use crate::test::support::prelude::*;
 
 const C: i64 = 512;
 const H: i64 = 7;
 const K: i64 = 3;
+
+/// 6862 nodes before the weak arm of `fold_const_alu`, 4301 after (tinygrad: 2480).
+const BUDGET: usize = 4500;
 
 /// Loop axes (co, oy, ox) then reduce axes (ci, ky, kx): full shape [512,7,7,512,3,3].
 fn conv_kernel_sink() -> Arc<UOp> {
@@ -23,10 +29,8 @@ fn conv_kernel_sink() -> Arc<UOp> {
     let (co, oy, ox) = (UOp::range_const(C, 0), UOp::range_const(H, 1), UOp::range_const(H, 2));
     let (ci, ky, kx) = (reduce_axis(C, 3), reduce_axis(K, 4), reduce_axis(K, 5));
 
-    let read = |slot: usize, len: i64, index: Arc<UOp>| {
-        let buffer = UOp::param(slot, len as usize, DType::Float32, None);
-        UOp::load().index(UOp::index().buffer(buffer).indices(vec![index]).call().unwrap()).call()
-    };
+    let read =
+        |slot: usize, len: i64, index: Arc<UOp>| load(index_of(param(slot, len as usize, DType::Float32), index));
 
     // pad 1: iy = oy + ky - 1, ix = ox + kx - 1, both gated to [0, H).
     let (iy, ix) = (oy.add(&ky).sub(&k(1)), ox.add(&kx).sub(&k(1)));
@@ -35,14 +39,12 @@ fn conv_kernel_sink() -> Arc<UOp> {
     let w = read(2, C * C * K * K, co.mul(&k(C * K * K)).add(&ci.mul(&k(K * K))).add(&ky.mul(&k(K))).add(&kx));
 
     let acc = x.try_mul(&w).unwrap().reduce(smallvec![ci, ky, kx], ReduceOp::Add);
-    let out = UOp::param(0, (C * H * H) as usize, DType::Float32, None);
     let out_index = co.mul(&k(H * H)).add(&oy.mul(&k(H))).add(&ox);
-    let store = UOp::index().buffer(out).indices(vec![out_index]).call().unwrap().store(acc);
+    let store = store(index_of(param(0, (C * H * H) as usize, DType::Float32), out_index), acc);
     UOp::sink(vec![store.end(smallvec![co, oy, ox])])
 }
 
 /// `apply_post_optimization_configured_with_capture` stages 08 -> 14 (optimizer/mod.rs).
-/// Stage 11 (local buffers) is inert here: the kernel holds no STAGE or movement op.
 fn through_devectorize(ast: Arc<UOp>, renderer: &Renderer) -> Arc<UOp> {
     let ast = graph_rewrite(&*crate::optimizer::POST_OPT_SYM, ast, &mut ());
     let ast = crate::expand::pre_expand(&ast);
@@ -76,7 +78,6 @@ fn weak_folding_keeps_the_resnet_conv_devectorize_bounded() {
     }
     assert_eq!(scheduler.full_shape(), vec![16, 32, 7, 7, 512, 3, 3]);
 
-    // 6862 nodes before the weak arm of `fold_const_alu`, 4301 after (tinygrad: 2480).
     let devectorized = through_devectorize(scheduler.get_optimized_ast(None), &renderer);
-    assert!(devectorized.node_count() < 5000, "devectorize blew up: {} nodes", devectorized.node_count());
+    assert!(devectorized.node_count() < BUDGET, "devectorize blew up: {} nodes", devectorized.node_count());
 }
