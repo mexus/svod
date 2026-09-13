@@ -28,10 +28,7 @@ mod blocks;
 mod error;
 mod jit;
 mod stft;
-// TODO: port `stream.rs` (the streaming/one-frame GTCRN) onto `svod_tensor::nn`
-// the same way this module was; it still uses the retired `HasStateDict` /
-// `Conv2dWeights` API and does not compile.
-// pub mod stream;
+pub mod stream;
 
 pub use error::{Error, Result};
 pub use jit::GtcrnJit;

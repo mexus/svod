@@ -1,235 +1,193 @@
-//! Streaming GTCRN tests — shape verification + state-dict round-trip (default)
-//! + parity against the offline model's frame-by-frame output (heavy).
+//! Streaming GTCRN tests.
+//!
+//! Default tier: the symbolic one-frame graph's shapes, the state-dict round
+//! trip, and — the real coverage — frame-by-frame equality with the offline
+//! model on random weights. Heavy tier: the PyTorch `StreamGTCRN` golden.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use svod_dtype::DType;
 use svod_tensor::Tensor;
+use svod_tensor::nn::Module;
 
-use crate::gtcrn::{GtcrnStream, GtcrnStreamJit};
-use crate::jit::InputSpec;
-use crate::state::HasStateDict;
+use crate::gtcrn::stream::{GtcrnStream, GtcrnStreamJit};
+use crate::gtcrn::{Gtcrn, HUB_REPO, N_FREQ};
 
-fn get_shape(tensor: &Tensor) -> Vec<usize> {
-    tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+/// Depth-conv weights the stream model stores flipped and must emit unflipped.
+const FLIPPED_KEYS: [&str; 3] = [
+    "decoder.de_convs.0.depth_conv.weight",
+    "decoder.de_convs.1.depth_conv.weight",
+    "decoder.de_convs.2.depth_conv.weight",
+];
+
+fn zeros(shape: &[usize]) -> Tensor {
+    Tensor::zeros(shape, DType::Float32)
 }
 
-/// Build the symbolic streaming graph on random weights with T=1 and verify
-/// the output + all recycled cache shapes without realizing. Catches axis /
+/// The three cache families, all zero — a cold stream, built eagerly for the
+/// tests that run the graph without the JIT.
+fn cold_caches() -> ([Tensor; 6], [Tensor; 6], [Tensor; 2]) {
+    (
+        std::array::from_fn(|i| zeros(&GtcrnStream::CONV_CACHE[i])),
+        std::array::from_fn(|_| zeros(&GtcrnStream::TRA_CACHE)),
+        std::array::from_fn(|_| zeros(&GtcrnStream::INTER_CACHE)),
+    )
+}
+
+fn refs<const N: usize>(t: &[Tensor; N]) -> [&Tensor; N] {
+    std::array::from_fn(|i| &t[i])
+}
+
+/// Build the symbolic streaming graph on random weights with `T = 1` and verify
+/// the output plus every recycled cache shape without realizing. Catches axis /
 /// cache-slicing / permute bugs across the whole streaming graph in ms.
 #[test]
 fn stream_forward_shape() {
     let model = GtcrnStream::with_random_weights();
-    let (conv_caches, tra_caches, inter_caches) = model.zero_caches();
-
-    // Single-frame spec: (1, 257, 1, 2).
-    let spec = Tensor::zeros(&[1, 257, 1, 2], DType::Float32).unwrap();
+    let (conv, tra, inter) = cold_caches();
+    let spec = zeros(&[1, N_FREQ, 1, 2]);
 
     let (enh, new_conv, new_tra, new_inter) =
-        model.forward_stream(&spec, &conv_caches, &tra_caches, &inter_caches).expect("forward_stream");
+        model.forward_stream(&spec, refs(&conv), refs(&tra), refs(&inter)).expect("forward_stream");
 
-    // Output: (1, 257, 1, 2).
-    assert_eq!(get_shape(&enh), vec![1, 257, 1, 2], "enhanced spec shape");
+    assert_eq!(enh.dims().expect("concrete output shape"), vec![1, N_FREQ, 1, 2], "enhanced spec");
 
-    // Encoder conv caches: (1, 16, 2*d, 33) for d=1,2,5 → (1,16,2,33),(1,16,4,33),(1,16,10,33).
-    assert_eq!(get_shape(&new_conv.encoder[0]), vec![1, 16, 2, 33], "conv_en[0] (d=1)");
-    assert_eq!(get_shape(&new_conv.encoder[1]), vec![1, 16, 4, 33], "conv_en[1] (d=2)");
-    assert_eq!(get_shape(&new_conv.encoder[2]), vec![1, 16, 10, 33], "conv_en[2] (d=5)");
-
-    // Decoder conv caches: reversed dilations d=5,2,1.
-    assert_eq!(get_shape(&new_conv.decoder[0]), vec![1, 16, 10, 33], "conv_de[0] (d=5)");
-    assert_eq!(get_shape(&new_conv.decoder[1]), vec![1, 16, 4, 33], "conv_de[1] (d=2)");
-    assert_eq!(get_shape(&new_conv.decoder[2]), vec![1, 16, 2, 33], "conv_de[2] (d=1)");
-
-    // TRA caches: (1, 16) each.
-    for (i, c) in new_tra.encoder.iter().enumerate() {
-        assert_eq!(get_shape(c), vec![1, 16], "tra_en[{i}]");
+    // Each new cache must be exactly the shape the next call feeds back in:
+    // (1,16,2,33), (1,16,4,33), (1,16,10,33) for the encoder's dilations 1,2,5
+    // and the reverse for the decoder.
+    for (i, c) in new_conv.iter().enumerate() {
+        assert_eq!(c.dims().unwrap(), GtcrnStream::CONV_CACHE[i].to_vec(), "conv cache {i}");
     }
-    for (i, c) in new_tra.decoder.iter().enumerate() {
-        assert_eq!(get_shape(c), vec![1, 16], "tra_de[{i}]");
+    for (i, c) in new_tra.iter().enumerate() {
+        assert_eq!(c.dims().unwrap(), GtcrnStream::TRA_CACHE.to_vec(), "tra cache {i}");
     }
-
-    // Inter caches: (33, 16) each.
-    for (i, c) in new_inter.caches.iter().enumerate() {
-        assert_eq!(get_shape(c), vec![33, 16], "inter[{i}]");
+    for (i, c) in new_inter.iter().enumerate() {
+        assert_eq!(c.dims().unwrap(), GtcrnStream::INTER_CACHE.to_vec(), "inter cache {i}");
     }
 }
 
-/// Emit the stream model's state dict and reload it into a fresh model. Verifies
-/// the key layout round-trips (including the flipped transpose-conv depth weights).
+/// The stream model loads the *offline* checkpoint and must emit it back
+/// unchanged: the `StreamConvTranspose2d` kernel flip is an involution applied
+/// on both edges, so a reload of an emitted dict must not flip a second time.
+/// A one-sided flip un-flips silently here and nowhere else.
 #[test]
-fn stream_state_dict_round_trip() {
-    let model = GtcrnStream::with_random_weights();
-    let sd = model.state_dict("");
+fn state_dict_keeps_the_checkpoint_spelling() {
+    let checkpoint = Gtcrn::with_random_weights().state_dict("");
+    let model = GtcrnStream::from_state_dict(&checkpoint).expect("load");
+    let emitted = model.state_dict("");
 
-    // Representative keys across all block types.
-    let expected_keys = [
-        "erb.erb_fc.weight",
-        "encoder.en_convs.0.conv.weight",
-        "encoder.en_convs.0.conv.bias",
-        "encoder.en_convs.2.depth_conv.weight",
-        "encoder.en_convs.2.tra.att_gru.weight_ih_l0",
-        "dpgrnn1.intra_rnn.rnn1_f.weight_ih_l0",
-        "dpgrnn1.inter_rnn.rnn1_f.weight_ih_l0",
-        "decoder.de_convs.0.depth_conv.weight",
-        "decoder.de_convs.0.tra.att_gru.weight_ih_l0",
-        "decoder.de_convs.4.conv.weight",
-    ];
-    for key in &expected_keys {
-        assert!(sd.contains_key(*key), "missing key: {key}");
+    assert_eq!(emitted.len(), checkpoint.len(), "key count");
+    for (key, want) in &checkpoint {
+        let got = emitted.get(key).unwrap_or_else(|| panic!("key dropped: {key}"));
+        if FLIPPED_KEYS.contains(&key.as_str()) {
+            assert_eq!(got.to_vec::<f32>().unwrap(), want.to_vec::<f32>().unwrap(), "{key} came back flipped");
+        } else {
+            assert!(Arc::ptr_eq(&got.uop(), &want.uop()), "{key} was not taken from the state dict");
+        }
     }
 
-    // Reload into a fresh model.
-    let mut model2 = GtcrnStream::with_random_weights();
-    model2.load_state_dict(&sd, "").expect("reload");
+    // Idempotence: `from_state_dict(&m.state_dict(""))` is the identity.
+    let reloaded = GtcrnStream::from_state_dict(&emitted).expect("reload").state_dict("");
+    for key in FLIPPED_KEYS {
+        let (a, b) = (emitted[key].to_vec::<f32>().unwrap(), reloaded[key].to_vec::<f32>().unwrap());
+        assert_eq!(a, b, "{key} is not idempotent across a state-dict round trip");
+    }
+}
 
-    // Verify a tensor round-trips.
-    let sd2 = model2.state_dict("");
-    let w1 = sd.get("encoder.en_convs.2.depth_conv.weight").unwrap();
-    let w2 = sd2.get("encoder.en_convs.2.depth_conv.weight").unwrap();
-    assert_eq!(get_shape(w1), get_shape(w2), "depth_conv weight shape mismatch");
+/// Frames of the `(1, F, T, 2)` layout: frame `i` is strided, not contiguous.
+fn frame_of(flat: &[f32], frames: usize, i: usize) -> Vec<f32> {
+    (0..N_FREQ).flat_map(|f| [flat[(f * frames + i) * 2], flat[(f * frames + i) * 2 + 1]]).collect()
+}
+
+/// Run `frames` frames through the streaming JIT and return each output frame.
+fn run_stream(model: GtcrnStream, spec: &[f32], frames: usize) -> Vec<Vec<f32>> {
+    let mut jit = GtcrnStreamJit::prepared(model).expect("prepare stream JIT");
+    (0..frames)
+        .map(|i| {
+            let mut view = jit.spec_view_mut::<f32>().expect("spec view");
+            view.as_slice_mut().expect("contiguous spec").copy_from_slice(&frame_of(spec, frames, i));
+            jit.execute().expect("execute");
+            jit.enh_to_vec::<f32>().expect("enhanced frame")
+        })
+        .collect()
+}
+
+/// The offline network is strictly causal, so feeding the streaming model one
+/// frame at a time must reproduce the offline forward on the same window
+/// exactly. This is the assertion the shape test cannot make: it fails on a
+/// wrong kernel flip, a dropped GRU hidden state, a lost dilation, a
+/// non-causal pad, or a cache sliced from the wrong end.
+#[test]
+fn streaming_matches_offline() {
+    const FRAMES: usize = 12;
+
+    let checkpoint = Gtcrn::with_random_weights().state_dict("");
+    let offline = Gtcrn::from_state_dict(&checkpoint).expect("offline model");
+    let stream = GtcrnStream::from_state_dict(&checkpoint).expect("stream model");
+
+    let spec = Tensor::uniform_with_dtype(&[1, N_FREQ, FRAMES, 2], -1.0, 1.0, DType::Float32).unwrap().contiguous();
+    let spec_vec = spec.to_vec::<f32>().unwrap();
+    let want = offline.forward(&spec).expect("offline forward").to_vec::<f32>().unwrap();
+
+    let got = run_stream(stream, &spec_vec, FRAMES);
+
+    let mut max_delta = 0.0f32;
+    for (i, frame) in got.iter().enumerate() {
+        let want_frame = frame_of(&want, FRAMES, i);
+        assert_eq!(frame.len(), want_frame.len(), "frame {i} length");
+        for (a, b) in frame.iter().zip(&want_frame) {
+            assert!(a.is_finite(), "frame {i} produced {a}");
+            max_delta = max_delta.max((a - b).abs());
+        }
+    }
+    // Same weights, same arithmetic, different kernel fusion: the two paths
+    // differ only by fp32 reassociation.
+    assert!(max_delta < 1e-5, "streaming vs offline: max |delta| = {max_delta:e}");
+}
+
+fn resolve_file(name: &str) -> PathBuf {
+    for dir in [std::env::var("SVOD_GTCRN").ok(), Some(format!("{}/../data/gtcrn", env!("CARGO_MANIFEST_DIR")))]
+        .into_iter()
+        .flatten()
+    {
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return p;
+        }
+    }
+    crate::hub::HubRepo::open(HUB_REPO, "main")
+        .and_then(|repo| repo.get(name))
+        .unwrap_or_else(|e| panic!("download {name} from {HUB_REPO}: {e}"))
 }
 
 /// Run the streaming model frame-by-frame on the golden spec and compare to the
-/// PyTorch `StreamGTCRN` output (generated by `convert_gtcrn.py --stream-golden`).
-///
-/// The JIT plan is compiled once (T=1 baked in) and the 14 recurrent caches
-/// recycle on-device via the assign-back idiom between `execute()` calls. Each
-/// frame's input is sliced along the T axis of the `(1, F, T, C)` golden (frames
-/// are strided in the flat buffer, not contiguous), and each output frame is
-/// compared against the identically T-sliced `stream_output_crop`.
+/// PyTorch `StreamGTCRN` output (`convert_gtcrn.py --stream-golden`), which was
+/// captured from the same cold start over the same 24-frame crop.
 ///
 /// ```text
-/// SVOD_GTCRN=$PWD/data/gtcrn cargo test -p svod-model --lib gtcrn::stream --release -- --ignored
+/// SVOD_GTCRN=$PWD/data/gtcrn cargo test -p svod-model --lib gtcrn::stream -- --ignored
 /// ```
 #[test]
 #[ignore = "heavy: real GTCRN weights + PyTorch stream golden (local or HF Hub download)"]
 fn streaming_matches_pytorch_stream() {
-    use std::path::PathBuf;
+    const FRAMES: usize = 24;
 
-    fn resolve_file(name: &str) -> PathBuf {
-        if let Ok(dir) = std::env::var("SVOD_GTCRN") {
-            let p = PathBuf::from(dir).join(name);
-            if p.exists() {
-                return p;
-            }
-        }
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/gtcrn").join(name);
-        if p.exists() {
-            return p;
-        }
-        let api = hf_hub::api::sync::Api::new().expect("HF Hub API");
-        let repo = hf_hub::Repo::with_revision("vpermilp/gtcrn".into(), hf_hub::RepoType::Model, "main".into());
-        api.repo(repo).get(name).unwrap_or_else(|_| panic!("download {name} from vpermilp/gtcrn"))
-    }
-
-    let weights = resolve_file("gtcrn.safetensors");
-    let golden_path = resolve_file("golden_stream.safetensors");
-
-    let model = GtcrnStream::from_safetensors(&weights).expect("load stream model");
-    let golden = crate::state::load_safetensors(&golden_path).expect("load golden");
-
-    // The streaming golden uses spec_crop (same as offline) and stream_output_crop
-    // (from the PyTorch StreamGTCRN, frame-by-frame). Both are (1, F, T, C) — we
-    // slice each frame along T below to compare frame-by-frame.
-
-    // The spec_crop golden is laid out (1, F=257, T=24, C=2) row-major, so the
-    // 24 frames are NOT contiguous in the flat buffer — frame i lives at
-    // strided offsets (f*48 + i*2 + c). Slice the T axis in the graph (not the
-    // flat buffer) to extract each frame correctly, matching the PyTorch
-    // `spec_crop[:, :, i:i+1, :]`.
-    let spec_full = crate::state::get_tensor(&golden, "spec_crop").unwrap().clone();
-    let n_frames = 24;
-    let frame_tensors: Vec<Vec<f32>> = (0..n_frames)
-        .map(|i| {
-            use svod_ir::SInt;
-            let mut f =
-                spec_full.clone().try_shrink([None, None, Some((SInt::Const(i), SInt::Const(i + 1))), None]).unwrap();
-            f.realize().unwrap();
-            f.as_vec::<f32>().unwrap()
-        })
-        .collect();
-
-    // Prepare the JIT once with T=1 (compile once), then execute per frame.
-    // The caches recycle on-device via the assign-back idiom — no graph
-    // accumulation across frames.
-    let mut jit = GtcrnStreamJit::new(model);
-
-    // Build the InputSpec array: spec (host-visible) + all caches (device-local).
-    let tra_hidden = 16; // half*2 = (C_NET/2)*2
-    jit.prepare_with_config(
-        InputSpec::f32(&[1, 257, 1, 2]),
-        InputSpec::f32(&[1, 16, 2, 33]).device_local(),  // conv_en0 (d=1)
-        InputSpec::f32(&[1, 16, 4, 33]).device_local(),  // conv_en1 (d=2)
-        InputSpec::f32(&[1, 16, 10, 33]).device_local(), // conv_en2 (d=5)
-        InputSpec::f32(&[1, 16, 10, 33]).device_local(), // conv_de0 (d=5)
-        InputSpec::f32(&[1, 16, 4, 33]).device_local(),  // conv_de1 (d=2)
-        InputSpec::f32(&[1, 16, 2, 33]).device_local(),  // conv_de2 (d=1)
-        InputSpec::f32(&[1, tra_hidden]).device_local(), // tra_en0
-        InputSpec::f32(&[1, tra_hidden]).device_local(), // tra_en1
-        InputSpec::f32(&[1, tra_hidden]).device_local(), // tra_en2
-        InputSpec::f32(&[1, tra_hidden]).device_local(), // tra_de0
-        InputSpec::f32(&[1, tra_hidden]).device_local(), // tra_de1
-        InputSpec::f32(&[1, tra_hidden]).device_local(), // tra_de2
-        InputSpec::f32(&[33, 16]).device_local(),        // inter0
-        InputSpec::f32(&[33, 16]).device_local(),        // inter1
-        &svod_tensor::PrepareConfig::from_env(),
-    )
-    .expect("JIT prepare");
-
-    // Zero-init all caches on-device.
-    let zeros_tra = vec![0.0f32; tra_hidden];
-    let zeros_inter = vec![0.0f32; 33 * 16];
-    let zero_conv_1 = vec![0.0f32; 16 * 2 * 33];
-    let zero_conv_2 = vec![0.0f32; 16 * 4 * 33];
-    let zero_conv_5 = vec![0.0f32; 16 * 10 * 33];
-    {
-        macro_rules! zero_cache {
-            ($getter:ident, $data:expr) => {{
-                jit.$getter().unwrap().copyin(bytemuck::cast_slice(&$data)).unwrap();
-            }};
-        }
-        zero_cache!(conv_en0_mut, zero_conv_1);
-        zero_cache!(conv_en1_mut, zero_conv_2);
-        zero_cache!(conv_en2_mut, zero_conv_5);
-        zero_cache!(conv_de0_mut, zero_conv_5);
-        zero_cache!(conv_de1_mut, zero_conv_2);
-        zero_cache!(conv_de2_mut, zero_conv_1);
-        zero_cache!(tra_en0_mut, zeros_tra);
-        zero_cache!(tra_en1_mut, zeros_tra);
-        zero_cache!(tra_en2_mut, zeros_tra);
-        zero_cache!(tra_de0_mut, zeros_tra);
-        zero_cache!(tra_de1_mut, zeros_tra);
-        zero_cache!(tra_de2_mut, zeros_tra);
-        zero_cache!(inter0_mut, zeros_inter);
-        zero_cache!(inter1_mut, zeros_inter);
-    }
-
-    // want_full is (1, F=257, T=24, C=2) row-major — frames are NOT contiguous
-    // in the flat buffer. Extract each frame along T (matching the input slicing)
-    // so got[i] and want[i] are both single-frame (1,257,1,2) flat buffers.
-    let want_full = crate::state::get_tensor(&golden, "stream_output_crop").unwrap().clone();
-    let want_frame = |i: usize| -> Vec<f32> {
-        use svod_ir::SInt;
-        let mut f =
-            want_full.clone().try_shrink([None, None, Some((SInt::Const(i), SInt::Const(i + 1))), None]).unwrap();
-        f.realize().unwrap();
-        f.as_vec::<f32>().unwrap()
+    let model = GtcrnStream::from_safetensors(&resolve_file("gtcrn.safetensors")).expect("load stream model");
+    let golden = crate::state::load_safetensors(&resolve_file("golden_stream.safetensors")).expect("load golden");
+    let get = |key: &str| {
+        crate::state::get_tensor(&golden, key).unwrap_or_else(|_| panic!("missing golden key: {key}")).to_vec::<f32>()
     };
 
-    let mut max_delta = 0.0f32;
-    let mut peak = 0.0f32;
-    for frame in 0..n_frames {
-        // Write one frame (correctly sliced along T) into the spec input buffer.
-        jit.spec_mut().unwrap().copyin(bytemuck::cast_slice(&frame_tensors[frame])).unwrap();
+    let spec = get("spec_crop").unwrap();
+    let want = get("stream_output_crop").unwrap();
+    let got = run_stream(model, &spec, FRAMES);
 
-        // Execute (caches recycle on-device).
-        jit.execute().unwrap();
-
-        // Read the enhanced frame and compare against the T-sliced golden frame.
-        let out = jit.enh().unwrap();
-        let got_slice: &[f32] = out.as_slice().unwrap();
-        let want_slice = want_frame(frame);
-        assert_eq!(got_slice.len(), want_slice.len(), "frame {frame} length mismatch");
-        for (a, b) in got_slice.iter().zip(&want_slice) {
+    let (mut max_delta, mut peak) = (0.0f32, 0.0f32);
+    for (i, frame) in got.iter().enumerate() {
+        let want_frame = frame_of(&want, FRAMES, i);
+        assert_eq!(frame.len(), want_frame.len(), "frame {i} length");
+        for (a, b) in frame.iter().zip(&want_frame) {
             max_delta = max_delta.max((a - b).abs());
             peak = peak.max(b.abs());
         }
