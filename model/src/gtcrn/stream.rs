@@ -419,14 +419,13 @@ impl Dpgrnn {
 }
 
 impl Grnn {
-    /// [`Grnn::forward`] with hidden state. `h` is `(B·F, hidden)`; rnn1 takes
-    /// its first half and rnn2 the second, matching the input split.
+    /// [`Grnn::forward`] with hidden state. Only the unidirectional `inter_rnn`
+    /// threads state, and its merged form needs no reordering at all: the
+    /// block-diagonal GRU's hidden state *is* `[h₁ | h₂]`, exactly the
+    /// concatenation the split pair carried, so the `(B·F, hidden)` cache
+    /// layout is unchanged.
     fn forward_with_state(&self, x: &Tensor, h: &Tensor) -> Result<(Tensor, Tensor)> {
-        let x = x.chunk(2, -1)?;
-        let h = h.chunk(2, -1)?;
-        let (y1, nh1) = self.rnn1_f.forward_with_state(&x[0], &h[0])?;
-        let (y2, nh2) = self.rnn2_f.forward_with_state(&x[1], &h[1])?;
-        Ok((Tensor::cat(&[&y1, &y2], -1)?, Tensor::cat(&[&nh1, &nh2], -1)?))
+        self.merged_forward()?.forward_with_state(x, h)
     }
 }
 

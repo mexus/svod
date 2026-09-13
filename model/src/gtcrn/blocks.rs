@@ -16,7 +16,7 @@ use svod_tensor::nn::{
     BatchNorm2d, Conv2d, ConvTranspose2d, GruDirection, Layer, LayerNorm, Linear, Module, RnnLayout,
 };
 
-use crate::init::fan_in_uniform;
+use crate::init::{fan_in_uniform, zeros};
 
 use super::error::Result;
 
@@ -287,6 +287,53 @@ impl GruWeights {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         run_gru(x, &[self], None)
     }
+
+    /// Fuse two GRUs that read disjoint halves of the same input — `self` the
+    /// low half, `other` the high one — into a single GRU of input `2I` and
+    /// hidden `2H` whose gate matrices are **block diagonal**.
+    ///
+    /// `W·x + R·h = [W₁x₁ + R₁h₁ ; W₂x₂ + R₂h₂]` when the blocks are disjoint,
+    /// and every gate nonlinearity is elementwise, so the merged GRU's output
+    /// is exactly the two originals' outputs concatenated — one scan instead of
+    /// two, at twice the flops of a matmul this small.
+    ///
+    /// Rows stay gate-major in svod's ONNX `[z, r, h]` spelling, so each gate
+    /// owns `2H` contiguous rows and the two GRUs interleave *within* a gate:
+    /// `[z₁, z₂, r₁, r₂, n₁, n₂]` over `[·₁ | 0]` / `[0 | ·₂]` column blocks.
+    /// The bias follows the same order.
+    fn merge(&self, other: &Self) -> Result<Self> {
+        let h = self.hidden_size;
+        assert_eq!(other.hidden_size, h, "a GRNN's two groups share a hidden size");
+        let gate = |t: &Tensor, g: usize| -> Result<Tensor> { Ok(t.narrow(0, g * h, h)?) };
+        // Two `[3H, n]` gate-major matrices -> `[6H, 2n]` block diagonal.
+        let block_diag = |a: &Tensor, b: &Tensor| -> Result<Tensor> {
+            let pad = zeros(&[h, a.dim_const(1)?], DType::Float32);
+            let column = |w: &Tensor, lead: bool| -> Result<Tensor> {
+                let mut rows = Vec::with_capacity(6);
+                for g in 0..3 {
+                    let block = gate(w, g)?;
+                    rows.extend(if lead { [block, pad.clone()] } else { [pad.clone(), block] });
+                }
+                Ok(Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?)
+            };
+            Ok(Tensor::cat(&[&column(a, true)?, &column(b, false)?], 1)?)
+        };
+        // Two `[3H]` gate-major vectors -> `[6H]`, interleaved within each gate.
+        let interleave = |a: &Tensor, b: &Tensor| -> Result<Tensor> {
+            let mut parts = Vec::with_capacity(6);
+            for g in 0..3 {
+                parts.extend([gate(a, g)?, gate(b, g)?]);
+            }
+            Ok(Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)?)
+        };
+        Ok(Self {
+            hidden_size: 2 * h,
+            weight_ih: block_diag(&self.weight_ih, &other.weight_ih)?,
+            weight_hh: block_diag(&self.weight_hh, &other.weight_hh)?,
+            bias_ih: interleave(&self.bias_ih, &other.bias_ih)?,
+            bias_hh: interleave(&self.bias_hh, &other.bias_hh)?,
+        })
+    }
 }
 
 /// Drive `gru()` over `dirs` directions' weights, returning nn.GRU's
@@ -320,9 +367,15 @@ fn run_gru(x: &Tensor, dirs: &[&GruWeights], direction: Option<GruDirection>) ->
 // GRNN — grouped RNN (two GRUs over channel-halves)
 // --------------------------------------------------------------------------- //
 
-/// `GRNN`: splits the feature axis in halves, runs one GRU per half, concats.
-/// A present `_b` half makes that GRU bidirectional — the reverse weights are
-/// the whole of what "bidirectional" means here, so there is no separate flag.
+/// `GRNN`: two GRUs over disjoint halves of the feature axis, outputs
+/// concatenated. A present `_b` half makes that GRU bidirectional — the reverse
+/// weights are the whole of what "bidirectional" means here, so there is no
+/// separate flag.
+///
+/// The two groups never exchange information, so the forward runs them as one
+/// [block-diagonal GRU](GruWeights::merge) — the same arithmetic in half the
+/// scans, which is what this model's latency is made of. The four weight sets
+/// stay stored apart, so the state dict is untouched.
 #[derive(Clone, Module)]
 pub struct Grnn {
     pub rnn1_f: GruWeights,
@@ -332,18 +385,35 @@ pub struct Grnn {
 }
 
 impl Grnn {
-    /// `(B, T, input) -> (B, T, hidden)`. Splits input on the last axis,
-    /// runs rnn1/rnn2 on the halves, concatenates outputs.
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let halves = x.chunk(2, -1)?;
-        let run = |fwd: &GruWeights, rev: &Option<GruWeights>, x: &Tensor| match rev {
-            Some(rev) => run_gru(x, &[fwd, rev], Some(GruDirection::Bidirectional)),
-            None => fwd.forward(x),
-        };
-        let y1 = run(&self.rnn1_f, &self.rnn1_b, &halves[0])?;
-        let y2 = run(&self.rnn2_f, &self.rnn2_b, &halves[1])?;
-        Ok(Tensor::cat(&[&y1, &y2], -1)?)
+    /// Both groups' forward GRUs as one. Built once per graph — the scan
+    /// re-launches only the step, so this never enters the time loop.
+    pub(super) fn merged_forward(&self) -> Result<GruWeights> {
+        self.rnn1_f.merge(&self.rnn2_f)
     }
+
+    /// `(B, T, input) -> (B, T, hidden)`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let fwd = self.merged_forward()?;
+        let (Some(b1), Some(b2)) = (&self.rnn1_b, &self.rnn2_b) else {
+            // Unidirectional: the merged output is `[y₁ | y₂]` already.
+            return fwd.forward(x);
+        };
+        let y = run_gru(x, &[&fwd, &b1.merge(b2)?], Some(GruDirection::Bidirectional))?;
+        regroup(&y, self.rnn1_f.hidden_size)
+    }
+}
+
+/// `[fwd₁ | fwd₂ | rev₁ | rev₂] -> [fwd₁ | rev₁ | fwd₂ | rev₂]`, the order the
+/// per-group `cat` of two bidirectional GRUs produced and the consuming FC was
+/// trained against. A merged bidirectional GRU concatenates *directions*
+/// outermost where the split pair concatenated *groups* outermost, so undoing
+/// it is a transpose of the two 2-wide factors of the feature axis — one op on
+/// the finished sequence, outside the scan.
+fn regroup(y: &Tensor, h: usize) -> Result<Tensor> {
+    let s = y.shape()?;
+    let (b, t) = (s[0].clone(), s[1].clone());
+    let split = y.try_reshape([b.clone(), t.clone(), SInt::Const(2), SInt::Const(2), SInt::Const(h)])?;
+    Ok(split.try_permute(&[0, 1, 3, 2, 4])?.try_reshape([b, t, SInt::Const(4 * h)])?)
 }
 
 // --------------------------------------------------------------------------- //
