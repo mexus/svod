@@ -122,7 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fixed-size sample chunks (one prepare, reused per chunk): a chunk of
     // CHUNK_FRAMES · HOP samples is CHUNK_FRAMES + 1 STFT frames in and the
     // same sample count back out, so the enhanced chunks concatenate directly.
-    const CHUNK_FRAMES: usize = 32;
+    //
+    // 128 is the measured knee. The DPGRNN's intra RNN runs along frequency,
+    // not time, so its 33 steps cost the same whatever the chunk length and
+    // amortise as the chunk grows: 36 dispatches per frame at 32 frames, 24 at
+    // 128. Past that the whole-chunk convolutions start losing more than the
+    // recurrence saves (256 is slower than 128 on both devices).
+    const CHUNK_FRAMES: usize = 128;
     const CHUNK_SAMPLES: usize = CHUNK_FRAMES * HOP;
     let mut enh = vec![0.0f32; waveform.len()];
 
