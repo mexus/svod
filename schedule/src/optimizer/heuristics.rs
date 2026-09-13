@@ -257,18 +257,18 @@ fn strides_of(
                 // c is rng → stride 1
                 sum_strides += 1;
             } else if let Op::Binary(BinaryOp::Mul, lhs, rhs) = term.op() {
-                // c.op is Ops.MUL and one side is rng and other is CONST
-                if Arc::ptr_eq(lhs, target_rng)
-                    && let Op::Const(cv) = rhs.op()
-                    && let svod_ir::ConstValue::Int(v) = cv.0
-                {
-                    sum_strides += v as usize;
-                } else if Arc::ptr_eq(rhs, target_rng)
-                    && let Op::Const(cv) = lhs.op()
-                    && let svod_ir::ConstValue::Int(v) = cv.0
-                {
-                    sum_strides += v as usize;
-                }
+                // c.op is Ops.MUL and one side is rng and other is CONST.
+                // A reversed axis (a flipped view, as `conv_transpose2d` builds)
+                // indexes with a negative constant; like `min_stride`, that is
+                // no forward stride at all — and must not wrap into `usize`.
+                let stride = if Arc::ptr_eq(lhs, target_rng) {
+                    const_int(rhs)
+                } else if Arc::ptr_eq(rhs, target_rng) {
+                    const_int(lhs)
+                } else {
+                    None
+                };
+                sum_strides += stride.filter(|&v| v > 0).unwrap_or(0) as usize;
             }
         }
     }

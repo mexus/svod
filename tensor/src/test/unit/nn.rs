@@ -832,3 +832,20 @@ fn test_densenet_two_layer_kernel_count() {
 }
 
 // Full ONNX model kernel count test: onnx/src/test/unit/nn.rs::test_rnnt_encoder_kernel_count
+
+/// A dilated convolution whose output extent is smaller than its dilation.
+/// Frame-at-a-time streaming always produces one output row, so every dilated
+/// temporal conv in a streaming model lands here.
+#[test]
+fn conv2d_output_shorter_than_its_dilation() {
+    // H = 5, kernel 3, dilation 2 -> one output row: 5 - 2*(3-1) = 1.
+    let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 5, 1), (0..5).map(|v| v as f32).collect()).unwrap());
+    let w = Tensor::from_ndarray(&Array4::<f32>::ones((1, 1, 3, 1)));
+
+    let y = x.conv2d().weight(&w).dilation(&[2, 1]).call().expect("a dilated conv must build");
+
+    assert_eq!(get_shape(&y), vec![1, 1, 1, 1]);
+    y.realize().unwrap();
+    // Taps at rows 0, 2, 4 of [0,1,2,3,4].
+    assert_eq!(y.to_vec::<f32>().unwrap(), vec![6.0]);
+}

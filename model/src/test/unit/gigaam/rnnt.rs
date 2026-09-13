@@ -189,7 +189,6 @@ fn rnnt_block_decode_is_window_invariant(window: usize) {
         sentencepiece: false,
     });
     let d_model = cfg.d_model;
-    let model = GigaAm::with_random_weights(cfg);
     let decoder =
         RnntDecoder::new((0..NUM_CLASSES - 1).map(|i| i.to_string()).collect(), RnntOpts { max_symbols_per_step: 3 });
 
@@ -211,11 +210,21 @@ fn rnnt_block_decode_is_window_invariant(window: usize) {
         decoder.decode_batch_blocks(valid, &mut backend).expect("decode")
     }
 
-    let reference = decode::<{ DECODE_WINDOW }>(model.clone(), &frames, &valid, &decoder);
-    assert!(
-        reference.iter().any(|(_, emissions)| !emissions.is_empty()),
-        "the fixture emitted nothing; the window comparison would be vacuous"
-    );
+    // `with_random_weights` draws from the global RNG, which seeds itself from the
+    // wall clock unless a test called `manual_seed`. Whether a random transducer
+    // reaches a non-blank class before running out of frames is then part of the
+    // draw — about one draw in thirty emits nothing, which makes the comparison
+    // below vacuous and failed CI on an unrelated commit. Seeding would only fix
+    // the draw, not the arithmetic: the emission also turns on float results that
+    // differ between this host and the runner. So redraw until the reference has
+    // something to compare, which holds whatever the platform computes.
+    let (model, reference) = (0..8)
+        .find_map(|_| {
+            let model = GigaAm::with_random_weights(cfg.clone());
+            let decoded = decode::<{ DECODE_WINDOW }>(model.clone(), &frames, &valid, &decoder);
+            decoded.iter().any(|(_, emissions)| !emissions.is_empty()).then_some((model, decoded))
+        })
+        .expect("eight random transducers all emitted nothing; the fixture is no longer decoding");
     let under_test = match window {
         1 => decode::<1>(model, &frames, &valid, &decoder),
         2 => decode::<2>(model, &frames, &valid, &decoder),

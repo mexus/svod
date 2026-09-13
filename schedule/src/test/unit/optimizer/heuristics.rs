@@ -546,6 +546,23 @@ fn is_masked_follows_the_where_condition(axis: usize) {
     assert_eq!(is_masked(&scheduler, 1), axis == 1);
 }
 
+/// A reversed axis indexes with a negative constant — `conv_transpose2d` builds
+/// exactly that, flipping the kernel — and it is no forward stride at all. The
+/// sum used to cast the constant straight to `usize`, so one reversed term
+/// wrapped to about 2^64 and the next addition overflowed, which made every
+/// kernel carrying a transposed convolution unschedulable.
+#[test_case(-1, 1, 0 ; "a reversed row axis counts as no stride")]
+#[test_case(768, 1, 768 ; "a forward row axis counts its stride")]
+fn a_negative_stride_does_not_wrap(row_stride: i64, reduce_stride: i64, expected_sum: usize) {
+    let sink = laid_out_reduce(64, 8, row_stride, reduce_stride, DType::Float16);
+    let scheduler = Scheduler::new(sink, Renderer::cuda());
+
+    let (num_strides, sum_strides) = count_strides(&scheduler, 0);
+
+    assert_eq!(num_strides, 1, "the buffer indexes the row axis either way");
+    assert_eq!(sum_strides, expected_sum);
+}
+
 /// Row reduces: many rows get a wave split off the contiguous reduce axis plus an unroll.
 #[test_case(Renderer::cuda(), 8192, 768, 768, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "many rows split a warp off the contiguous reduce")]
 #[test_case(Renderer::cuda(), 8192, 3072, 3072, 1, &[Opt::group(0, 32), Opt::unroll(1, 4)]; "a longer row keeps the same split")]
