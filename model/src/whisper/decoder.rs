@@ -535,8 +535,15 @@ impl TextDecoder {
             let cross_out = match direct {
                 Some(out) => out.try_reshape([batch, 1, self.n_state])?.cast(self.activation_dtype.clone()),
                 None => {
-                    let layer_ck = cross_k.narrow(2, lh_start, n_head)?.cast(self.activation_dtype.clone());
-                    let layer_cv = cross_v.narrow(2, lh_start, n_head)?.cast(self.activation_dtype.clone());
+                    // The cache holds one row per attempt, so a lane reads the row
+                    // its attempt owns. The tile kernel does that with an index load;
+                    // here it costs a gather, which is why the fast path exists.
+                    let owned = |cache: &Tensor| -> Result<Tensor> {
+                        let layer = cache.narrow(2, lh_start, n_head)?;
+                        Ok(layer.index_select(0, cross_cache_map)?.cast(self.activation_dtype.clone()))
+                    };
+                    let layer_ck = owned(cross_k)?;
+                    let layer_cv = owned(cross_v)?;
                     let cq_h = cq_seq.try_permute(&[0, 2, 1, 3])?;
                     let layer_ck_h = layer_ck.try_permute(&[0, 2, 1, 3])?;
                     let layer_cv_h = layer_cv.try_permute(&[0, 2, 1, 3])?;
