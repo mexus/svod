@@ -475,7 +475,12 @@ impl TextDecoder {
                     &q_seq.cast(DType::Float32),
                     &full_k,
                     &full_v,
-                    svod_tk::SqAttentionOpts { key_lens: Some(self_key_lens), include_last: true, split: 1 },
+                    svod_tk::SqAttentionOpts {
+                        key_lens: Some(self_key_lens),
+                        include_last: true,
+                        split: 1,
+                        cache_map: None,
+                    },
                 )
                 .map_err(tk_launch_error)?
             } else {

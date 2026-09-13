@@ -34,12 +34,46 @@ pub struct SqAttentionOpts<'a> {
     /// Number of contiguous K/V chunks. Values above one are supported only for
     /// unmasked attention when `N` is divisible by `split`.
     pub split: usize,
+    /// Optional `[B]` i32 map from a query row to the K/V row it reads.
+    ///
+    /// Rows that decode the same audio share a cross-attention cache — beam
+    /// search runs every hypothesis against one window — but rows belonging to
+    /// different windows do not. Pointing each row at its own cache row lets one
+    /// copy serve a whole hypothesis set without serializing the windows: the
+    /// caller writes the cache once per window instead of once per row, and the
+    /// step reads the largest tensor it touches once per window rather than once
+    /// per row. Entries must be in `0..K batch`; out-of-range reads are undefined.
+    pub cache_map: Option<&'a Tensor>,
 }
 
 impl Default for SqAttentionOpts<'_> {
     fn default() -> Self {
-        Self { key_lens: None, include_last: false, split: 1 }
+        Self { key_lens: None, include_last: false, split: 1, cache_map: None }
     }
+}
+
+/// Shape one single-query attention kernel is built for.
+///
+/// `kv_batch` is `b`, `1` when one K/V cache serves every row, or the number of
+/// caches a `cache_map` selects between.
+#[derive(Clone, Copy)]
+pub(crate) struct SqGeom {
+    pub(crate) b: usize,
+    pub(crate) kv_batch: usize,
+    pub(crate) n: usize,
+    pub(crate) heads: HeadSelection,
+    pub(crate) d: usize,
+}
+
+/// The K/V row a query row reads: its own, row 0 for a single shared cache, or
+/// whatever `cache_map` names. The map is bound last so the ABI stays
+/// `q, k, v[, key_lens][, cache_map]`.
+fn kv_row_index(ker: &Kernel, b: usize, kv_batch: usize, cache_map: bool, batch: &Arc<UOp>) -> Idx {
+    if cache_map {
+        let map = ker.gl(&[b], DType::Int32);
+        return Idx::Uop(load_at(map.uop(), map.shape(), &[Idx::from(batch)]));
+    }
+    if kv_batch == 1 { Idx::Const(0) } else { Idx::Uop(batch.clone()) }
 }
 
 fn cidx(v: i64) -> Arc<UOp> {
@@ -61,15 +95,21 @@ pub(crate) struct HeadSelection {
 ///
 /// ABI is `out, q, k, v, [key_lens]`, with sequence-major `[B,S,H,D]` Q/output
 /// and `[B,S,H_total,D]` K/V globals.
+/// `kv_batch` is `b`, or `1` when one K/V cache serves every batch row. Beam
+/// search decodes each hypothesis against the *same* audio, so the cross
+/// attention cache is identical across rows; binding it once and indexing row 0
+/// turns a `b`-fold re-read of the largest tensor in the step into a single one.
+/// `cache_map` binds a trailing `[b]` i32 global (after `key_lens`, when present)
+/// giving the K/V row each query row reads; without it every row reads its own,
+/// or row 0 when `kv_batch` is 1.
 pub(crate) fn build_single_query_attention(
     ker: &Kernel,
-    b: usize,
-    n: usize,
-    heads: HeadSelection,
-    d: usize,
+    geom: SqGeom,
     masked: bool,
     include_last: bool,
+    cache_map: bool,
 ) {
+    let SqGeom { b, kv_batch, n, heads, d } = geom;
     let wave = ker.caps.wave_size;
     Kernel::assert_divisible(d, wave, "single-query attention D");
     assert!(n > 0, "single-query attention N must be > 0");
@@ -82,8 +122,8 @@ pub(crate) fn build_single_query_attention(
         &[GlSpec::new(&[b, 1, heads.count, d], f32.clone())],
         &[
             GlSpec::new(&[b, 1, heads.count, d], f32.clone()),
-            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
-            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
+            GlSpec::new(&[kv_batch, n, heads.total, d], f32.clone()),
+            GlSpec::new(&[kv_batch, n, heads.total, d], f32.clone()),
         ],
     );
     let (out, q, k, v) = (outs[0].clone(), ins[0].clone(), ins[1].clone(), ins[2].clone());
@@ -95,6 +135,7 @@ pub(crate) fn build_single_query_attention(
         let lens = ker.gl(&[b], DType::Int32);
         load_at(lens.uop(), lens.shape(), &[Idx::from(&batch)])
     });
+    let kv_row = kv_row_index(ker, b, kv_batch, cache_map, &batch);
 
     let q_reg = ker.alloc_reg(ept, f32.clone());
     let o_reg = ker.alloc_reg(ept, f32.clone());
@@ -141,7 +182,7 @@ pub(crate) fn build_single_query_attention(
         let dim = lane.add(&cidx((j * wave) as i64));
         let qv = load_at(&q_loop, &[ept], &[Idx::Const(j as i64)]);
         let kv =
-            load_at(k.uop(), k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
+            load_at(k.uop(), k.shape(), &[kv_row.clone(), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         dot = dot.add(&qv.mul(&kv));
     }
     let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
@@ -159,7 +200,7 @@ pub(crate) fn build_single_query_attention(
         let dim = lane.add(&cidx((j * wave) as i64));
         let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
         let vv =
-            load_at(v.uop(), v.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
+            load_at(v.uop(), v.shape(), &[kv_row.clone(), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         let new_o = old_o.mul(&alpha).add(&vv.mul(&beta));
         output_stores.push(
             flat_index(&o_reg.after(smallvec![norm_store.clone()]), &[ept], &[Idx::Const(j as i64)]).store(new_o),
@@ -189,14 +230,15 @@ pub(crate) fn build_single_query_attention(
 /// ABI is `numerator, stats, q, k, v`; K/V use `[B,N,H_total,D]`, while
 /// outputs are `[B,S,H,D]` and `[B,S,H,2]`, where the final axis of stats is
 /// `(max, norm)`.
-pub(crate) fn build_single_query_attention_partial(
-    ker: &Kernel,
-    b: usize,
-    n: usize,
-    heads: HeadSelection,
-    d: usize,
-    splits: usize,
-) {
+/// `kv_batch` is `b`, or `1` when one K/V cache serves every batch row. Beam
+/// search decodes each hypothesis against the *same* audio, so the cross
+/// attention cache is identical across rows; binding it once and indexing row 0
+/// turns a `b`-fold re-read of the largest tensor in the step into a single one.
+/// `cache_map` binds a trailing `[b]` i32 global (after `key_lens`, when present)
+/// giving the K/V row each query row reads; without it every row reads its own,
+/// or row 0 when `kv_batch` is 1.
+pub(crate) fn build_single_query_attention_partial(ker: &Kernel, geom: SqGeom, splits: usize, cache_map: bool) {
+    let SqGeom { b, kv_batch, n, heads, d } = geom;
     const SUBGROUP: usize = 8;
     let wave = ker.caps.wave_size;
     Kernel::assert_divisible(d, wave, "single-query attention D");
@@ -217,8 +259,8 @@ pub(crate) fn build_single_query_attention_partial(
         ],
         &[
             GlSpec::new(&[b, 1, heads.count, d], f32.clone()),
-            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
-            GlSpec::new(&[b, n, heads.total, d], f32.clone()),
+            GlSpec::new(&[kv_batch, n, heads.total, d], f32.clone()),
+            GlSpec::new(&[kv_batch, n, heads.total, d], f32.clone()),
         ],
     );
     let (numerator, stats) = (outs[0].clone(), outs[1].clone());
@@ -226,6 +268,7 @@ pub(crate) fn build_single_query_attention_partial(
     let head = ker.grid_x();
     let packed_head = head.add(&cidx(heads.offset as i64));
     let batch = ker.grid_y();
+    let kv_row = kv_row_index(ker, b, kv_batch, cache_map, &batch);
     let split = ker.grid_z();
     let lane = ker.laneid();
 
@@ -267,8 +310,7 @@ pub(crate) fn build_single_query_attention_partial(
     for j in 0..dot_ept {
         let dim = subgroup_lane.add(&cidx((j * SUBGROUP) as i64));
         let qv = load_at(&q_loop, &[dot_ept], &[Idx::Const(j as i64)]);
-        let k_off =
-            flat_offset(k.shape(), &[Idx::from(&batch), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
+        let k_off = flat_offset(k.shape(), &[kv_row.clone(), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
         let kv = load_off_gated(k.uop(), k_off, valid.clone(), f32c(0.0));
         dot = dot.add(&qv.mul(&kv));
     }
@@ -298,7 +340,7 @@ pub(crate) fn build_single_query_attention_partial(
             let group_key = split.mul(&cidx(chunk as i64)).add(&group_key_offset);
             let v_off = flat_offset(
                 v.shape(),
-                &[Idx::from(&batch), Idx::from(&group_key), Idx::from(&packed_head), Idx::from(dim.clone())],
+                &[kv_row.clone(), Idx::from(&group_key), Idx::from(&packed_head), Idx::from(dim.clone())],
             );
             let vv = load_off_gated(v.uop(), v_off, group_valid, f32c(0.0));
             tile_o = tile_o.add(&vv.mul(group_beta));
@@ -432,7 +474,8 @@ pub fn single_query_attention(
 
 /// Graph-native FP32 single-query attention over selected heads in packed K/V.
 ///
-/// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]`, and heads
+/// Q is `[B,1,H,D]`, K/V are `[B,N,H_total,D]` — or `[1,N,H_total,D]` to serve
+/// every batch row from one cache — and heads
 /// `head_offset..head_offset+H` are selected without materializing a slice.
 pub fn single_query_attention_packed(
     q: &Tensor,
@@ -447,6 +490,7 @@ pub fn single_query_attention_packed(
     let (b, n, h, h_total, d) = (qd[0], kd[1], qd[2], kd[2], qd[3]);
     let dtype = q.uop().dtype();
     let masked = opts.key_lens.is_some();
+    let has_map = opts.cache_map.is_some();
     let splits = opts.split;
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
 
@@ -459,9 +503,28 @@ pub fn single_query_attention_packed(
             multiple: 1usize
         }
     );
+    // One K/V cache may serve every batch row: beam search decodes each hypothesis
+    // against the same audio, so a cross-attention cache is identical across rows.
+    let kv_batch = kd[0];
+    // With a map, any cache count is addressable: the map names the row. Without
+    // one, a cache is either per-row or the single one every row shares.
     ensure!(
-        kd[0] == b,
-        crate::launch::OperandDimMismatchSnafu { kernel: "single-query attention", dim: "K batch B", a: kd[0], b }
+        opts.cache_map.is_some() || kv_batch == b || kv_batch == 1,
+        crate::launch::OperandDimMismatchSnafu {
+            kernel: "single-query attention",
+            dim: "K batch (B or 1 without cache_map)",
+            a: kd[0],
+            b
+        }
+    );
+    ensure!(
+        kv_batch > 0,
+        crate::launch::DimMultipleSnafu {
+            kernel: "single-query attention",
+            dim: "K batch (> 0)",
+            value: kv_batch,
+            multiple: 1usize
+        }
     );
     ensure!(
         head_offset <= h_total && h <= h_total - head_offset,
@@ -482,7 +545,7 @@ pub fn single_query_attention_packed(
         }
     );
     for (dim, a, expected) in [
-        ("V batch B", vd[0], b),
+        ("V batch (must match K)", vd[0], kv_batch),
         ("V sequence N", vd[1], n),
         ("V total heads H_total", vd[2], h_total),
         ("V head dim D", vd[3], d),
@@ -519,6 +582,22 @@ pub fn single_query_attention_packed(
             multiple: 1usize
         }
     );
+    if let Some(map) = opts.cache_map {
+        let md = crate::launch::concrete_dims(map, "single-query attention", "cache_map", 1)?;
+        ensure!(
+            md == [b],
+            crate::launch::OperandDimMismatchSnafu {
+                kernel: "single-query attention",
+                dim: "cache_map B",
+                a: md[0],
+                b
+            }
+        );
+        ensure!(
+            map.uop().dtype() == DType::Int32,
+            crate::launch::DtypeSnafu { kernel: "single-query attention", got: map.uop().dtype(), expected: "i32" }
+        );
+    }
     if let Some(lens) = opts.key_lens {
         let ld = crate::launch::concrete_dims(lens, "single-query attention", "key_lens", 1)?;
         ensure!(
@@ -556,11 +635,15 @@ pub fn single_query_attention_packed(
         move |arch| d.is_multiple_of(ArchCaps::for_arch(arch).wave_size),
         move |arch| {
             let caps = ArchCaps::for_arch(arch);
+            let geom = SqGeom { b, kv_batch, n, heads, d };
             if splits == 1 {
                 let out = Tensor::empty(&[b, 1, h, d], DType::Float32);
                 let mut inputs = vec![q, k, v];
                 if let Some(lens) = opts.key_lens {
                     inputs.push(lens);
+                }
+                if let Some(map) = opts.cache_map {
+                    inputs.push(map);
                 }
                 crate::graph_launch(
                     "sq_attention",
@@ -570,11 +653,15 @@ pub fn single_query_attention_packed(
                     &inputs,
                     caps,
                     move |ker| {
-                        build_single_query_attention(ker, b, n, heads, d, masked, opts.include_last);
+                        build_single_query_attention(ker, geom, masked, opts.include_last, has_map);
                         ker.finish(1)
                     },
                 )
             } else {
+                let mut partial_inputs = vec![q, k, v];
+                if let Some(map) = opts.cache_map {
+                    partial_inputs.push(map);
+                }
                 let partials = crate::graph_launch_multi(
                     "sq_attention_partial",
                     [h as i64, b as i64, splits as i64],
@@ -583,10 +670,10 @@ pub fn single_query_attention_packed(
                         Tensor::empty(&[b, splits, h, d], DType::Float32),
                         Tensor::empty(&[b, splits, h, 2], DType::Float32),
                     ],
-                    &[q, k, v],
+                    &partial_inputs,
                     caps,
                     move |ker| {
-                        build_single_query_attention_partial(ker, b, n, heads, d, splits);
+                        build_single_query_attention_partial(ker, geom, splits, has_map);
                         ker.finish(2)
                     },
                 )?;

@@ -6,7 +6,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::kernels::sq_attention::{
-    HeadSelection, SQ_ATTENTION_SUPPORTED_ARCHS, SqAttentionOpts, build_single_query_attention,
+    HeadSelection, SQ_ATTENTION_SUPPORTED_ARCHS, SqAttentionOpts, SqGeom, build_single_query_attention,
     build_single_query_attention_merge, build_single_query_attention_partial,
 };
 use crate::{ArchCaps, Kernel};
@@ -42,7 +42,7 @@ fn sink(caps: ArchCaps, masked: bool) -> Arc<UOp> {
         caps,
     );
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
-    build_single_query_attention(&ker, b, n, heads, d, masked, masked);
+    build_single_query_attention(&ker, SqGeom { b, kv_batch: b, n, heads, d }, masked, masked, false);
     ker.finish(1)
 }
 
@@ -63,7 +63,7 @@ fn split_sinks(caps: ArchCaps, splits: usize, d: usize) -> (Arc<UOp>, Arc<UOp>) 
         caps,
     );
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
-    build_single_query_attention_partial(&partial, b, n, heads, d, splits);
+    build_single_query_attention_partial(&partial, SqGeom { b, kv_batch: b, n, heads, d }, splits, false);
     let partial = partial.finish(2);
 
     let merge_buffers = vec![
@@ -235,6 +235,117 @@ fn cpu_reference(
     out
 }
 
+/// One K/V cache serving every batch row must decode exactly as the same cache
+/// replicated per row. Beam search reads an identical cross-attention cache from
+/// every hypothesis, so binding it once is the difference between reading the
+/// largest tensor in the step `B` times and reading it once.
+///
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_attention_broadcast -- --ignored`.
+#[test]
+#[ignore]
+fn sq_attention_broadcast_cache_matches_a_replicated_one() {
+    if !supported_device() {
+        eprintln!("skip sq_attention_broadcast_cache_matches_a_replicated_one: unsupported device/toolchain");
+        return;
+    }
+    // Whisper's cross-attention geometry: five hypotheses over one 1500-frame window.
+    let (b, n, h, h_total, d, head_offset) = (5usize, 1500usize, 20usize, 24usize, 64usize, 2usize);
+    let q = Tensor::randn(&[b, 1, h, d]).expect("q");
+    let shared_k = Tensor::randn(&[1, n, h_total, d]).expect("shared k");
+    let shared_v = Tensor::randn(&[1, n, h_total, d]).expect("shared v");
+    for t in [&q, &shared_k, &shared_v] {
+        t.realize().expect("realize");
+    }
+    // The same bytes, laid out once per row, is what the kernel used to require.
+    let tile = |t: &Tensor| {
+        let wide = t.try_expand([b, n, h_total, d]).expect("expand").contiguous();
+        wide.realize().expect("realize tiled");
+        wide
+    };
+    let (wide_k, wide_v) = (tile(&shared_k), tile(&shared_v));
+
+    for split in [1usize, 4] {
+        let run = |k: &Tensor, v: &Tensor| {
+            let opts = SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+            let out = crate::single_query_attention_packed(&q, k, v, head_offset, opts)
+                .expect("sq attention")
+                .expect("supported");
+            out.realize().expect("realize");
+            out.as_vec::<f32>().expect("vec")
+        };
+        let shared = run(&shared_k, &shared_v);
+        let replicated = run(&wide_k, &wide_v);
+        assert_eq!(shared.len(), replicated.len());
+        let max_abs = shared.iter().zip(&replicated).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        assert_eq!(max_abs, 0.0, "split {split}: broadcast diverged from the replicated cache by {max_abs}");
+    }
+}
+
+/// With rows pointing at different caches, each must read the one it names.
+///
+/// This is the shape a batched decoder actually has: several hypothesis sets in
+/// flight, each against its own audio window, so neither "one cache for all rows"
+/// nor "a cache per row" describes it. The map lets one copy serve a whole
+/// hypothesis set without serializing the windows.
+///
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_attention_cache_map -- --ignored`.
+#[test]
+#[ignore]
+fn sq_attention_cache_map_reads_the_row_it_names() {
+    if !supported_device() {
+        eprintln!("skip sq_attention_cache_map_reads_the_row_it_names: unsupported device/toolchain");
+        return;
+    }
+    // Four query rows over two windows, interleaved so a row never reads its own index.
+    let (b, caches, n, h, h_total, d, head_offset) = (4usize, 2usize, 256usize, 3usize, 7usize, 64usize, 2usize);
+    let owners = [0i32, 1, 0, 1];
+    let q = Tensor::randn(&[b, 1, h, d]).expect("q");
+    let k = Tensor::randn(&[caches, n, h_total, d]).expect("k");
+    let v = Tensor::randn(&[caches, n, h_total, d]).expect("v");
+    for t in [&q, &k, &v] {
+        t.realize().expect("realize");
+    }
+    let map = Tensor::from_slice(owners.as_slice());
+    map.realize().expect("realize map");
+
+    // The same caches laid out one per row — what the kernel required before.
+    let widen = |t: &Tensor| {
+        let rows: Vec<Tensor> = owners.iter().map(|&o| t.narrow(0, o as usize, 1usize).expect("row")).collect();
+        let wide = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0).expect("cat").contiguous();
+        wide.realize().expect("realize wide");
+        wide
+    };
+    let (wide_k, wide_v) = (widen(&k), widen(&v));
+
+    for split in [1usize, 4] {
+        let mapped = crate::single_query_attention_packed(
+            &q,
+            &k,
+            &v,
+            head_offset,
+            SqAttentionOpts { cache_map: Some(&map), split, ..Default::default() },
+        )
+        .expect("mapped")
+        .expect("supported");
+        mapped.realize().expect("realize mapped");
+        let replicated = crate::single_query_attention_packed(
+            &q,
+            &wide_k,
+            &wide_v,
+            head_offset,
+            SqAttentionOpts { split, ..Default::default() },
+        )
+        .expect("replicated")
+        .expect("supported");
+        replicated.realize().expect("realize replicated");
+
+        let a = mapped.as_vec::<f32>().expect("mapped vec");
+        let e = replicated.as_vec::<f32>().expect("replicated vec");
+        let max_abs = a.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert_eq!(max_abs, 0.0, "split {split}: mapped cache diverged from the replicated one by {max_abs}");
+    }
+}
+
 /// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_attention_numerical_gpu -- --ignored`.
 #[test]
 #[ignore]
@@ -260,7 +371,8 @@ fn sq_attention_numerical_gpu() {
             if let Some(t) = &mut lens_t {
                 t.realize().expect("realize lens");
             }
-            let opts = SqAttentionOpts { key_lens: lens_t.as_ref(), include_last: lens.is_some(), split };
+            let opts =
+                SqAttentionOpts { key_lens: lens_t.as_ref(), include_last: lens.is_some(), split, cache_map: None };
             let got = crate::single_query_attention_packed(&q, &k, &v, head_offset, opts)
                 .expect("sq attention")
                 .expect("supported");

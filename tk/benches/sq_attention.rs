@@ -36,8 +36,12 @@ fn bench_sq_attention(c: &mut Criterion) {
 
         let splits: &[usize] = if mode == "cross" { &[1, 2, 4, 5, 10] } else { &[1] };
         for &split in splits {
-            let opts =
-                svod_tk::SqAttentionOpts { key_lens: lens.as_ref(), include_last: mode.starts_with("self"), split };
+            let opts = svod_tk::SqAttentionOpts {
+                key_lens: lens.as_ref(),
+                include_last: mode.starts_with("self"),
+                split,
+                cache_map: None,
+            };
             let tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
             let tk_plan = tk.prepare().expect("prepare tk");
             group.bench_with_input(BenchmarkId::new(format!("tk/{mode}/split_{split}"), n), &n, |bencher, _| {
