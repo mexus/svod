@@ -49,6 +49,16 @@ struct Args {
     /// data/gtcrn/gtcrn.safetensors or $SVOD_GTCRN/gtcrn.safetensors.
     #[arg(long)]
     weights: Option<PathBuf>,
+
+    /// Re-run one steady-state chunk under the profiler and print the per-kernel
+    /// report. The enhancement pass itself is timed unprofiled, so the RTF above
+    /// stays comparable.
+    #[arg(long)]
+    profile: bool,
+
+    /// Origin rollup depth for `--profile`; defaults to `SVOD_ORIGIN_DEPTH`.
+    #[arg(long)]
+    origin_depth: Option<usize>,
 }
 
 fn resolve_weights(args: &Args) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -142,6 +152,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_frames(waveform.len()),
         t.elapsed().as_secs_f32()
     );
+
+    if args.profile {
+        // One chunk, after the loop above has warmed every cache, so the report
+        // is steady state rather than first-dispatch.
+        buf[..CHUNK_SAMPLES].copy_from_slice(&waveform[..CHUNK_SAMPLES.min(waveform.len())]);
+        jit.waveform_mut()?.copyin(bytemuck::cast_slice(&buf))?;
+        let t = Instant::now();
+        let kernels = jit.execute_profiled()?;
+        let stage = svod_runtime::StageProfile::gpu("enhance_chunk", t.elapsed(), kernels);
+        let mut run = svod_runtime::RunProfile::default();
+        run.push(stage);
+        let depth = args.origin_depth.or_else(|| svod_runtime::ProfileOptions::from_env().origin_depth);
+        println!("\n--- Profile (one {CHUNK_FRAMES}-frame chunk) ---\n{}", run.render_report_at(depth));
+
+        // Split by dispatch count: a kernel launched once per STFT frame is the
+        // recurrence re-launched per time slot; a kernel launched a handful of
+        // times is a whole-chunk op (conv, STFT, mask).
+        let frames = CHUNK_FRAMES + 1;
+        let aggs = svod_runtime::aggregate_profiles(&run.stages[0].kernels);
+        let (mut rec_ms, mut rec_n, mut one_ms, mut one_n) = (0.0f64, 0usize, 0.0f64, 0usize);
+        for a in &aggs {
+            let ms = a.total.as_secs_f64() * 1e3;
+            if a.count >= frames {
+                rec_ms += ms;
+                rec_n += a.count;
+            } else {
+                one_ms += ms;
+                one_n += a.count;
+            }
+        }
+        let tot = rec_ms + one_ms;
+        println!(
+            "per-frame (recurrence): {rec_n:5} dispatches  {rec_ms:6.3} ms  {:5.1}%\n\
+             whole-chunk (conv/stft): {one_n:5} dispatches  {one_ms:6.3} ms  {:5.1}%",
+            100.0 * rec_ms / tot,
+            100.0 * one_ms / tot
+        );
+    }
 
     // Write enhanced WAV.
     let spec = hound::WavSpec {
