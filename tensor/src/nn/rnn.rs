@@ -356,14 +356,22 @@ impl RecurrentCell for GruCell {
 
     fn step_projected(&self, gx: &Tensor, h: &Self::State) -> Result<Self::State> {
         let hs = self.hidden_size;
-        let gh_rz = h.linear().weight(&self.w_hh_rz).maybe_bias(self.b_hh_rz.as_ref()).call()?;
-        let r = gx.narrow(-1, 0usize, hs)?.try_add(&gh_rz.narrow(-1, 0usize, hs)?)?.sigmoid()?;
-        let z = gx.narrow(-1, hs, hs)?.try_add(&gh_rz.narrow(-1, hs, hs)?)?.sigmoid()?;
+        // With `linear_before_reset` the `n` gate reads `h` directly, so its
+        // recurrent projection is independent of `r` and belongs in the same
+        // matmul as `r` and `z` -- one reduce per step rather than two, which on
+        // a short sequence is the difference between one dispatch and two.
+        // Without it, `n` projects `r * h` and genuinely has to follow.
+        let gh = if self.linear_before_reset {
+            h.linear().weight(&self.weight_hh).maybe_bias(self.bias_hh.as_ref()).call()?
+        } else {
+            h.linear().weight(&self.w_hh_rz).maybe_bias(self.b_hh_rz.as_ref()).call()?
+        };
+        let r = gx.narrow(-1, 0usize, hs)?.try_add(&gh.narrow(-1, 0usize, hs)?)?.sigmoid()?;
+        let z = gx.narrow(-1, hs, hs)?.try_add(&gh.narrow(-1, hs, hs)?)?.sigmoid()?;
         let gx_n = gx.narrow(-1, 2 * hs, hs)?;
 
         let n = if self.linear_before_reset {
-            let gh_n = h.linear().weight(&self.w_hh_n).maybe_bias(self.b_hh_n.as_ref()).call()?;
-            gx_n.try_add(&r.try_mul(&gh_n)?)?.tanh()?
+            gx_n.try_add(&r.try_mul(&gh.narrow(-1, 2 * hs, hs)?)?)?.tanh()?
         } else {
             let gh_n = r.try_mul(h)?.linear().weight(&self.w_hh_n).maybe_bias(self.b_hh_n.as_ref()).call()?;
             gx_n.try_add(&gh_n)?.tanh()?
