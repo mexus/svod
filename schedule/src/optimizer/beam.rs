@@ -819,8 +819,20 @@ pub fn get_applied_opts(scheduler: &Scheduler) -> &[Opt] {
 ///
 /// Lazy-initialized on first access. Returns None if cache directory
 /// cannot be created or database cannot be opened.
+///
+/// `SVOD_BEAM_CACHE_DIR` overrides the location, mirroring
+/// `SVOD_OBJECT_CACHE_DIR`. sled takes an **exclusive lock** on the database, so
+/// two processes sharing one location cannot both open it — under a
+/// process-per-test runner that means every process after the first sees `None`.
+/// The override is the only portable way to give them separate roots:
+/// `dirs::cache_dir()` reads `XDG_CACHE_HOME` on Linux but returns
+/// `~/Library/Caches` unconditionally on macOS, so redirecting that variable
+/// isolates the tests on one platform and silently does nothing on the other.
 static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
-    let cache_dir = dirs::cache_dir()?.join("svod");
+    let cache_dir = match std::env::var_os("SVOD_BEAM_CACHE_DIR") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => dirs::cache_dir()?.join("svod"),
+    };
     std::fs::create_dir_all(&cache_dir).ok()?;
     sled::open(cache_dir.join("beam_cache")).ok()
 });

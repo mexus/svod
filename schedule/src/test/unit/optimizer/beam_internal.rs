@@ -46,8 +46,12 @@ fn cache_ready() {
         .join("../target")
         .join(format!("beam-cache-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("create the test cache root");
-    // SAFETY: `dirs::cache_dir()` is not writable in every test environment.
-    unsafe { std::env::set_var("XDG_CACHE_HOME", &root) };
+    // SAFETY: `dirs::cache_dir()` is not writable in every test environment, and
+    // under a process-per-test runner each process needs its OWN root — sled locks
+    // the database exclusively, so sharing one would leave every process after the
+    // first without a cache. `SVOD_BEAM_CACHE_DIR` is the portable override;
+    // `XDG_CACHE_HOME` would only work on Linux.
+    unsafe { std::env::set_var("SVOD_BEAM_CACHE_DIR", &root) };
     assert!(CACHE_DB.is_some(), "the BEAM sled cache must open under {}", root.display());
 }
 

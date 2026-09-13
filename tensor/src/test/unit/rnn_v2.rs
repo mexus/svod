@@ -754,6 +754,20 @@ fn gru_graph(t_len: usize, batch: usize) -> Tensor {
     x.gru().weight_ih(&w_ih).weight_hh(&w_hh).call().unwrap().output
 }
 
+/// How many distinct looped step kernels the cell's shape yields on the device the
+/// suite is running on. `RnnCell::step` picks the shape: a host keeps the wide
+/// `[3H, H]` recurrent projection, whose output is narrowed into gates and so
+/// materialises into a second kernel; every other device projects each gate through
+/// its own `[H, H]` matrix, which narrows no reduce output and fuses the step into
+/// one. Reading the same predicate here keeps these pins honest on whatever device
+/// is selected — the default is the host on Linux but `METAL:0` on macOS.
+fn expected_step_kernels() -> usize {
+    match Tensor::empty(&[1], DType::Float32).device() {
+        svod_dtype::DeviceSpec::Cpu => 2,
+        _ => 1,
+    }
+}
+
 /// A `T`-step GRU on the host costs a fixed five kernels whatever `T` is: the
 /// zeroed initial state, the hoisted input projection over the whole sequence,
 /// the two step kernels (the wide `[3H, H]` recurrent projection, which
@@ -810,8 +824,9 @@ fn the_step_kernel_is_compiled_once_and_launched_per_slot() {
     let (short_programs, short_steps, short_bindings) = scan_plan_shape(8);
     let (long_programs, long_steps, long_bindings) = scan_plan_shape(19);
 
+    let want = expected_step_kernels();
     assert_eq!(short_programs, long_programs, "compiled programs grew with the sequence length");
-    assert_eq!((short_steps, long_steps), (2, 2), "expected exactly two looped step kernels");
+    assert_eq!((short_steps, long_steps), (want, want), "expected exactly {want} looped step kernel(s)");
     for bound in &short_bindings {
         assert_eq!(*bound, (0..8).collect::<Vec<i64>>(), "T=8 launch bindings");
     }
@@ -842,7 +857,7 @@ fn step_sources(graph: &Tensor) -> Vec<String> {
 #[test]
 fn the_looped_step_source_carries_no_per_step_constant() {
     let short = step_sources(&gru_graph(8, 2));
-    assert_eq!(short.len(), 2, "two distinct step kernels");
+    assert_eq!(short.len(), expected_step_kernels(), "distinct step kernels");
     assert_eq!(short, step_sources(&gru_graph(31, 2)), "step source changed with the sequence length");
 
     // The bound time index reaches the kernel as a scalar argument, not a

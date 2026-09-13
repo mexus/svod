@@ -171,8 +171,28 @@ fn oversized_threadgroup_is_rejected_with_limits() {
     }
 }
 
-#[test_case::test_case(vec![storage(0), storage(2)]; "non-contiguous slots")]
-#[test_case::test_case(vec![storage(1), storage(0)]; "unsorted slots")]
+/// Slots may skip — the scheduler leaves gaps whenever it eliminates a param, and
+/// positional binding does not care. Regression: this used to be rejected, which
+/// failed the GigaAM RNN-T block whose ABI comes out `[0, 1, 2, 4, 6, ...]`.
+#[test]
+fn non_contiguous_slots_load_and_execute() {
+    let Some(alloc) = metal_alloc_or_skip() else { return };
+    let bytes = compile_for_test(&alloc.dev, VADD_MSL).unwrap();
+    // `vadd` reads data0/data1/data2; re-slotting the ABI to 0/2/4 leaves the
+    // rendered names alone and only widens the gaps the loader must tolerate.
+    let sparse = vec![storage(0), storage(2), storage(4)];
+    let program = MetalProgram::load(alloc.dev.clone(), &bytes, "vadd", &sparse).expect("sparse slots must load");
+    let (a, b) = (upload(&alloc, &[1.0f32; 32]), upload(&alloc, &[2.0f32; 32]));
+    let out = upload(&alloc, &[0.0f32; 32]);
+    unsafe {
+        program.execute(&[host_ptr(&out), host_ptr(&a), host_ptr(&b)], &[], Some([1, 1, 1]), Some([32, 1, 1]), true)
+    }
+    .expect("sparse-slot dispatch");
+    let host = download(&alloc, &out, 32);
+    assert!(host.iter().all(|&v| v == 3.0), "positional binding paired the wrong buffers: {host:?}");
+}
+
+#[test_case::test_case(vec![storage(1), storage(0)]; "descending slots")]
 #[test_case::test_case((0..32).map(storage).collect(); "more than 31 bindings")]
 fn positional_abi_violations_are_rejected(abi: Vec<AbiParamDescriptor>) {
     let Some(dev) = metal_device_or_skip() else { return };

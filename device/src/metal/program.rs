@@ -56,12 +56,24 @@ impl std::fmt::Debug for MetalProgram {
 }
 
 impl MetalProgram {
+    /// `msl-kernel-abi-v1` binds arguments **positionally**: the MSL signature is
+    /// emitted by walking the ABI list in order (`CRenderer`'s param loop) and
+    /// [`Self::execute`] binds `args.iter().enumerate()`, so the binding index is the
+    /// parameter's POSITION, never its PARAM slot. The slot only spells the
+    /// parameter's name (`data{slot}`).
+    ///
+    /// So slots may have **gaps** — the scheduler leaves them whenever it eliminates
+    /// a param, and `[0, 1, 2, 4, 6, ...]` binds exactly as well as `[0, 1, 2, 3]`.
+    /// What they may not do is descend: the order the ABI list is walked is the order
+    /// the caller stacks its buffers, so a list that is not ascending would pair a
+    /// buffer with the wrong parameter.
     pub fn load(dev: Arc<MetalDevice>, bytes: &[u8], name: &str, abi: &[AbiParamDescriptor]) -> Result<Self> {
-        if abi.iter().enumerate().any(|(index, param)| param.slot != index) || abi.len() > MAX_BUFFER_BINDINGS {
+        let ascending = abi.windows(2).all(|pair| pair[0].slot < pair[1].slot);
+        if !ascending || abi.len() > MAX_BUFFER_BINDINGS {
             return Err(Error::ProgramAbiMismatch {
                 reason: format!(
-                    "msl-kernel-abi-v1 binds arguments positionally: slots must be 0..{} (max {MAX_BUFFER_BINDINGS}), got {:?}",
-                    abi.len(),
+                    "msl-kernel-abi-v1 binds positionally: slots must ascend and number at most \
+                     {MAX_BUFFER_BINDINGS}, got {:?}",
                     abi.iter().map(|param| param.slot).collect::<Vec<_>>()
                 ),
             });
