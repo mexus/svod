@@ -99,9 +99,12 @@ pub fn median_filter(data: &[f32], n_rows: usize, n_cols: usize, filter_width: u
     let pad = filter_width / 2;
     let mut out = vec![0.0f32; n_rows * n_cols];
 
+    // One window buffer for the whole pass: allocating per output cell dominated
+    // the filter at ~1M cells.
+    let mut window = Vec::with_capacity(filter_width);
     for i in 0..n_rows {
         for j in 0..n_cols {
-            let mut window = Vec::with_capacity(filter_width);
+            window.clear();
             for off in -(pad as isize)..=(pad as isize) {
                 let idx = j as isize + off;
                 // Reflect padding (single-bounce)
@@ -263,22 +266,39 @@ pub fn find_alignment_path_selected(
         }
     }
 
+    // Standardize each (head, frame) column. The columns are strided by a whole
+    // row, so this sweeps text-major and keeps one accumulator per frame rather
+    // than walking each column three times.
+    let mut mean = vec![0.0f32; valid_audio];
+    let mut deviation = vec![0.0f32; valid_audio];
     for head in 0..n_heads {
-        for frame in 0..valid_audio {
-            let mean =
-                (0..valid_text).map(|text| weights[(head * valid_text + text) * valid_audio + frame]).sum::<f32>()
-                    / valid_text as f32;
-            let variance = (0..valid_text)
-                .map(|text| {
-                    let delta = weights[(head * valid_text + text) * valid_audio + frame] - mean;
-                    delta * delta
-                })
-                .sum::<f32>()
-                / valid_text as f32;
-            let std = variance.sqrt().max(1e-10);
-            for text in 0..valid_text {
-                let index = (head * valid_text + text) * valid_audio + frame;
-                weights[index] = (weights[index] - mean) / std;
+        let head_base = head * valid_text * valid_audio;
+        let rows = || (0..valid_text).map(move |text| head_base + text * valid_audio);
+        mean.fill(0.0);
+        deviation.fill(0.0);
+        for row in rows() {
+            for (accumulated, &value) in mean.iter_mut().zip(&weights[row..row + valid_audio]) {
+                *accumulated += value;
+            }
+        }
+        for accumulated in mean.iter_mut() {
+            *accumulated /= valid_text as f32;
+        }
+        for row in rows() {
+            for ((accumulated, &value), &mean) in
+                deviation.iter_mut().zip(&weights[row..row + valid_audio]).zip(mean.iter())
+            {
+                *accumulated += (value - mean) * (value - mean);
+            }
+        }
+        for accumulated in deviation.iter_mut() {
+            *accumulated = (*accumulated / valid_text as f32).sqrt().max(1e-10);
+        }
+        for row in rows() {
+            for ((value, &mean), &std) in
+                weights[row..row + valid_audio].iter_mut().zip(mean.iter()).zip(deviation.iter())
+            {
+                *value = (*value - mean) / std;
             }
         }
     }

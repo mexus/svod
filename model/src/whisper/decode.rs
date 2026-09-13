@@ -1744,7 +1744,7 @@ fn log_softmax(logits: &[f32], idx: usize) -> f32 {
 /// log-softmax normalizer is one constant per row, so it shifts every score
 /// alike and cannot reorder them. That lets the scan hold `k` entries instead
 /// of materializing — and sorting — a logprob for all ~51k tokens.
-fn top_k_logprobs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+pub(crate) fn top_k_logprobs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     let k = k.min(logits.len());
     if k == 0 {
         return Vec::new();
