@@ -946,6 +946,55 @@ fn test_fa_cuda(b: usize, n: usize, h: usize, h_kv: usize, d: usize, dtype: DTyp
     assert!(report.ok, "{}", report.message);
 }
 
+/// Attention inputs well away from unit variance.
+///
+/// The other CUDA cases build `q`/`k`/`v` from `randn`, and that hid a real defect:
+/// the softmax scale used to be folded into `Q` *before* the cast to the 16-bit mma
+/// operand, so every score carried a rounding relative to its own magnitude, which
+/// `exp2` then amplified. Scores grow with the square of the activation scale, so
+/// the error was invisible at variance 1 and severe by 8 (max abs error 1.3e-4 ->
+/// 4.2e-1). Real activations are not unit-variance, so the sweep is the guard.
+///
+/// 8x is the ceiling on purpose. Whisper's encoder activations measure rms 1.3
+/// and peak near 10, so 8x already covers the regime and leaves the regression a
+/// 30x margin to trip over. Beyond that the softmax is peaked enough that single
+/// elements ride the per-element tolerance and the case fails on its own draw --
+/// a 32x row failed roughly one run in twelve, which guards nothing.
+#[test_case::test_case(2.0; "2x")]
+#[test_case::test_case(8.0; "8x")]
+#[ignore]
+fn fa_cuda_holds_away_from_unit_variance(scale: f32) {
+    if !cuda_device() {
+        eprintln!("skip fa_cuda_holds_away_from_unit_variance: no CUDA sm_80+ device / toolchain");
+        return;
+    }
+    // Whisper's encoder geometry: 1500 frames padded to 1536, masked back to 1500.
+    let (b, n, h, d) = (1usize, 1536usize, 6usize, 64usize);
+    let mk = || {
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").try_mul(scale).expect("scale").cast(DType::Float16);
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(), mk(), mk());
+    let lens = vec![1500i32; b];
+    let lens_t = Tensor::from_slice(lens.as_slice());
+    let got = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens_t) })
+        .expect("fa")
+        .expect("the FA kernel applies on CUDA sm_80+")
+        .cast(DType::Float32);
+    got.realize().expect("realize");
+    let reference = fa_reference(&q, &k, &v, false, Some(lens.as_slice()));
+    reference.realize().expect("realize reference");
+    let report = svod_tensor::testing::allclose_f32(
+        &got.as_vec::<f32>().expect("read"),
+        &reference.as_vec::<f32>().expect("read reference"),
+        2e-2,
+        2e-2,
+    );
+    println!("fa[cuda] scale={scale}x b={b} n={n} h={h} d={d} lens=1500: {}", report.message);
+    assert!(report.ok, "{}", report.message);
+}
+
 /// Every RANGE a kernel body opens must be closed on every path to its SINK: the
 /// tensor scheduler's kernel split (`split_store`) treats a RANGE still in scope
 /// at a CALL as an interior loop and refuses to cut the *consumer* kernel, which

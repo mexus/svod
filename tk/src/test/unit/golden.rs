@@ -77,15 +77,17 @@ fn fa_sink() -> Arc<UOp> {
 // Committed structural golden digests. Update ONLY for an intentional graph change.
 const MATMUL_DIGEST: u128 = 0x0678_fad7_5395_74af_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 536;
-const FA_DIGEST: u128 = 0xcffc_f971_faae_1cf7_0000_0000_0000_0000;
-const FA_NODES: usize = 897;
+const FA_DIGEST: u128 = 0xcb5c_0c18_143b_2390_0000_0000_0000_0000;
+const FA_NODES: usize = 899;
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
 // `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
 // clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
-const FA_NONCAUSAL_DIGEST: u128 = 0xe248_21f6_021a_8426_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 871;
-const FA_MASKED_DIGEST: u128 = 0x0166_bbc1_9159_203e_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 895;
+// The FA digests last moved when the softmax scale left `Q` for the f32 `QKᵀ`
+// accumulator: the multiply moves inside the KV loop, so each variant gains two nodes.
+const FA_NONCAUSAL_DIGEST: u128 = 0x3af5_5511_a827_0210_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 873;
+const FA_MASKED_DIGEST: u128 = 0x6a06_f161_5833_523c_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 897;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
