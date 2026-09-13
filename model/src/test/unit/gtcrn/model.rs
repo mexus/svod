@@ -30,9 +30,10 @@ fn forward_shape() {
 /// catches a decoder skip-connection or mask-product wiring bug that a shape
 /// check cannot see.
 ///
-/// 8 frames, not fewer: `Tensor::pool` underflows its unsigned window
-/// arithmetic when a dilation exceeds the output extent, and the encoder's last
-/// GT block dilates T by 5.
+/// 8 frames for coverage, not out of necessity: two is enough to pass now that
+/// `Tensor::pool` clamps the window arithmetic that used to underflow when a
+/// dilation exceeds the output extent, which the encoder's last GT block (T
+/// dilated by 5) reaches at every short input.
 #[test]
 fn zero_spec_stays_zero() {
     let model = Gtcrn::with_random_weights();

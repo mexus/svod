@@ -18,7 +18,7 @@
 //!   cargo run -p svod-model --release --example gtcrn_enhance -- \
 //!       --in noisy.wav --out enhanced.wav
 //!   cargo run -p svod-model --release --example gtcrn_enhance -- \
-//!       --in noisy.wav --hub        # pull weights from vpermilp/gtcrn
+//!       --in noisy.wav --out enhanced.wav --hub        # pull weights from vpermilp/gtcrn
 //!
 //! Env:
 //!   SVOD_GTCRN=/path/to/data/gtcrn   Local weights dir (gtcrn.safetensors).
@@ -162,7 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.profile {
         // One chunk, after the loop above has warmed every cache, so the report
         // is steady state rather than first-dispatch.
-        buf[..CHUNK_SAMPLES].copy_from_slice(&waveform[..CHUNK_SAMPLES.min(waveform.len())]);
+        let head = CHUNK_SAMPLES.min(waveform.len());
+        buf[..head].copy_from_slice(&waveform[..head]);
+        buf[head..].fill(0.0);
         jit.waveform_mut()?.copyin(bytemuck::cast_slice(&buf))?;
         let t = Instant::now();
         let kernels = jit.execute_profiled()?;

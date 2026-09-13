@@ -297,6 +297,10 @@ pub struct GruCell {
     w_hh_r: Tensor,
     w_hh_z: Tensor,
     w_hh_n: Tensor,
+    /// `weight_hh` rows for `r, z` — `[2H, H]`. The `n` gate projects `r * h`
+    /// when `linear_before_reset` is off, so its rows must not be projected here.
+    w_hh_rz: Tensor,
+    b_hh_rz: Option<Tensor>,
     b_hh_r: Option<Tensor>,
     b_hh_z: Option<Tensor>,
     b_hh_n: Option<Tensor>,
@@ -322,6 +326,8 @@ impl GruCell {
         let hidden_size = weight_hh.dim_const(-1)?;
         let row = |i: usize| weight_hh.narrow(0, i * hidden_size, hidden_size);
         let (w_hh_r, w_hh_z, w_hh_n) = (row(0)?, row(1)?, row(2)?);
+        let w_hh_rz = weight_hh.narrow(0, 0usize, 2 * hidden_size)?;
+        let b_hh_rz = bias_hh.as_ref().map(|b| b.narrow(0, 0usize, 2 * hidden_size)).transpose()?;
         let brow = |i: usize| bias_hh.as_ref().map(|b| b.narrow(0, i * hidden_size, hidden_size)).transpose();
         let (b_hh_r, b_hh_z, b_hh_n) = (brow(0)?, brow(1)?, brow(2)?);
         Ok(Self {
@@ -334,6 +340,8 @@ impl GruCell {
             w_hh_r,
             w_hh_z,
             w_hh_n,
+            w_hh_rz,
+            b_hh_rz,
             b_hh_r,
             b_hh_z,
             b_hh_n,
@@ -376,27 +384,35 @@ impl RecurrentCell for GruCell {
         // and fuses the step into one kernel -- which is what matters where a
         // launch costs more than the arithmetic inside it. On a host the launch
         // is free and the wide projection vectorises better, so it keeps it.
+        let project = |w: &Tensor, b: Option<&Tensor>| h.linear().weight(w).maybe_bias(b).call();
+        // The `n` gate's recurrent projection only belongs here when it reads `h`
+        // directly; the other formulation projects `r * h` below, so projecting
+        // those rows now would be work thrown away.
         let (r, z, gh_n) = if h.device() == DeviceSpec::Cpu {
-            let gh = h.linear().weight(&self.weight_hh).maybe_bias(self.bias_hh.as_ref()).call()?;
+            let (w, b) = match self.linear_before_reset {
+                true => (&self.weight_hh, self.bias_hh.as_ref()),
+                false => (&self.w_hh_rz, self.b_hh_rz.as_ref()),
+            };
+            let gh = project(w, b)?;
             let gate = |i: usize| gh.narrow(-1, i * hs, hs);
-            (gate(0)?, gate(1)?, gate(2)?)
+            (gate(0)?, gate(1)?, self.linear_before_reset.then(|| gate(2)).transpose()?)
         } else {
-            let project = |w: &Tensor, b: Option<&Tensor>| h.linear().weight(w).maybe_bias(b).call();
             (
                 project(&self.w_hh_r, self.b_hh_r.as_ref())?,
                 project(&self.w_hh_z, self.b_hh_z.as_ref())?,
-                project(&self.w_hh_n, self.b_hh_n.as_ref())?,
+                self.linear_before_reset.then(|| project(&self.w_hh_n, self.b_hh_n.as_ref())).transpose()?,
             )
         };
         let r = gx.narrow(-1, 0usize, hs)?.try_add(&r)?.sigmoid()?;
         let z = gx.narrow(-1, hs, hs)?.try_add(&z)?.sigmoid()?;
         let gx_n = gx.narrow(-1, 2 * hs, hs)?;
 
-        let n = if self.linear_before_reset {
-            gx_n.try_add(&r.try_mul(&gh_n)?)?.tanh()?
-        } else {
-            let gh_n = r.try_mul(h)?.linear().weight(&self.w_hh_n).maybe_bias(self.b_hh_n.as_ref()).call()?;
-            gx_n.try_add(&gh_n)?.tanh()?
+        let n = match gh_n {
+            Some(gh_n) => gx_n.try_add(&r.try_mul(&gh_n)?)?.tanh()?,
+            None => {
+                let gh_n = r.try_mul(h)?.linear().weight(&self.w_hh_n).maybe_bias(self.b_hh_n.as_ref()).call()?;
+                gx_n.try_add(&gh_n)?.tanh()?
+            }
         };
 
         // (1 - z) * n + z * h, written to reuse `n` once.
