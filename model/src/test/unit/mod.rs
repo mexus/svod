@@ -7,6 +7,7 @@ mod diarizen;
 mod firered_vad;
 mod firered_vad_stream;
 mod gigaam;
+mod gtcrn;
 mod jit;
 mod mel;
 mod modernbert;
