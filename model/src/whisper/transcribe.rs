@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use snafu::Snafu;
-use svod_arch::pipelines::audio::{Transcriber, Transcript};
+use svod_arch::pipelines::audio::{CoverageRepair, Transcriber, Transcript};
 use svod_runtime::{RunProfile, StageProfile};
 use svod_tensor::PrepareConfig;
 
@@ -268,6 +268,12 @@ impl Transcriber for WhisperRecognizer {
         SAMPLE_RATE as u32
     }
 
+    /// Whisper ends a window at its last emitted timestamp, which routinely
+    /// lands short of the window edge, so the pipeline re-decodes what it left.
+    fn coverage_repair(&self) -> Option<CoverageRepair> {
+        Some(CoverageRepair::default())
+    }
+
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
@@ -398,6 +404,12 @@ impl Transcriber for WhisperAlignedTranscriber {
 
     fn sample_rate(&self) -> u32 {
         SAMPLE_RATE as u32
+    }
+
+    /// Whisper ends a window at its last emitted timestamp, which routinely
+    /// lands short of the window edge, so the pipeline re-decodes what it left.
+    fn coverage_repair(&self) -> Option<CoverageRepair> {
+        Some(CoverageRepair::default())
     }
 
     fn transcribe_windows(
