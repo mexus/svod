@@ -74,8 +74,17 @@ impl Tensor {
             (0..n_spatial).map(|j| (&i_[j] - dilation[j] * (kernel[j] - 1)).ceildiv(&SInt::from(stride[j]))).collect();
 
         // f_[j] = max(1, ceildiv(o_[j] * stride[j] - dilation[j], i_[j]))
+        //
+        // The difference is clamped at zero before the subtraction runs: `SInt`
+        // is unsigned and panics on underflow, which the outer `max(1, ..)`
+        // would otherwise never get to answer. An output extent below the
+        // dilation is ordinary -- a frame-at-a-time streaming model produces one
+        // row out of every dilated temporal conv -- and folds by one.
         let f_: Vec<SInt> = (0..n_spatial)
-            .map(|j| SInt::from(1usize).smax(&(&o_[j] * stride[j] - dilation[j]).ceildiv(&i_[j])))
+            .map(|j| {
+                let reach = (&o_[j] * stride[j]).smax(&SInt::from(dilation[j])) - dilation[j];
+                SInt::from(1usize).smax(&reach.ceildiv(&i_[j]))
+            })
             .collect();
 
         // Batch dims: None in shrink (identity), SInt in reshape.
