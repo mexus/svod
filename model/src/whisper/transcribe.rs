@@ -481,6 +481,11 @@ impl WhisperRecognizer {
         let mut decoder_step_profile = GraphProfile::default();
         let mut decode_stats = DecodeScheduleStats::default();
         let mut copies = CopyProfile::default();
+        // Detection costs a whole decoder forward over the 1500-position cross
+        // cache. One recording is one language, so the first window's answer
+        // serves the rest; scoping it here rather than to `self` keeps the next
+        // call's audio from inheriting it.
+        let mut detected_language: Option<String> = None;
         let (mut t_mel, mut t_decoder_scheduler) = (Duration::ZERO, Duration::ZERO);
 
         for batch_start in (0..windows.len()).step_by(max_batch) {
@@ -567,15 +572,21 @@ impl WhisperRecognizer {
                 if !self.tokenizer.multilingual {
                     options.language = Some("en".to_string());
                 } else if options.language.is_none() {
-                    let detection = detect_language_profile(
-                        &mut self.decoder_jit,
-                        n_vocab,
-                        &self.tokenizer,
-                        profile.then_some(&mut copies),
-                        profile.then_some(&mut language_profile),
-                    )
-                    .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-                    options.language = Some(detection.language);
+                    let language = match &detected_language {
+                        Some(language) => language.clone(),
+                        None => {
+                            let detection = detect_language_profile(
+                                &mut self.decoder_jit,
+                                n_vocab,
+                                &self.tokenizer,
+                                profile.then_some(&mut copies),
+                                profile.then_some(&mut language_profile),
+                            )
+                            .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+                            detected_language.insert(detection.language).clone()
+                        }
+                    };
+                    options.language = Some(language);
                 }
 
                 let seed = prefill_decode_seed(
