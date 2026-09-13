@@ -215,8 +215,22 @@ impl WhisperRecognizer {
             InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
             InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
             InputSpec::i32(&[max_lanes]),
+            InputSpec::i32(&[max_lanes]),
             &prepare_config,
         )?;
+        // The step graph runs every lane each dispatch, reserved or not, so the
+        // cross-cache map must name a real row from the start. Identity leaves an
+        // unseeded lane reading its own cache; seeding then points a whole attempt
+        // at one row.
+        {
+            let rows: Vec<i32> = (0..max_lanes as i32).collect();
+            let buf = batched_step_jit.cross_cache_map_mut()?;
+            let dst = buf.as_host_bytes_mut()?;
+            let bytes: &[u8] = bytemuck::cast_slice(&rows);
+            // The buffer was just prepared as `[max_lanes]` i32, so it is exactly
+            // this long; a mismatch is a bug in the spec above, not a caller error.
+            dst[..bytes.len()].copy_from_slice(bytes);
+        }
 
         // Read positional embedding eagerly (static weight, reused every window).
         // Cast to fp32 — the host decode math (pos_embedding slicing in decode.rs)

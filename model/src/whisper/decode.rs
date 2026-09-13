@@ -688,11 +688,18 @@ fn seed_attempt_rows(
     let self_stride =
         n_text_ctx.checked_mul(seed.per_pos_bytes).ok_or_else(|| decode_err("self cache stride overflow"))?;
     let cross_stride = seed.cross_cache_bytes;
+    // Every row of this attempt decodes the same window, so its cross-attention
+    // cache is the same bytes. Write it into the first row and point the rest
+    // there: the step then reads the largest tensor it touches once per window
+    // instead of once per hypothesis. Rows of *other* attempts keep their own,
+    // which is what the map is for.
+    let owner = *rows.first().ok_or_else(|| decode_err("attempt reserved no rows"))?;
+    copy_device_cache_row(jit.cross_k_mut()?, owner, cross_stride, &seed.cross_k)?;
+    copy_device_cache_row(jit.cross_v_mut()?, owner, cross_stride, &seed.cross_v)?;
     for &row in rows {
         copy_device_cache_row(jit.self_k_cache_mut()?, row, self_stride, &seed.self_k_cache)?;
         copy_device_cache_row(jit.self_v_cache_mut()?, row, self_stride, &seed.self_v_cache)?;
-        copy_device_cache_row(jit.cross_k_mut()?, row, cross_stride, &seed.cross_k)?;
-        copy_device_cache_row(jit.cross_v_mut()?, row, cross_stride, &seed.cross_v)?;
+        write_cross_cache_row(jit, row, owner)?;
     }
     Ok(())
 }
@@ -1116,6 +1123,18 @@ fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -
     let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("position row offset overflow"))?;
     let bytes: &[u8] = bytemuck::cast_slice(emb);
     let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("position row is out of bounds"))?;
+    target.copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Point one decoder row at the cross-attention cache row it should read.
+fn write_cross_cache_row(jit: &mut WhisperDecoderStepJit, row: usize, owner: usize) -> Result<()> {
+    let buf = jit.cross_cache_map_mut()?;
+    let dst = buf.as_host_bytes_mut()?;
+    let off = row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("cross map row offset overflow"))?;
+    let owner = i32::try_from(owner).map_err(|_| decode_err("cross cache row exceeds i32"))?;
+    let bytes: &[u8] = bytemuck::bytes_of(&owner);
+    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("cross map row is out of bounds"))?;
     target.copy_from_slice(bytes);
     Ok(())
 }

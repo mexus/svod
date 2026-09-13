@@ -77,9 +77,19 @@ impl Whisper {
         cross_k: &Tensor,
         cross_v: &Tensor,
         self_key_lens: &Tensor,
+        cross_cache_map: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         scoped("decoder", || {
-            self.decoder.forward_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
+            self.decoder.forward_step(
+                token,
+                pos_emb,
+                self_k_cache,
+                self_v_cache,
+                cross_k,
+                cross_v,
+                self_key_lens,
+                cross_cache_map,
+            )
         })
     }
 

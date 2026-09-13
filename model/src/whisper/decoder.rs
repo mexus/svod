@@ -372,6 +372,7 @@ impl TextDecoder {
         cross_k: &Tensor,
         cross_v: &Tensor,
         self_key_lens: &Tensor,
+        cross_cache_map: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         self.forward_step_with_config(
             token,
@@ -381,6 +382,7 @@ impl TextDecoder {
             cross_k,
             cross_v,
             self_key_lens,
+            cross_cache_map,
             StepAttentionConfig::default(),
         )
     }
@@ -396,6 +398,7 @@ impl TextDecoder {
         cross_k: &Tensor,
         cross_v: &Tensor,
         self_key_lens: &Tensor,
+        cross_cache_map: &Tensor,
         mode: StepAttentionMode,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         self.forward_step_with_config(
@@ -406,6 +409,7 @@ impl TextDecoder {
             cross_k,
             cross_v,
             self_key_lens,
+            cross_cache_map,
             mode.into(),
         )
     }
@@ -420,6 +424,7 @@ impl TextDecoder {
         cross_k: &Tensor,
         cross_v: &Tensor,
         self_key_lens: &Tensor,
+        cross_cache_map: &Tensor,
         attention: StepAttentionConfig,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let n_head = self.n_head;
@@ -517,7 +522,11 @@ impl TextDecoder {
                     cross_k,
                     cross_v,
                     lh_start,
-                    svod_tk::SqAttentionOpts { split: cross_splits, ..Default::default() },
+                    svod_tk::SqAttentionOpts {
+                        split: cross_splits,
+                        cache_map: Some(cross_cache_map),
+                        ..Default::default()
+                    },
                 )
                 .map_err(tk_launch_error)?
             } else {

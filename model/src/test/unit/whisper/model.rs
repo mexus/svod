@@ -320,9 +320,10 @@ fn cached_steps_match_teacher_forced_full_prefix() {
         let self_k = Tensor::from_slice(&cache_k).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
         let self_v = Tensor::from_slice(&cache_v).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
         let key_lens = Tensor::from_slice([pos as i32]);
+        let cross_map = Tensor::from_slice([0i32]);
 
         let (step_logits, new_k, new_v) =
-            model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
+            model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map).unwrap();
         prefix.push(next_token);
         let full_tokens = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
         let teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();

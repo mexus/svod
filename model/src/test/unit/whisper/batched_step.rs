@@ -33,9 +33,11 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
     let cross_v = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
     let key_lens = Tensor::zeros(&[batch], DType::Int32);
+    // Identity: each row reads its own cross cache, the pre-sharing behaviour.
+    let cross_map = Tensor::from_slice((0..batch as i32).collect::<Vec<_>>());
 
     let (logits, new_k, new_v) =
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens).unwrap();
+        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map).unwrap();
     assert_eq!(logits.dim_const(0).unwrap(), batch);
     assert_eq!(new_k.dim_const(0).unwrap(), batch);
     assert_eq!(new_v.dim_const(0).unwrap(), batch);
@@ -83,6 +85,9 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
     let cross_k = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
     let cross_v = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
     let key_lens = Tensor::from_slice([2i32, 5]);
+    // Identity: each row reads its own cross cache, so every mode sees the same
+    // caches the generic path builds by slicing.
+    let cross_map = Tensor::from_slice((0..batch as i32).collect::<Vec<_>>());
 
     let outputs = [
         StepAttentionMode::Generic,
@@ -95,7 +100,9 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
     .map(|mode| {
         model
             .decoder
-            .forward_step_with_attention_mode(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, mode)
+            .forward_step_with_attention_mode(
+                &token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map, mode,
+            )
             .unwrap()
             .0
     });

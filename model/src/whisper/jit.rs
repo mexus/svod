@@ -116,11 +116,21 @@ jit_wrapper! {
         cross_k: Tensor,
         cross_v: Tensor,
         self_key_lens: Tensor,
+        cross_cache_map: Tensor,
 
         outputs { logits, new_self_k, new_self_v }
 
-        build(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens) {
-            model.decode_step(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens)
+        build(token, pos_emb, self_k_cache, self_v_cache, cross_k, cross_v, self_key_lens, cross_cache_map) {
+            model.decode_step(
+                token,
+                pos_emb,
+                self_k_cache,
+                self_v_cache,
+                cross_k,
+                cross_v,
+                self_key_lens,
+                cross_cache_map,
+            )
         }
     }
 }
