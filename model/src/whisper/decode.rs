@@ -637,12 +637,10 @@ fn start_attempt(
                     }),
                 });
             }
-            let mut ranked: Vec<_> = log_softmax_vec(&filtered).into_iter().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let mut active = Vec::with_capacity(size);
             let mut finished = Vec::new();
             let mut next_logical_id = 0;
-            for (token, logprob) in ranked {
+            for (token, logprob) in top_k_logprobs(&filtered, size + 1) {
                 if active.len() >= size {
                     break;
                 }
@@ -1014,9 +1012,7 @@ pub(crate) fn run_fixed_slot_decode(
                                 attempt.pos + 1 - seed.init_len,
                                 &seed.suppress_tokens,
                             );
-                            let mut ranked: Vec<_> = log_softmax_vec(&logits).into_iter().enumerate().collect();
-                            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                            for (token, logprob) in ranked.into_iter().take(size + 1) {
+                            for (token, logprob) in top_k_logprobs(&logits, size + 1) {
                                 candidates.push(BeamCandidate {
                                     parent_index,
                                     parent_logical_id: hypothesis.logical_id,
@@ -1738,11 +1734,31 @@ fn log_softmax(logits: &[f32], idx: usize) -> f32 {
     if idx < logits.len() { logits[idx] - logsum } else { f32::NEG_INFINITY }
 }
 
-fn log_softmax_vec(logits: &[f32]) -> Vec<f32> {
-    let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let sum: f32 = logits.iter().map(|&l| (l - max_val).exp()).sum();
-    let logsum = sum.ln() + max_val;
-    logits.iter().map(|&l| l - logsum).collect()
+/// The `k` highest-scoring `(token, logprob)` pairs, ordered by descending
+/// logprob and then by ascending token id.
+///
+/// Ranking on the raw logit is equivalent to ranking on the logprob: the
+/// log-softmax normalizer is one constant per row, so it shifts every score
+/// alike and cannot reorder them. That lets the scan hold `k` entries instead
+/// of materializing — and sorting — a logprob for all ~51k tokens.
+fn top_k_logprobs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let k = k.min(logits.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    // `a` outranks `b` on the higher logit, and on the lower token id in a tie.
+    let outranks = |a: (usize, f32), b: (usize, f32)| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)).is_gt();
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
+    for candidate in logits.iter().copied().enumerate() {
+        if top.len() == k && !outranks(candidate, top[k - 1]) {
+            continue;
+        }
+        let at = top.partition_point(|&held| outranks(held, candidate));
+        top.insert(at, candidate);
+        top.truncate(k);
+    }
+    let logsum = logsumexp(logits);
+    top.into_iter().map(|(token, logit)| (token, logit - logsum)).collect()
 }
 
 fn logsumexp(arr: &[f32]) -> f32 {
