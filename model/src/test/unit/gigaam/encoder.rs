@@ -146,7 +146,9 @@ fn rope_tables_are_realized_at_load() {
             assert_eq!(writers.count(), 0, "a kernel recomputes the {name} table");
             assert!(readers.count() >= cfg.n_layers, "fewer than one {name} reader per layer");
         }
-        let sines = plan.kernels().filter(|kernel| kernel.code.contains("sin")).count();
+        // `sin(`, not `sin`: MSL's prelude is `using namespace metal;`, and "u-sin-g"
+        // matches a bare substring test in every Metal kernel ever rendered.
+        let sines = plan.kernels().filter(|kernel| kernel.code.contains("sin(")).count();
         let sin_ops = plan
             .prepared_kernels()
             .iter()
