@@ -41,9 +41,8 @@ use std::path::Path;
 
 use snafu::ResultExt;
 use svod_dtype::DType;
-use svod_ir::SInt;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, Module};
+use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, LayerNorm, Linear, Module};
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, StateDict};
@@ -54,7 +53,7 @@ use blocks::{Conv, ConvBlock, Dpgrnn, Erb, GTConvBlock, Grnn, GruWeights, Tra};
 
 /// Extract a single channel (axis 1) from a `(B, 2, T, F)` tensor → `(B, T, F)`.
 pub fn channel(t: &Tensor, idx: usize) -> Result<Tensor> {
-    Ok(t.try_shrink([None, Some((SInt::Const(idx), SInt::Const(idx + 1))), None, None])?.try_squeeze(Some(1))?)
+    Ok(t.narrow(1, idx, 1usize)?.try_squeeze(Some(1))?)
 }
 
 /// HuggingFace repo publishing the converted checkpoint + golden.
@@ -116,19 +115,11 @@ impl Gtcrn {
     /// Run the network on a `(B, F=257, T, 2)` complex spectrogram, returning
     /// the enhanced `(B, 257, T, 2)` spectrogram. Mirrors `GTCRN.forward`.
     pub fn forward(&self, spec: &Tensor) -> Result<Tensor> {
-        // spec: (B, F, T, 2). Split real/imag, permute to (B, T, F).
-        let part = |idx: usize| -> Result<Tensor> {
-            Ok(spec
-                .try_shrink([None, None, None, Some((SInt::Const(idx), SInt::Const(idx + 1)))])?
-                .try_squeeze(Some(-1))?
-                .try_permute(&[0, 2, 1])?)
-        };
-        let spec_real = part(0)?;
-        let spec_imag = part(1)?;
-
-        // spec_mag = sqrt(real^2 + imag^2 + 1e-12).
-        let eps = Tensor::full(&[1], 1e-12f32, DType::Float32);
-        let spec_mag = spec_real.square().try_add(spec_imag.square())?.try_add(&eps)?.try_sqrt()?;
+        // spec: (B, F, T, 2). Split real/imag and take the magnitude, each
+        // permuted from (B, F, T) to (B, T, F).
+        let spec_real = spec.complex_real()?.try_permute(&[0, 2, 1])?;
+        let spec_imag = spec.complex_imag()?.try_permute(&[0, 2, 1])?;
+        let spec_mag = spec.magnitude(1e-12)?.try_permute(&[0, 2, 1])?;
 
         // feat = stack([mag, real, imag], dim=1) -> (B, 3, T, 257).
         let feat = Tensor::stack(&[&spec_mag, &spec_real, &spec_imag], 1)?;
@@ -155,19 +146,9 @@ impl Gtcrn {
         // m = erb.bs(m_feat) -> (B, 2, T, 129).
         let m = self.erb.bs(&x)?;
 
-        // Complex ratio mask: spec_ref as (B, 2, T, F); mask m as (B, 2, T, F).
-        let spec_ref = spec.try_permute(&[0, 3, 2, 1])?; // (B,2,T,F)
-        // Split both into their two channels: (B, T, F) each.
-        let mask_real = channel(&m, 0)?;
-        let mask_imag = channel(&m, 1)?;
-        let spec_r = channel(&spec_ref, 0)?;
-        let spec_i = channel(&spec_ref, 1)?;
-        // s_real = spec_r*mask_real - spec_i*mask_imag
-        // s_imag = spec_i*mask_real + spec_r*mask_imag
-        let out_real = spec_r.try_mul(&mask_real)?.try_sub(&spec_i.try_mul(&mask_imag)?)?;
-        let out_imag = spec_i.try_mul(&mask_real)?.try_add(&spec_r.try_mul(&mask_imag)?)?;
-        let spec_enh = Tensor::stack(&[&out_real, &out_imag], 1)?; // (B,2,T,F)
-        Ok(spec_enh.try_permute(&[0, 3, 2, 1])?) // (B,F,T,2)
+        // Complex ratio mask: spec is (B,F,T,2) already; bring the mask into the
+        // same layout and multiply as complex numbers.
+        Ok(spec.complex_mul(&m.try_permute(&[0, 3, 2, 1])?)?) // (B,F,T,2)
     }
 
     // -----------------------------------------------------------------------
@@ -343,8 +324,7 @@ fn gt_conv(dilation_t: usize, use_deconv: bool) -> GTConvBlock {
         point_bn2: batch_norm(half),
         tra: Tra {
             gru: gru(half, half * 2),
-            fc_weight: weight(&[half, half * 2], half * 2),
-            fc_bias: bias(half, half * 2),
+            fc: Linear::new(weight(&[half, half * 2], half * 2), Some(bias(half, half * 2))),
         },
     }
 }
@@ -362,17 +342,23 @@ pub(crate) fn empty_dpgrnn() -> Dpgrnn {
         rnn2_f: gru(half, hidden),
         rnn2_b: bidirectional.then(|| gru(half, hidden)),
     };
-    let ln = [DPGRNN_WIDTH, DPGRNN_HIDDEN];
+    let fc = || {
+        Linear::new(weight(&[DPGRNN_HIDDEN, DPGRNN_HIDDEN], DPGRNN_HIDDEN), Some(bias(DPGRNN_HIDDEN, DPGRNN_HIDDEN)))
+    };
+    let ln = || {
+        LayerNorm::new(
+            ones(&[DPGRNN_WIDTH, DPGRNN_HIDDEN], DType::Float32),
+            Some(zeros(&[DPGRNN_WIDTH, DPGRNN_HIDDEN], DType::Float32)),
+            Dpgrnn::LN_EPS,
+        )
+        .with_axis(-2)
+    };
     Dpgrnn {
         intra_rnn: grnn(half / 2, true),
-        intra_fc_weight: weight(&[DPGRNN_HIDDEN, DPGRNN_HIDDEN], DPGRNN_HIDDEN),
-        intra_fc_bias: bias(DPGRNN_HIDDEN, DPGRNN_HIDDEN),
-        intra_ln_weight: ones(&ln, DType::Float32),
-        intra_ln_bias: zeros(&ln, DType::Float32),
+        intra_fc: fc(),
+        intra_ln: ln(),
         inter_rnn: grnn(half, false),
-        inter_fc_weight: weight(&[DPGRNN_HIDDEN, DPGRNN_HIDDEN], DPGRNN_HIDDEN),
-        inter_fc_bias: bias(DPGRNN_HIDDEN, DPGRNN_HIDDEN),
-        inter_ln_weight: ones(&ln, DType::Float32),
-        inter_ln_bias: zeros(&ln, DType::Float32),
+        inter_fc: fc(),
+        inter_ln: ln(),
     }
 }

@@ -4,15 +4,17 @@
 //!
 //! Every struct derives [`Module`], so the converted checkpoint's keys map 1:1
 //! onto the field names; `#[module(key = "…")]` carries the handful of places
-//! where PyTorch spells a submodule differently (`erb_fc.weight`, `att_gru`,
-//! the `_l0` GRU suffixes). The batch norms keep PyTorch's raw
+//! where PyTorch spells a submodule differently (`att_gru`, `att_fc`, the `_l0`
+//! GRU suffixes). The batch norms keep PyTorch's raw
 //! `running_mean`/`running_var` and fold them at forward time, so no state-dict
 //! rewriting happens on the way in.
 
 use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, GruDirection, Layer, Module, RnnLayout, StateDict};
+use svod_tensor::nn::{
+    BatchNorm2d, Conv2d, ConvTranspose2d, GruDirection, Layer, LayerNorm, Linear, Module, RnnLayout,
+};
 
 use crate::init::fan_in_uniform;
 
@@ -29,11 +31,9 @@ use super::error::Result;
 #[derive(Clone, Module)]
 pub struct Erb {
     /// `[erb_subband_2=64, nfreqs - erb_subband_1=192]` — analysis (bm).
-    #[module(key = "erb_fc.weight")]
-    pub erb_fc: Tensor,
+    pub erb_fc: Linear,
     /// `[192, 64]` — synthesis (bs); stored as the transposed analysis matrix.
-    #[module(key = "ierb_fc.weight")]
-    pub ierb_fc: Tensor,
+    pub ierb_fc: Linear,
 }
 
 const ERB_SUBBAND_1: usize = 65;
@@ -42,8 +42,8 @@ const ERB_SUBBAND_2: usize = 64;
 impl Erb {
     pub fn empty() -> Self {
         Self {
-            erb_fc: fan_in_uniform(&[ERB_SUBBAND_2, 192], 192, DType::Float32),
-            ierb_fc: fan_in_uniform(&[192, ERB_SUBBAND_2], ERB_SUBBAND_2, DType::Float32),
+            erb_fc: Linear::new(fan_in_uniform(&[ERB_SUBBAND_2, 192], 192, DType::Float32), None),
+            ierb_fc: Linear::new(fan_in_uniform(&[192, ERB_SUBBAND_2], ERB_SUBBAND_2, DType::Float32), None),
         }
     }
 
@@ -60,12 +60,10 @@ impl Erb {
         self.split_project(x_erb, 129, &self.ierb_fc)
     }
 
-    /// Pass the low 65 bins through and project `[65..end)` with `weight`.
-    fn split_project(&self, x: &Tensor, end: usize, weight: &Tensor) -> Result<Tensor> {
-        let cut = SInt::Const(ERB_SUBBAND_1);
-        let low = x.try_shrink([None, None, None, Some((SInt::Const(0), cut.clone()))])?;
-        let high = x.try_shrink([None, None, None, Some((cut, SInt::Const(end)))])?;
-        let high = high.linear().weight(weight).call()?;
+    /// Pass the low 65 bins through and project `[65..end)` with `fc`.
+    fn split_project(&self, x: &Tensor, end: usize, fc: &Linear) -> Result<Tensor> {
+        let low = x.narrow(-1, 0usize, ERB_SUBBAND_1)?;
+        let high = fc.forward(&x.narrow(-1, ERB_SUBBAND_1, end - ERB_SUBBAND_1)?)?;
         Ok(Tensor::cat(&[&low, &high], -1)?)
     }
 }
@@ -105,7 +103,7 @@ pub fn sfe(x: &Tensor, kernel: usize, in_channels: usize) -> Result<Tensor> {
 /// [`ConvTranspose2d`]. Both spell their state the same way (`weight`, `bias`),
 /// so the state dict is identical either way and the direction stays a
 /// construction-time choice.
-#[derive(Clone)]
+#[derive(Clone, Module)]
 pub enum Conv {
     Normal(Conv2d),
     Transposed(ConvTranspose2d),
@@ -140,22 +138,6 @@ impl Conv {
                 assert_eq!(c.stride.0, 1, "causal pad folding assumes unit stride on T");
                 Self::Transposed(c.with_padding(((before - pad, after), f)))
             }
-        }
-    }
-}
-
-impl Module for Conv {
-    fn write_state(&self, prefix: &str, out: &mut StateDict) {
-        match self {
-            Self::Normal(c) => c.write_state(prefix, out),
-            Self::Transposed(c) => c.write_state(prefix, out),
-        }
-    }
-
-    fn load_state_dict(&mut self, sd: &StateDict, prefix: &str) -> svod_tensor::error::Result<()> {
-        match self {
-            Self::Normal(c) => c.load_state_dict(sd, prefix),
-            Self::Transposed(c) => c.load_state_dict(sd, prefix),
         }
     }
 }
@@ -255,12 +237,9 @@ impl GTConvBlock {
 pub struct Tra {
     #[module(key = "att_gru")]
     pub gru: GruWeights,
-    /// `(C, 2C)`
-    #[module(key = "att_fc.weight")]
-    pub fc_weight: Tensor,
-    /// `(C,)`
-    #[module(key = "att_fc.bias")]
-    pub fc_bias: Tensor,
+    /// `(C, 2C)` weight, `(C,)` bias
+    #[module(key = "att_fc")]
+    pub fc: Linear,
 }
 
 impl Tra {
@@ -269,7 +248,7 @@ impl Tra {
         let zt = x.square().mean_with().axes(-1isize).keepdim(false).call()?; // (B,C,T)
         let zt = zt.try_permute(&[0, 2, 1])?; // (B,T,C) — batch-first.
         let at = self.gru.forward(&zt)?; // (B, T, 2C)
-        let at = at.linear().weight(&self.fc_weight).bias(&self.fc_bias).call()?; // (B, T, C)
+        let at = self.fc.forward(&at)?; // (B, T, C)
         let at = at.try_permute(&[0, 2, 1])?.sigmoid()?; // (B, C, T)
         // Broadcast-multiply over F.
         Ok(x.try_mul(&at.try_unsqueeze(-1)?)?)
@@ -377,32 +356,13 @@ impl Grnn {
 pub struct Dpgrnn {
     /// bidirectional, input=C=16 split 8/8, hidden=4 → output 16; runs along F
     pub intra_rnn: Grnn,
-    #[module(key = "intra_fc.weight")]
-    pub intra_fc_weight: Tensor,
-    #[module(key = "intra_fc.bias")]
-    pub intra_fc_bias: Tensor,
-    /// `(width, hidden)` = `(33, 16)`
-    #[module(key = "intra_ln.weight")]
-    pub intra_ln_weight: Tensor,
-    #[module(key = "intra_ln.bias")]
-    pub intra_ln_bias: Tensor,
+    pub intra_fc: Linear,
+    /// `(width, hidden)` = `(33, 16)` affine, normalizing over both axes.
+    pub intra_ln: LayerNorm,
     /// unidirectional, input=C=16 split 8/8, hidden=8 → output 16; runs along T
     pub inter_rnn: Grnn,
-    #[module(key = "inter_fc.weight")]
-    pub inter_fc_weight: Tensor,
-    #[module(key = "inter_fc.bias")]
-    pub inter_fc_bias: Tensor,
-    #[module(key = "inter_ln.weight")]
-    pub inter_ln_weight: Tensor,
-    #[module(key = "inter_ln.bias")]
-    pub inter_ln_bias: Tensor,
-}
-
-/// Affine LayerNorm over the last two axes (matching
-/// `nn.LayerNorm((width, hidden))`). Public so the streaming DPGRNN
-/// variant can reuse it.
-pub fn affine_ln(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> Result<Tensor> {
-    Ok(x.layernorm_with().axis(-2).eps(eps).weight(weight).bias(bias).call()?)
+    pub inter_fc: Linear,
+    pub inter_ln: LayerNorm,
 }
 
 impl Dpgrnn {
@@ -417,18 +377,18 @@ impl Dpgrnn {
         // Intra RNN: run over the F axis for each (B,T) slice.
         let intra_x = x.try_reshape([b.clone() * t.clone(), f.clone(), c.clone()])?;
         let intra_x = self.intra_rnn.forward(&intra_x)?;
-        let intra_x = intra_x.linear().weight(&self.intra_fc_weight).bias(&self.intra_fc_bias).call()?;
+        let intra_x = self.intra_fc.forward(&intra_x)?;
         let intra_x = intra_x.try_reshape([b.clone(), t.clone(), f.clone(), c.clone()])?;
-        let intra_x = affine_ln(&intra_x, &self.intra_ln_weight, &self.intra_ln_bias, Self::LN_EPS)?;
+        let intra_x = self.intra_ln.forward(&intra_x)?;
         let intra_out = x.try_add(&intra_x)?;
 
         // Inter RNN: run over the T axis for each (B,F) slice.
         let inter_in = intra_out.try_permute(&[0, 2, 1, 3])?; // (B,F,T,C)
         let inter_x = inter_in.try_reshape([b.clone() * f.clone(), t.clone(), c.clone()])?;
         let inter_x = self.inter_rnn.forward(&inter_x)?;
-        let inter_x = inter_x.linear().weight(&self.inter_fc_weight).bias(&self.inter_fc_bias).call()?;
+        let inter_x = self.inter_fc.forward(&inter_x)?;
         let inter_x = inter_x.try_reshape([b, f, t, c])?.try_permute(&[0, 2, 1, 3])?; // (B,T,F,C)
-        let inter_x = affine_ln(&inter_x, &self.inter_ln_weight, &self.inter_ln_bias, Self::LN_EPS)?;
+        let inter_x = self.inter_ln.forward(&inter_x)?;
         let inter_out = intra_out.try_add(&inter_x)?;
 
         Ok(inter_out.try_permute(&[0, 3, 1, 2])?) // (B,C,T,F)
