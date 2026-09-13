@@ -1155,16 +1155,19 @@ pub(crate) fn copy_device_cache_row(
 }
 
 /// Read one lane's logits row `[n_vocab]` from the batched JIT output.
+/// Copy one logits row to the host over the copy engine.
+///
+/// The buffer is device-resident — managed memory on CUDA — so reading it
+/// through the host-visible mapping faults the pages across one at a time, at
+/// a measured 0.32 GB/s. Copying the row's byte range moves the same data as a
+/// single bulk transfer instead.
 fn read_logits_row(jit: &WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
-    let logits = jit.logits_view::<f32>()?;
-    if row >= logits.shape()[0] {
-        return Err(decode_err("logits row is out of bounds"));
-    }
-    let logits = logits.index_axis(ndarray::Axis(0), row);
-    if logits.len() != n_vocab {
-        return Err(decode_err("logits row width does not match the vocabulary"));
-    }
-    Ok(logits.iter().copied().collect())
+    let bytes = n_vocab * std::mem::size_of::<f32>();
+    // A row past the end overruns the allocation, which `view` rejects.
+    let row_view = jit.logits()?.view(row * bytes, bytes)?;
+    let mut logits = vec![0f32; n_vocab];
+    row_view.copyout_prefix(bytemuck::cast_slice_mut(&mut logits))?;
+    Ok(logits)
 }
 
 // ─── Cached beam search ─────────────────────────────────────────────────────
