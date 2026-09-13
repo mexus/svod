@@ -114,27 +114,21 @@ impl MultiHeadAttention {
         };
         let (q_fa, k_fa, v_fa) = (split(q)?, split(k)?, split(v)?);
 
-        // Cast to bf16 for FA kernel
+        // The kernel's mma operands are 16-bit, so it can only hold the model's own
+        // precision when the activations already are. Casting fp32 down to reach it
+        // trades roughly three decimal digits for the speedup silently: on the fp32
+        // encoder that moved the output from 1.0e-3 to 1.8 against the PyTorch
+        // golden (bf16), and only to 2.6e-1 with fp16. So an fp32 model keeps SDPA.
         let dt = q_fa.dtype();
-        let need_cast = dt != DType::BFloat16 && dt != DType::Float16;
-        let (q_f, k_f, v_f) = if need_cast {
-            let to = DType::BFloat16;
-            (q_fa.cast(to.clone()), k_fa.cast(to.clone()), v_fa.cast(to))
-        } else {
-            (q_fa.clone(), k_fa.clone(), v_fa.clone())
-        };
-
-        let direct = if (d / self.n_head).is_multiple_of(16) {
-            svod_tk::flash_attention_with(&q_f, &k_f, &v_f, svod_tk::FaOpts { causal, key_lens })
+        let sixteen_bit = dt == DType::BFloat16 || dt == DType::Float16;
+        let direct = if sixteen_bit && (d / self.n_head).is_multiple_of(16) {
+            svod_tk::flash_attention_with(&q_fa, &k_fa, &v_fa, svod_tk::FaOpts { causal, key_lens })
                 .map_err(tk_launch_error)?
         } else {
             None
         };
         match direct {
-            Some(out) => {
-                let out = if need_cast { out.cast(dt) } else { out };
-                Ok(out.try_reshape([b, s, d.into()])?)
-            }
+            Some(out) => Ok(out.try_reshape([b, s, d.into()])?),
             None => {
                 // SDPA fallback (needs [B, H, S, Dh])
                 let valid = key_lens.map(|lens| Tensor::sequence_mask(lens, k.dim_const(1)?)).transpose()?;
