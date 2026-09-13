@@ -26,7 +26,7 @@
 use bon::bon;
 use snafu::OptionExt;
 use strum::{Display, EnumString};
-use svod_dtype::DType;
+use svod_dtype::{DType, DeviceSpec};
 use svod_ir::SInt;
 
 use crate::error::{ExclusiveParamsSnafu, NdimExactSnafu, NonConstDimSnafu, ParamRangeSnafu};
@@ -287,11 +287,18 @@ pub struct GruCell {
     pub bias_hh: Option<Tensor>,
     hidden_size: usize,
     linear_before_reset: bool,
-    /// `weight_hh` rows for `r, z` — `[2H, H]`.
-    w_hh_rz: Tensor,
-    /// `weight_hh` rows for `n` — `[H, H]`.
+    /// `weight_hh` split per gate — `[H, H]` each, rows `r, z, n`.
+    ///
+    /// Three matmuls rather than one wide one, on purpose: narrowing a *reduce's*
+    /// output forces it to materialise, so taking gates out of a single `[3H, H]`
+    /// projection costs an extra kernel per step. Projecting each gate separately
+    /// leaves every reduce with its own elementwise epilogue and fuses the whole
+    /// step into one kernel. The flops are identical either way.
+    w_hh_r: Tensor,
+    w_hh_z: Tensor,
     w_hh_n: Tensor,
-    b_hh_rz: Option<Tensor>,
+    b_hh_r: Option<Tensor>,
+    b_hh_z: Option<Tensor>,
     b_hh_n: Option<Tensor>,
 }
 
@@ -313,10 +320,10 @@ impl GruCell {
         linear_before_reset: bool,
     ) -> Result<Self> {
         let hidden_size = weight_hh.dim_const(-1)?;
-        let w_hh_rz = weight_hh.narrow(0, 0usize, 2 * hidden_size)?;
-        let w_hh_n = weight_hh.narrow(0, 2 * hidden_size, hidden_size)?;
-        let b_hh_rz = bias_hh.as_ref().map(|b| b.narrow(0, 0usize, 2 * hidden_size)).transpose()?;
-        let b_hh_n = bias_hh.as_ref().map(|b| b.narrow(0, 2 * hidden_size, hidden_size)).transpose()?;
+        let row = |i: usize| weight_hh.narrow(0, i * hidden_size, hidden_size);
+        let (w_hh_r, w_hh_z, w_hh_n) = (row(0)?, row(1)?, row(2)?);
+        let brow = |i: usize| bias_hh.as_ref().map(|b| b.narrow(0, i * hidden_size, hidden_size)).transpose();
+        let (b_hh_r, b_hh_z, b_hh_n) = (brow(0)?, brow(1)?, brow(2)?);
         Ok(Self {
             weight_ih,
             weight_hh,
@@ -324,9 +331,11 @@ impl GruCell {
             bias_hh,
             hidden_size,
             linear_before_reset,
-            w_hh_rz,
+            w_hh_r,
+            w_hh_z,
             w_hh_n,
-            b_hh_rz,
+            b_hh_r,
+            b_hh_z,
             b_hh_n,
         })
     }
@@ -356,22 +365,35 @@ impl RecurrentCell for GruCell {
 
     fn step_projected(&self, gx: &Tensor, h: &Self::State) -> Result<Self::State> {
         let hs = self.hidden_size;
-        // With `linear_before_reset` the `n` gate reads `h` directly, so its
-        // recurrent projection is independent of `r` and belongs in the same
-        // matmul as `r` and `z` -- one reduce per step rather than two, which on
-        // a short sequence is the difference between one dispatch and two.
-        // Without it, `n` projects `r * h` and genuinely has to follow.
-        let gh = if self.linear_before_reset {
-            h.linear().weight(&self.weight_hh).maybe_bias(self.bias_hh.as_ref()).call()?
+        // Two shapes for the same arithmetic, and which one wins is a property of
+        // the device rather than of the GRU.
+        //
+        // Narrowing `gx` is free -- it is a plain input, so the slice is a view.
+        // Narrowing a *reduce's* output is not: it forces that reduce to
+        // materialise, so taking all three gates out of one `[3H, H]` projection
+        // costs a second kernel per step. Projecting each gate through its own
+        // `[H, H]` matrix leaves every reduce with its own elementwise epilogue
+        // and fuses the step into one kernel -- which is what matters where a
+        // launch costs more than the arithmetic inside it. On a host the launch
+        // is free and the wide projection vectorises better, so it keeps it.
+        let (r, z, gh_n) = if h.device() == DeviceSpec::Cpu {
+            let gh = h.linear().weight(&self.weight_hh).maybe_bias(self.bias_hh.as_ref()).call()?;
+            let gate = |i: usize| gh.narrow(-1, i * hs, hs);
+            (gate(0)?, gate(1)?, gate(2)?)
         } else {
-            h.linear().weight(&self.w_hh_rz).maybe_bias(self.b_hh_rz.as_ref()).call()?
+            let project = |w: &Tensor, b: Option<&Tensor>| h.linear().weight(w).maybe_bias(b).call();
+            (
+                project(&self.w_hh_r, self.b_hh_r.as_ref())?,
+                project(&self.w_hh_z, self.b_hh_z.as_ref())?,
+                project(&self.w_hh_n, self.b_hh_n.as_ref())?,
+            )
         };
-        let r = gx.narrow(-1, 0usize, hs)?.try_add(&gh.narrow(-1, 0usize, hs)?)?.sigmoid()?;
-        let z = gx.narrow(-1, hs, hs)?.try_add(&gh.narrow(-1, hs, hs)?)?.sigmoid()?;
+        let r = gx.narrow(-1, 0usize, hs)?.try_add(&r)?.sigmoid()?;
+        let z = gx.narrow(-1, hs, hs)?.try_add(&z)?.sigmoid()?;
         let gx_n = gx.narrow(-1, 2 * hs, hs)?;
 
         let n = if self.linear_before_reset {
-            gx_n.try_add(&r.try_mul(&gh.narrow(-1, 2 * hs, hs)?)?)?.tanh()?
+            gx_n.try_add(&r.try_mul(&gh_n)?)?.tanh()?
         } else {
             let gh_n = r.try_mul(h)?.linear().weight(&self.w_hh_n).maybe_bias(self.b_hh_n.as_ref()).call()?;
             gx_n.try_add(&gh_n)?.tanh()?

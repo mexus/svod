@@ -754,17 +754,22 @@ fn gru_graph(t_len: usize, batch: usize) -> Tensor {
     x.gru().weight_ih(&w_ih).weight_hh(&w_hh).call().unwrap().output
 }
 
-/// A `T`-step GRU costs a fixed five kernels whatever `T` is: the zeroed
-/// initial state, the hoisted input projection over the whole sequence, the
-/// two step kernels (the `r`/`z` matmul and the `n` matmul, each fused with
-/// its elementwise tail), and the copy that hands back the hidden history as
-/// the output sequence. The step pair is *one* compiled body each, re-launched
-/// per time slot by the schedule-level `END(CALL, [RANGE])` loop with the time
-/// index bound as a scalar kernel argument.
+/// A `T`-step GRU on the host costs a fixed five kernels whatever `T` is: the
+/// zeroed initial state, the hoisted input projection over the whole sequence,
+/// the two step kernels (the wide `[3H, H]` recurrent projection, which
+/// materialises because its output is narrowed into gates, and the tail that
+/// consumes it), and the copy that hands back the hidden history as the output
+/// sequence. The step is *one* compiled body, re-launched per time slot by the
+/// schedule-level `END(CALL, [RANGE])` loop with the time index bound as a
+/// scalar kernel argument.
 ///
-/// Pinned so a regression that stops hoisting the projection, that starts
-/// emitting a third step kernel (the WAR temp `self_read_misses_store` avoids),
-/// or that re-unrolls the loop is visible.
+/// A device where a launch costs more than the arithmetic gets four instead:
+/// `GruCell::step_projected` there projects each gate through its own `[H, H]`
+/// matrix, which never narrows a reduce output and so fuses the step into one
+/// kernel. Same flops, different shape; see that function.
+///
+/// Pinned so a regression that stops hoisting the projection, that splits the
+/// step further, or that re-unrolls the loop is visible.
 #[test]
 fn t8_gru_kernel_count() {
     // Pinned against the CPU splitter: how many kernels a device needs is the
