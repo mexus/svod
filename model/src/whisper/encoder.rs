@@ -106,7 +106,7 @@ impl AudioEncoder {
         let x = x.try_add(&self.positional_embedding)?.cast(dtype);
 
         let (batch, sequence) = (x.dim_const(0)?, x.dim_const(1)?);
-        let padded_sequence = encoder_padded_sequence_len(&x.device(), sequence);
+        let padded_sequence = encoder_padded_sequence_len(&x.device(), &x.dtype(), sequence);
         let (mut x, key_lens) = match padded_sequence {
             Some(padded) => {
                 let x = x.try_pad(&[(0, 0), (0, (padded - sequence) as isize), (0, 0)])?;
@@ -133,8 +133,19 @@ impl AudioEncoder {
     }
 }
 
-pub(crate) fn encoder_padded_sequence_len(device: &svod_dtype::DeviceSpec, sequence: usize) -> Option<usize> {
-    svod_tk::flash_attention_supported(device)
+/// The padded sequence length, or `None` to leave the sequence alone.
+///
+/// The padding exists only so flash attention can tile the sequence, so it earns
+/// nothing unless that kernel will actually run: it needs a supported device *and*
+/// activations that are already 16-bit, since it cannot take fp32 without silently
+/// downgrading precision (see `MultiHeadAttention::fa_attention`).
+pub(crate) fn encoder_padded_sequence_len(
+    device: &svod_dtype::DeviceSpec,
+    dtype: &DType,
+    sequence: usize,
+) -> Option<usize> {
+    let sixteen_bit = *dtype == DType::BFloat16 || *dtype == DType::Float16;
+    (sixteen_bit && svod_tk::flash_attention_supported(device))
         .then(|| padded_fa_sequence_len(false, sequence, sequence, sequence))
         .flatten()
 }

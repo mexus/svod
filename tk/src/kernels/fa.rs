@@ -153,6 +153,13 @@ struct FaCtx<'a, 'k> {
     warpid: &'a Arc<UOp>,
     causal: bool,
     valid_len: Option<Arc<UOp>>,
+    /// `log2(e)/sqrt(d)` — the softmax scale, folded with the `exp2` base change.
+    /// Applied to the f32 `QKᵀ` accumulator rather than to `Q`: scaling `Q` costs a
+    /// second rounding to the 16-bit mma input dtype, and that error enters the
+    /// scores relative to their own magnitude, which `exp2` then amplifies. Scores
+    /// grow with the square of the activation scale, so pre-scaling `Q` is accurate
+    /// only near unit variance and drifts badly on real activations.
+    score_scale: f64,
 }
 
 /// Apply the FA score-mask (causal + optional padding) to the `att` tile. The
@@ -224,6 +231,8 @@ fn fa_qk<'k>(
     let att = warp.zero(ctx.lp.reinit(att));
     let k_reg_t = warp.transpose(k_reg_t, &k_reg);
     let att = warp.mma_atb(att, &k_reg_t, ctx.q_reg_t);
+    // Scale in f32, on the accumulator — see `FaCtx::score_scale`.
+    let att = att * ctx.score_scale;
 
     let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref());
     (att, v_reg)
@@ -417,9 +426,10 @@ pub(crate) fn build_fa_mw_rdb(
     let norm_vec = ker.acc_vec(q_blk_rows);
     let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
 
-    // Load + scale this warp's Q tile, then transpose for the QKᵀ contraction.
+    // Load this warp's Q tile, then transpose for the QKᵀ contraction. The softmax
+    // scale rides on the f32 accumulator instead (`FaCtx::score_scale`), so this
+    // cast round-trips the stored 16-bit value exactly.
     let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
-    let q_reg_fl = q_reg_fl * ((1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E);
     let q_reg = warp.copy(q_reg, &q_reg_fl);
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
 
@@ -514,7 +524,17 @@ pub(crate) fn build_fa_mw_rdb(
     // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block landed last
     // iteration, or the prologue for block 0) and run QKᵀ → causal mask → online
     // softmax → A·V.
-    let ctx = FaCtx { warp: &warp, lp: &lp, q_reg_t: &q_reg_t, q_blk: &q_blk, warpid: &warpid, causal, valid_len };
+    let score_scale = (1.0 / (d as f64).sqrt()) * std::f64::consts::LOG2_E;
+    let ctx = FaCtx {
+        warp: &warp,
+        lp: &lp,
+        q_reg_t: &q_reg_t,
+        q_blk: &q_blk,
+        warpid: &warpid,
+        causal,
+        valid_len,
+        score_scale,
+    };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
     let FaScratch { k_reg, k_reg_t, v_reg, att, att_mma, max_vec_last, att_smem } = sc;
     let (att, v_reg) = fa_qk(&ctx, k_reg, k_reg_t, v_reg, att, k_cur, v_cur, &kv_idx, fence.as_ref().map(|f| &f[..]));
