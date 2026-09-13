@@ -1,15 +1,16 @@
 //! GTCRN speech enhancement: noisy WAV in → enhanced WAV out.
 //!
-//! Loads the converted checkpoint, runs STFT → network forward (JIT) → ISTFT,
-//! and writes the enhanced waveform.
+//! Loads the converted checkpoint and runs the JIT (STFT → network → ISTFT,
+//! one graph), writing the enhanced waveform.
 //!
 //! ## Chunking
 //!
 //! The GRU recurrence unrolls one IR node per time step, so a single JIT plan
-//! over the whole spectrogram would explode the symbolic graph. This example
+//! over the whole waveform would explode the symbolic graph. This example
 //! processes the audio in fixed 32-frame chunks (one `prepare`, reused per
-//! chunk). The GRU hidden state resets at each chunk boundary, so the output
-//! diverges slightly from a full-sequence forward near boundaries — the
+//! chunk). The GRU hidden state resets at each chunk boundary, and each chunk
+//! is reflect-padded against its own ends, so the output diverges slightly
+//! from a full-sequence run near boundaries — the
 //! [`gtcrn::parity`](../../src/test/unit/gtcrn/parity.rs) test verifies exact
 //! PyTorch parity on a single chunk.
 //!
@@ -26,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use svod_model::gtcrn::{Gtcrn, GtcrnJit, N_FREQ, Stft};
+use svod_model::gtcrn::{Gtcrn, GtcrnJit, HOP, num_frames};
 use svod_model::jit::InputSpec;
 
 #[derive(Parser, Debug)]
@@ -106,62 +107,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("  loaded in {:.2}s", t.elapsed().as_secs_f32());
 
-    // STFT (CPU).
-    let t = Instant::now();
-    let stft = Stft::new();
-    let n_frames = Stft::num_frames(waveform.len());
-    let spec_data = stft.forward(&waveform, 1);
-    println!("STFT: {} frames in {:.2}s", n_frames, t.elapsed().as_secs_f32());
-
     // The GRU recurrence unrolls one IR node per time step, so a single JIT
-    // plan over the full 611-frame audio would explode the symbolic graph.
-    // Process the spectrogram in fixed-size frame chunks (one prepare, reused
-    // per chunk), stitching the enhanced output back together.
+    // plan over the full audio would explode the symbolic graph. Process it in
+    // fixed-size sample chunks (one prepare, reused per chunk): a chunk of
+    // CHUNK_FRAMES · HOP samples is CHUNK_FRAMES + 1 STFT frames in and the
+    // same sample count back out, so the enhanced chunks concatenate directly.
     const CHUNK_FRAMES: usize = 32;
-    let chunk_size = N_FREQ * CHUNK_FRAMES * 2;
-    let mut enhanced = vec![0.0f32; spec_data.len()];
+    const CHUNK_SAMPLES: usize = CHUNK_FRAMES * HOP;
+    let mut enh = vec![0.0f32; waveform.len()];
 
     let t = Instant::now();
     let mut jit = GtcrnJit::new(model);
-    jit.prepare(InputSpec::f32(&[1, N_FREQ, CHUNK_FRAMES, 2]))?;
+    jit.prepare(InputSpec::f32(&[1, CHUNK_SAMPLES]))?;
     println!("JIT prepare ({CHUNK_FRAMES} frames/chunk): {:.2}s", t.elapsed().as_secs_f32());
 
     let t = Instant::now();
     let mut done = 0usize;
     // Reusable zero-padded chunk buffers (only the final chunk is partial).
-    let mut buf = vec![0.0f32; chunk_size];
-    let mut out_flat = vec![0.0f32; chunk_size];
-    while done < n_frames {
-        let take = (n_frames - done).min(CHUNK_FRAMES);
-        // The spectrogram is [B, F, T, 2]: time is the *inner* axis, so a chunk
-        // of frames is one strided run per bin, not a contiguous span. Slicing
-        // it contiguously would take whole frequency bins across every frame
-        // and still land exactly on the end of the buffer, enhancing nonsense
-        // without ever tripping a bounds check.
-        for k in 0..N_FREQ {
-            let src = (k * n_frames + done) * 2;
-            let dst = k * CHUNK_FRAMES * 2;
-            buf[dst..dst + take * 2].copy_from_slice(&spec_data[src..src + take * 2]);
-            // Zero-pad the final partial chunk; a no-op for full chunks.
-            buf[dst + take * 2..dst + CHUNK_FRAMES * 2].fill(0.0);
-        }
-        jit.spec_mut()?.copyin(bytemuck::cast_slice(&buf))?;
+    let mut buf = vec![0.0f32; CHUNK_SAMPLES];
+    let mut out_buf = vec![0.0f32; CHUNK_SAMPLES];
+    while done < waveform.len() {
+        let take = (waveform.len() - done).min(CHUNK_SAMPLES);
+        buf[..take].copy_from_slice(&waveform[done..done + take]);
+        buf[take..].fill(0.0);
+        jit.waveform_mut()?.copyin(bytemuck::cast_slice(&buf))?;
         jit.execute()?;
-        let out = jit.output()?;
-        out.copyout(bytemuck::cast_slice_mut(&mut out_flat))?;
-        for k in 0..N_FREQ {
-            let dst = (k * n_frames + done) * 2;
-            let src = k * CHUNK_FRAMES * 2;
-            enhanced[dst..dst + take * 2].copy_from_slice(&out_flat[src..src + take * 2]);
-        }
+        jit.output()?.copyout(bytemuck::cast_slice_mut(&mut out_buf))?;
+        enh[done..done + take].copy_from_slice(&out_buf[..take]);
         done += take;
     }
-    println!("JIT execute ({} chunks): {:.2}s", n_frames.div_ceil(CHUNK_FRAMES), t.elapsed().as_secs_f32());
-
-    // ISTFT (CPU).
-    let t = Instant::now();
-    let enh = stft.inverse(&enhanced, 1, n_frames);
-    println!("ISTFT: {} samples in {:.2}s", enh.len(), t.elapsed().as_secs_f32());
+    println!(
+        "JIT execute ({} chunks, {} frames): {:.2}s",
+        waveform.len().div_ceil(CHUNK_SAMPLES),
+        num_frames(waveform.len()),
+        t.elapsed().as_secs_f32()
+    );
 
     // Write enhanced WAV.
     let spec = hound::WavSpec {

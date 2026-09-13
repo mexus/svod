@@ -10,36 +10,34 @@
 //!
 //! let model = Gtcrn::from_hub()?;
 //! let mut jit = GtcrnJit::new(model);
-//! // 4 seconds of 16 kHz audio -> 251 STFT frames.
-//! let n_frames = svod_model::gtcrn::Stft::num_frames(4 * 16000);
-//! jit.prepare(InputSpec::f32(&[1, 257, n_frames, 2]))?;
+//! // 4 seconds of 16 kHz audio, waveform in and waveform out.
+//! jit.prepare(InputSpec::f32(&[1, 4 * 16000]))?;
 //!
-//! // copy the [1, 257, T, 2] complex spectrogram into `jit.spec_mut()?`, then:
+//! // copy the [1, L] noisy samples into `jit.waveform_mut()?`, then:
 //! jit.execute()?;
 //! let _enhanced = jit.output()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! STFT/ISTFT run eagerly on the host (see [`stft`]); the network forward pass
-//! is JIT-compiled. `examples/gtcrn_enhance.rs` shows the full
-//! waveform→waveform pipeline (STFT → [`GtcrnJit`] → ISTFT).
+//! The analysis STFT, the mask network and the synthesis ISTFT are one graph
+//! ([`Gtcrn::enhance`]); [`Gtcrn::forward`] is the spectrogram→spectrogram
+//! middle on its own. `examples/gtcrn_enhance.rs` runs the pipeline over a WAV.
 
 mod blocks;
 mod error;
 mod jit;
-mod stft;
 pub mod stream;
 
 pub use error::{Error, Result};
 pub use jit::GtcrnJit;
-pub use stft::{HOP, N_BINS, N_FFT, Stft};
 
+use std::f64::consts::TAU;
 use std::path::Path;
 
 use snafu::ResultExt;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
-use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, LayerNorm, Linear, Module};
+use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, LayerNorm, Linear, Module, Window};
 
 use crate::init::{fan_in_uniform, ones, zeros};
 use crate::state::{self, StateDict};
@@ -59,8 +57,26 @@ pub const HUB_REPO: &str = "vpermilp/gtcrn";
 /// The converted checkpoint's filename inside [`HUB_REPO`].
 const CHECKPOINT: &str = "gtcrn.safetensors";
 
-/// Input/output spectral bins (`n_fft/2 + 1`).
-pub const N_FREQ: usize = 257;
+/// STFT geometry — the upstream GTCRN defaults (`gtcrn.py` / `infer.py`).
+pub const N_FFT: usize = 512;
+pub const HOP: usize = 256;
+
+/// Input/output spectral bins (`N_FFT / 2 + 1`).
+pub const N_FREQ: usize = N_FFT / 2 + 1;
+
+/// GTCRN's analysis *and* synthesis window (`infer.py:18`): a periodic Hann
+/// raised to the 0.5 power. Tabulated on the host in f64, so the transforms
+/// upload their DFT kernels as constants instead of rebuilding them per run.
+pub fn window() -> Window {
+    let w: Vec<f32> = (0..N_FFT).map(|n| (0.5 - 0.5 * (TAU * n as f64 / N_FFT as f64).cos()).sqrt() as f32).collect();
+    Window::Custom(Tensor::from_slice(w))
+}
+
+/// STFT frames a `len`-sample waveform yields under `center` padding: the
+/// padded length is always `len + N_FFT`, so the count reduces to this.
+pub const fn num_frames(len: usize) -> usize {
+    len / HOP + 1
+}
 
 // Encoder/decoder channel/layout constants (GTCRN.__init__).
 const C_IN: usize = 3; // mag + real + imag
@@ -108,6 +124,17 @@ impl Gtcrn {
     // -----------------------------------------------------------------------
     // Forward
     // -----------------------------------------------------------------------
+
+    /// Noisy `(B, L)` waveform → enhanced waveform, the analysis STFT,
+    /// [`forward`](Self::forward) and the synthesis ISTFT in one graph.
+    ///
+    /// Both transforms use [`window`] with `center = True`, as `infer.py`
+    /// does, so the output holds `(num_frames(L) - 1) · HOP` samples — exactly
+    /// `L` when `L` is a multiple of [`HOP`].
+    pub fn enhance(&self, waveform: &Tensor) -> Result<Tensor> {
+        let spec = waveform.stft().n_fft(N_FFT).hop(HOP).window(window()).call()?;
+        Ok(self.forward(&spec)?.istft().n_fft(N_FFT).hop(HOP).window(window()).call()?)
+    }
 
     /// Run the network on a `(B, F=257, T, 2)` complex spectrogram, returning
     /// the enhanced `(B, 257, T, 2)` spectrogram. Mirrors `GTCRN.forward`.
