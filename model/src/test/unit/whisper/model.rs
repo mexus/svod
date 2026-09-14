@@ -1,5 +1,6 @@
 //! Forward shape + state-dict round-trip tests for Whisper model.
 
+use crate::whisper::config::cross_cache_dtype;
 use std::collections::BTreeSet;
 
 use svod_dtype::DType;
@@ -88,6 +89,16 @@ fn reference_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Te
     (keys, values)
 }
 
+/// Read a cache tensor as f32, and read a reference rounded through the cache's
+/// own dtype -- the only fair comparison once the cache is stored narrow.
+fn as_f32(t: &Tensor) -> Vec<f32> {
+    t.cast(DType::Float32).to_vec::<f32>().unwrap()
+}
+
+fn stored_as_f32(t: &Tensor) -> Vec<f32> {
+    as_f32(&t.cast(cross_cache_dtype()))
+}
+
 #[test]
 fn materialized_cross_kv_matches_reference_projection() {
     let mut dims = small_decoder_dims();
@@ -104,17 +115,23 @@ fn materialized_cross_kv_matches_reference_projection() {
 
     let expected_shape = [2, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for (expected, actual) in [(&expected_k, &actual_k), (&expected_v, &actual_v)] {
-        assert_eq!(actual.dtype(), DType::Float32);
+        assert_eq!(actual.dtype(), cross_cache_dtype());
         assert_eq!(actual.dims().unwrap(), expected_shape);
-        let expected = expected.as_vec::<f32>().unwrap();
-        let actual = actual.as_vec::<f32>().unwrap();
+        // The cache stores narrower than the reference computes, so round the
+        // reference through it: this keeps the check on the projection rather
+        // than on the storage's own quantization.
+        let expected = stored_as_f32(expected);
+        let actual = as_f32(actual);
         let max_delta = expected.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        assert!(max_delta < 1e-5, "materialized cross projection drifted by {max_delta}");
+        // One ULP of the storage dtype at these magnitudes. Rounding is a step
+        // function, so two f32 values a hair apart can land either side of a
+        // boundary; anything past a ULP is a real projection error, not storage.
+        assert!(max_delta < 1e-3, "materialized cross projection drifted by {max_delta}");
     }
 }
 
 #[test]
-fn low_precision_cross_projection_keeps_fp32_cache_storage() {
+fn low_precision_cross_projection_runs_in_the_activation_dtype() {
     let _structural = svod_ir::origin::capture_for_thread(false);
     let mut dims = small_decoder_dims();
     dims.dtype = DType::Float16;
@@ -132,12 +149,11 @@ fn low_precision_cross_projection_keeps_fp32_cache_storage() {
     for ((expected, legacy), actual) in
         [(&expected_k, &legacy_k), (&expected_v, &legacy_v)].into_iter().zip([&actual_k, &actual_v])
     {
-        assert_eq!(actual.dtype(), DType::Float32);
-        let expected = expected.as_vec::<f32>().unwrap();
-        let legacy = legacy.as_vec::<f32>().unwrap();
-        let actual = actual.as_vec::<f32>().unwrap();
-        assert_eq!(actual, expected, "projection must use the model activation dtype before FP32 cache storage");
-        assert_ne!(legacy, expected, "fixture must detect projection inherited from the FP32 encoder output");
+        assert_eq!(actual.dtype(), cross_cache_dtype());
+        let (expected, legacy) = (stored_as_f32(expected), stored_as_f32(legacy));
+        let actual = as_f32(actual);
+        assert_eq!(actual, expected, "projection must run in the model activation dtype before cache storage");
+        assert_ne!(legacy, expected, "fixture must detect projection inherited from the f32 encoder output");
     }
 }
 
@@ -185,7 +201,7 @@ fn quantized_weight_scale_scales_output_channels() {
 }
 
 #[test]
-fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
+fn low_precision_prefill_does_not_inherit_cache_storage_dtype() {
     let source_dims = small_decoder_dims();
     let source = Whisper::empty(source_dims.clone()).state_dict("");
     let mut dims = source_dims;
@@ -198,11 +214,14 @@ fn low_precision_prefill_does_not_inherit_fp32_cache_storage_dtype() {
     .unwrap();
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
     let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    assert_eq!(cross_k.dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), cross_cache_dtype());
 
-    let (actual, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    let (expected, _, _) =
-        model.decode_prefill(&tokens, &cross_k.cast(DType::Float16), &cross_v.cast(DType::Float16), 0).unwrap();
+    // Storage width must not reach the compute dtype, so a cache widened to f32
+    // has to give exactly what the natively-stored one gives. Narrowing instead
+    // would be a no-op now that the cache is already the narrow type.
+    let (actual, _, _) =
+        model.decode_prefill(&tokens, &cross_k.cast(DType::Float32), &cross_v.cast(DType::Float32), 0).unwrap();
+    let (expected, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
     Tensor::realize_batch([&actual, &expected]).unwrap();
     assert_eq!(actual.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
 }
@@ -304,7 +323,7 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     cache_k[..prefill_elements].copy_from_slice(&prefill_k.as_vec::<f32>().unwrap());
     cache_v[..prefill_elements].copy_from_slice(&prefill_v.as_vec::<f32>().unwrap());
     assert_eq!(cache_k.len() * std::mem::size_of::<f32>(), dims.n_text_ctx * layer_heads * d_head * 4);
-    assert_eq!(cross_k.dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), cross_cache_dtype());
     assert_eq!(prefill_k.dtype(), DType::Float32);
 
     for next_token in [5i32, 11] {
@@ -467,7 +486,7 @@ fn alignment_forward_exports_only_selected_heads() {
 }
 
 #[test]
-fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
+fn alignment_compute_does_not_inherit_cache_storage_dtype() {
     let mut dims = small_decoder_dims();
     dims.dtype = DType::Float16;
     let model = Whisper::empty(dims.clone());
@@ -479,12 +498,15 @@ fn alignment_compute_does_not_inherit_fp32_cache_storage_dtype() {
     let tokens = Tensor::from_slice([1i32, 2, 3, 4]).try_reshape([1usize, 4]).unwrap();
     let heads = [(0, 0), (1, 1)];
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
-    assert_eq!(cross_k.dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), cross_cache_dtype());
 
-    let actual = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
-    let low_k = cross_k.cast(DType::Float16);
-    let low_v = cross_v.cast(DType::Float16);
-    let expected = model.align_with_cross_kv(&tokens, &low_k, &low_v, &heads).unwrap();
+    // Storage width must not reach the compute dtype, so a cache widened to f32
+    // has to give exactly what the natively-stored one gives. Narrowing instead
+    // would be a no-op now that the cache is already the narrow type.
+    let wide_k = cross_k.cast(DType::Float32);
+    let wide_v = cross_v.cast(DType::Float32);
+    let actual = model.align_with_cross_kv(&tokens, &wide_k, &wide_v, &heads).unwrap();
+    let expected = model.align_with_cross_kv(&tokens, &cross_k, &cross_v, &heads).unwrap();
     Tensor::realize_batch([&actual, &expected]).unwrap();
 
     let actual = actual.as_vec::<f32>().unwrap();

@@ -171,7 +171,8 @@ impl TextDecoder {
             cross_ks.push(k.split_heads(self.n_head)?);
             cross_vs.push(v.split_heads(self.n_head)?);
         }
-        Ok((Self::pack_kv(cross_ks)?.cast(DType::Float32), Self::pack_kv(cross_vs)?.cast(DType::Float32)))
+        let dt = super::config::cross_cache_dtype();
+        Ok((Self::pack_kv(cross_ks)?.cast(dt.clone()), Self::pack_kv(cross_vs)?.cast(dt)))
     }
 
     /// Forward pass producing logits for all positions.

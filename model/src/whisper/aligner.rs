@@ -1,5 +1,6 @@
 //! Fixed-shape teacher-forced decoder alignment and host-side DTW.
 
+use crate::whisper::config::cross_cache_dtype;
 use std::time::{Duration, Instant};
 
 use crate::jit::InputSpec;
@@ -66,7 +67,8 @@ impl WhisperAligner {
         let d_head = n_state / model.dims.n_text_head;
         let alignment_model = WhisperAlignmentModel::new(model, heads.clone());
         let mut jit = WhisperAlignmentJit::new(alignment_model);
-        let cache_spec = InputSpec::f32(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head]).device_local();
+        let cache_spec =
+            InputSpec::new(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head], cross_cache_dtype()).device_local();
         jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, N_TEXT_CTX]))?;
         Ok(Self { jit, n_heads: heads.len(), batch_size, cache_stride: N_AUDIO_CTX * n_layer_heads * d_head })
     }
@@ -95,12 +97,12 @@ impl WhisperAligner {
             return Ok((Vec::new(), AlignmentProfile::default()));
         }
 
-        let cache_bytes = self.cache_stride * std::mem::size_of::<f32>();
+        let cache_bytes = self.cache_stride * cross_cache_dtype().bytes();
         let (_, packing_wall) = timed_d2d(copies.is_some(), inputs[0].cross_k, || {
             {
                 let packed_k = self.jit.cross_k_mut()?;
                 for (lane, input) in inputs.iter().enumerate() {
-                    if input.cross_k.dtype() != svod_dtype::DType::Float32
+                    if input.cross_k.dtype() != cross_cache_dtype()
                         || input.cross_k.size() != cache_bytes
                         || !std::ptr::eq(packed_k.allocator(), input.cross_k.allocator())
                     {
@@ -114,7 +116,7 @@ impl WhisperAligner {
             {
                 let packed_v = self.jit.cross_v_mut()?;
                 for (lane, input) in inputs.iter().enumerate() {
-                    if input.cross_v.dtype() != svod_dtype::DType::Float32
+                    if input.cross_v.dtype() != cross_cache_dtype()
                         || input.cross_v.size() != cache_bytes
                         || !std::ptr::eq(packed_v.allocator(), input.cross_v.allocator())
                         || !std::ptr::eq(input.cross_k.allocator(), input.cross_v.allocator())

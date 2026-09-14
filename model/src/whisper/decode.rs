@@ -11,7 +11,6 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use svod_arch::pipelines::audio::Segment;
 use svod_device::{Buffer, BufferSpec};
-use svod_dtype::DType;
 
 // ─── Language detection ─────────────────────────────────────────────────────
 
@@ -280,6 +279,9 @@ pub(crate) struct DecodeSeed {
     pub(crate) cross_k: Buffer,
     pub(crate) cross_v: Buffer,
     pub(crate) per_pos_bytes: usize,
+    /// One cross-cache position in bytes: the same element count as
+    /// `per_pos_bytes`, at the cross cache's own width.
+    pub(crate) cross_per_pos_bytes: usize,
     pub(crate) self_cache_bytes: usize,
     pub(crate) cross_cache_bytes: usize,
     pub(crate) self_positions: usize,
@@ -343,13 +345,14 @@ pub(crate) fn prefill_decode_seed(
 }
 
 pub(crate) fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
-    if src.dtype() != DType::Float32 || !src.size().is_multiple_of(std::mem::size_of::<f32>()) {
-        return Err(decode_err("prefill cache must contain aligned float32 data"));
+    let element = src.dtype().bytes();
+    if element == 0 || !src.size().is_multiple_of(element) {
+        return Err(decode_err("prefill cache is not element-aligned"));
     }
     let mut clone = Buffer::allocate(
         src.allocator_arc(),
-        DType::Float32,
-        vec![src.size() / std::mem::size_of::<f32>()],
+        src.dtype(),
+        vec![src.size() / element],
         BufferSpec { cpu_access: false, ..BufferSpec::default() },
     )?;
     clone.copy_from(src)?;
@@ -379,13 +382,20 @@ pub(crate) fn build_decode_seed(
         .checked_div(metadata.init_len)
         .filter(|&bytes| bytes != 0 && bytes.checked_mul(metadata.init_len) == Some(self_k.size()))
         .ok_or_else(|| decode_err("self cache is not position-aligned"))?;
-    if per_pos_bytes % std::mem::size_of::<f32>() != 0 {
-        return Err(decode_err("self cache position is not float32-aligned"));
+    let self_element = self_k.dtype().bytes();
+    if self_element == 0 || per_pos_bytes % self_element != 0 {
+        return Err(decode_err("self cache position is not element-aligned"));
     }
+    // Self and cross may be stored at different widths, so one position is the
+    // same element count but a different byte count in each.
+    let cross_per_pos_bytes = (per_pos_bytes / self_element)
+        .checked_mul(cross_k.dtype().bytes())
+        .filter(|&bytes| bytes != 0)
+        .ok_or_else(|| decode_err("cross cache position stride overflow"))?;
     let cross_positions = cross_k
         .size()
-        .checked_div(per_pos_bytes)
-        .filter(|&positions| positions != 0 && positions.checked_mul(per_pos_bytes) == Some(cross_k.size()))
+        .checked_div(cross_per_pos_bytes)
+        .filter(|&positions| positions != 0 && positions.checked_mul(cross_per_pos_bytes) == Some(cross_k.size()))
         .ok_or_else(|| decode_err("cross cache is not position-aligned"))?;
     let self_cache_bytes = self_k.size();
     let cross_cache_bytes = cross_k.size();
@@ -396,6 +406,7 @@ pub(crate) fn build_decode_seed(
         cross_k,
         cross_v,
         per_pos_bytes,
+        cross_per_pos_bytes,
         self_cache_bytes,
         cross_cache_bytes,
         self_positions: metadata.init_len,
@@ -681,7 +692,7 @@ fn seed_attempt_rows(
 ) -> Result<()> {
     if seed.self_positions > n_text_ctx
         || seed.self_positions.checked_mul(seed.per_pos_bytes) != Some(seed.self_cache_bytes)
-        || seed.cross_positions.checked_mul(seed.per_pos_bytes) != Some(seed.cross_cache_bytes)
+        || seed.cross_positions.checked_mul(seed.cross_per_pos_bytes) != Some(seed.cross_cache_bytes)
     {
         return Err(decode_err("decode seed cache geometry mismatch"));
     }
@@ -1159,8 +1170,10 @@ pub(crate) fn copy_device_cache_row(
     row_stride_bytes: usize,
     data: &Buffer,
 ) -> Result<()> {
-    if buf.dtype() != DType::Float32 || data.dtype() != DType::Float32 {
-        return Err(decode_err("cache seed buffers must be float32"));
+    // A raw region copy, so what matters is that the two agree -- self caches are
+    // f32 and cross caches narrower, and neither may be seeded from the other.
+    if buf.dtype() != data.dtype() {
+        return Err(decode_err("cache seed and destination row have different dtypes"));
     }
     if !std::ptr::eq(buf.allocator(), data.allocator()) {
         return Err(decode_err("cache seed and decoder row use different allocators"));

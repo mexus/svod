@@ -5,6 +5,7 @@
 //! independent aligner replays finalized tokens through a teacher-forced graph
 //! and computes word timings on the host.
 
+use crate::whisper::config::cross_cache_dtype;
 use std::time::{Duration, Instant};
 
 use snafu::Snafu;
@@ -169,7 +170,8 @@ impl WhisperRecognizer {
         let n_text_state = model.dims.n_text_state;
         let n_text_layer = model.dims.n_text_layer;
         let d_head = n_text_state / n_text_head;
-        let cross_cache_spec = InputSpec::f32(&[1, N_AUDIO_CTX, n_text_layer * n_text_head, d_head]).device_local();
+        let cross_cache_spec =
+            InputSpec::new(&[1, N_AUDIO_CTX, n_text_layer * n_text_head, d_head], cross_cache_dtype()).device_local();
 
         // Cache-consuming decoder used for language detection.
         let mut decoder_jit = WhisperDecoderJit::new(model.clone());
@@ -212,8 +214,10 @@ impl WhisperRecognizer {
             InputSpec::f32(&[max_lanes, 1, n_text_state]),
             InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
             InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-            InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-            InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+            InputSpec::new(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_cache_dtype())
+                .device_local(),
+            InputSpec::new(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_cache_dtype())
+                .device_local(),
             InputSpec::i32(&[max_lanes]),
             InputSpec::i32(&[max_lanes]),
             &prepare_config,

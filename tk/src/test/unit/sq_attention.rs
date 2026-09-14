@@ -42,7 +42,13 @@ fn sink(caps: ArchCaps, masked: bool) -> Arc<UOp> {
         caps,
     );
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
-    build_single_query_attention(&ker, SqGeom { b, kv_batch: b, n, heads, d }, masked, masked, false);
+    build_single_query_attention(
+        &ker,
+        SqGeom { b, kv_batch: b, n, heads, d, kv: DType::Float32 },
+        masked,
+        masked,
+        false,
+    );
     ker.finish(1)
 }
 
@@ -63,7 +69,12 @@ fn split_sinks(caps: ArchCaps, splits: usize, d: usize) -> (Arc<UOp>, Arc<UOp>) 
         caps,
     );
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
-    build_single_query_attention_partial(&partial, SqGeom { b, kv_batch: b, n, heads, d }, splits, false);
+    build_single_query_attention_partial(
+        &partial,
+        SqGeom { b, kv_batch: b, n, heads, d, kv: DType::Float32 },
+        splits,
+        false,
+    );
     let partial = partial.finish(2);
 
     let merge_buffers = vec![
@@ -278,6 +289,52 @@ fn sq_attention_broadcast_cache_matches_a_replicated_one() {
         assert_eq!(shared.len(), replicated.len());
         let max_abs = shared.iter().zip(&replicated).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
         assert_eq!(max_abs, 0.0, "split {split}: broadcast diverged from the replicated cache by {max_abs}");
+    }
+}
+
+/// A narrowed cache must agree with the f32 one to within f16 quantization.
+///
+/// Whisper projects cross-K/V in f16 and only widened them to f32 because this
+/// kernel demanded it, which doubled both the cache (2.3 GiB at large-v3) and the
+/// bytes the kernel streams. Reading f16 directly is only sound if the softmax
+/// still runs in f32, so this pins the output, not just the dtype plumbing.
+///
+/// `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_attention_f16 -- --ignored`.
+#[test]
+#[ignore]
+fn sq_attention_f16_cache_matches_f32_within_quantization() {
+    if !supported_device() {
+        eprintln!("skip sq_attention_f16_cache_matches_f32_within_quantization: unsupported device/toolchain");
+        return;
+    }
+    let (b, n, h, h_total, d, head_offset) = (5usize, 1500usize, 20usize, 24usize, 64usize, 2usize);
+    let q = Tensor::randn(&[b, 1, h, d]).expect("q");
+    let k32 = Tensor::randn(&[b, n, h_total, d]).expect("k");
+    let v32 = Tensor::randn(&[b, n, h_total, d]).expect("v");
+    // Round-trip through f16 so the f32 run sees exactly the values the f16 run
+    // will: this isolates the kernel's arithmetic from the cast's rounding.
+    let narrow = |t: &Tensor| t.cast(DType::Float16);
+    let widen = |t: &Tensor| t.cast(DType::Float16).cast(DType::Float32);
+    let (k16, v16) = (narrow(&k32), narrow(&v32));
+    let (k_ref, v_ref) = (widen(&k32), widen(&v32));
+    for t in [&q, &k16, &v16, &k_ref, &v_ref] {
+        t.realize().expect("realize");
+    }
+
+    for split in [1usize, 4] {
+        let run = |k: &Tensor, v: &Tensor| {
+            let opts = SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+            let out = crate::single_query_attention_packed(&q, k, v, head_offset, opts)
+                .expect("sq attention")
+                .expect("supported");
+            out.realize().expect("realize");
+            out.as_vec::<f32>().expect("vec")
+        };
+        let reference = run(&k_ref, &v_ref);
+        let narrowed = run(&k16, &v16);
+        assert_eq!(reference.len(), narrowed.len());
+        let max_abs = narrowed.iter().zip(&reference).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+        assert!(max_abs < 5e-3, "split {split}: f16 cache diverged from f32 by {max_abs:e}");
     }
 }
 

@@ -195,6 +195,16 @@ impl ModelDimensions {
     }
 }
 
+/// Element type of the cross-attention K/V caches.
+///
+/// The projection produces these in the model's activation dtype and they are
+/// only read back by attention, which accumulates in f32 regardless. Storing
+/// them wider buys nothing and costs twice the VRAM and twice the bandwidth of
+/// the kernel that streams them -- at large-v3 that is gigabytes.
+pub(crate) fn cross_cache_dtype() -> DType {
+    DType::Float16
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhisperSize {
     TinyEn,
