@@ -49,6 +49,28 @@ fn bench_sq_attention(c: &mut Criterion) {
             });
         }
 
+        // Production never binds a per-layer cache: every layer's K/V live in one
+        // packed `[b, n, n_layer * h, d]` buffer, so one head's consecutive keys
+        // sit `n_layer * h * d` floats apart instead of `h * d`. Same math, same
+        // bytes touched, different stride -- the layout the benches above miss.
+        if mode == "cross" {
+            let h_total = 32 * h;
+            let kk = randn_f32(&[b, n, h_total, d]);
+            let vv = randn_f32(&[b, n, h_total, d]);
+            for &split in &[1usize, 4, 10] {
+                let opts = svod_tk::SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+                let tk = svod_tk::single_query_attention_packed(&q, &kk, &vv, 0, opts)
+                    .expect("packed sq attention")
+                    .expect("supported");
+                let plan = tk.prepare().expect("prepare packed");
+                group.bench_with_input(
+                    BenchmarkId::new(format!("tk/cross_packed/split_{split}"), n),
+                    &n,
+                    |bencher, _| bench_plan(bencher, &plan),
+                );
+            }
+        }
+
         let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).expect("permute");
         let (qp, kp, vp) = (perm(&q), perm(&k), perm(&v));
         let mask = mode.starts_with("self").then(|| {
