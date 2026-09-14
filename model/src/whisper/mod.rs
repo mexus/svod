@@ -29,6 +29,7 @@ pub mod model;
 pub mod plan;
 pub mod tokenizer;
 pub mod transcribe;
+pub(crate) mod vocab;
 
 mod loader;
 pub(crate) mod profile;

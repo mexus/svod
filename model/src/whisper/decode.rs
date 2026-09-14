@@ -5,6 +5,7 @@ use super::error::{Error, Result};
 use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
 use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
 use super::tokenizer::WhisperTokenizer;
+use super::vocab::{logsumexp, top_k_logprobs};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::cmp::Ordering;
@@ -1772,41 +1773,6 @@ fn log_softmax(logits: &[f32], idx: usize) -> f32 {
     let sum: f32 = logits.iter().map(|&l| (l - max_val).exp()).sum();
     let logsum = sum.ln() + max_val;
     if idx < logits.len() { logits[idx] - logsum } else { f32::NEG_INFINITY }
-}
-
-/// The `k` highest-scoring `(token, logprob)` pairs, ordered by descending
-/// logprob and then by ascending token id.
-///
-/// Ranking on the raw logit is equivalent to ranking on the logprob: the
-/// log-softmax normalizer is one constant per row, so it shifts every score
-/// alike and cannot reorder them. That lets the scan hold `k` entries instead
-/// of materializing — and sorting — a logprob for all ~51k tokens.
-pub(crate) fn top_k_logprobs(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let k = k.min(logits.len());
-    if k == 0 {
-        return Vec::new();
-    }
-    // `a` outranks `b` on the higher logit, and on the lower token id in a tie.
-    let outranks = |a: (usize, f32), b: (usize, f32)| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)).is_gt();
-    let mut top: Vec<(usize, f32)> = Vec::with_capacity(k + 1);
-    for candidate in logits.iter().copied().enumerate() {
-        if top.len() == k && !outranks(candidate, top[k - 1]) {
-            continue;
-        }
-        let at = top.partition_point(|&held| outranks(held, candidate));
-        top.insert(at, candidate);
-        top.truncate(k);
-    }
-    let logsum = logsumexp(logits);
-    top.into_iter().map(|(token, logit)| (token, logit - logsum)).collect()
-}
-
-fn logsumexp(arr: &[f32]) -> f32 {
-    let max_val = arr.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    if max_val == f32::NEG_INFINITY {
-        return f32::NEG_INFINITY;
-    }
-    (arr.iter().map(|&l| (l - max_val).exp()).sum::<f32>()).ln() + max_val
 }
 
 fn compression_ratio_text(text: &str) -> f32 {

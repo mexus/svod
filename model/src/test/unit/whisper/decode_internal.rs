@@ -1,12 +1,12 @@
 //! Whisper decode-seed internals: the prefill seed owns its own device caches
 //! (never aliasing the prefill buffers) and seeds every scheduler row.
 
-use crate::whisper::decode::{
-    PrefillMetadata, build_decode_seed, clone_device_cache, copy_device_cache_row, top_k_logprobs,
-};
+use crate::whisper::decode::{PrefillMetadata, build_decode_seed, clone_device_cache, copy_device_cache_row};
+use crate::whisper::vocab::top_k_logprobs;
 use std::sync::Arc;
 use svod_device::{Buffer, BufferSpec, CpuAllocator};
 use svod_dtype::DType;
+use test_case::test_case;
 
 fn cache(allocator: Arc<CpuAllocator>, values: &[f32]) -> Buffer {
     let mut buffer = Buffer::allocate(allocator, DType::Float32, vec![values.len()], BufferSpec::default()).unwrap();
@@ -153,4 +153,66 @@ fn top_k_returns_normalized_logprobs_that_suppressed_tokens_cannot_reach() {
     let mass: f32 = picked.iter().take(2).map(|(_, logprob)| logprob.exp()).sum();
     assert!((mass - 1.0).abs() < 1e-6, "probability mass was {mass}");
     assert!(picked[2].1 == f32::NEG_INFINITY && picked[3].1 == f32::NEG_INFINITY);
+}
+
+/// The vector scans must agree with the scalar ones they replaced, at the row
+/// width Whisper actually uses. `n_vocab` is 51,866 at large-v3; the widths
+/// below straddle the dispatch floor, the lane multiples and the remainder tail.
+#[test_case(0; "empty")]
+#[test_case(1; "single")]
+#[test_case(63; "below the simd floor")]
+#[test_case(64; "at the simd floor")]
+#[test_case(255; "ragged tail")]
+#[test_case(1501; "timestamp range")]
+#[test_case(51866; "large-v3 vocabulary")]
+fn vector_logsumexp_matches_the_scalar_scan(n: usize) {
+    use crate::whisper::vocab::{logsumexp, logsumexp_scalar};
+    let logits: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.7919).sin() * 6.0).collect();
+    let (vector, scalar) = (logsumexp(&logits), logsumexp_scalar(&logits));
+    if n == 0 {
+        assert_eq!(vector, f32::NEG_INFINITY);
+        return;
+    }
+    // The two summation orders differ, so they cannot be bit-equal. A shift this
+    // small is common to every candidate in the row and cannot reorder them.
+    assert!((vector - scalar).abs() < 1e-3, "n={n}: vector {vector} vs scalar {scalar}");
+}
+
+/// An all-suppressed row is the degenerate case the vector cut cannot express:
+/// every entry ties at `-inf`, so the `>= kth` filter would admit the whole
+/// vocabulary. It must fall back to the scalar scan and reproduce it exactly --
+/// including the `-inf - -inf` NaN logprobs, which is what the scan has always
+/// returned here and what the caller's quality gate already rejects.
+#[test]
+fn vector_top_k_falls_back_when_every_token_is_suppressed() {
+    use crate::whisper::vocab::top_k_scalar;
+    let logits = vec![f32::NEG_INFINITY; 512];
+    let picked = top_k_logprobs(&logits, 5);
+    let expected = top_k_scalar(&logits, 5, f32::NEG_INFINITY);
+    assert_eq!(picked.len(), 5);
+    assert_eq!(picked.iter().map(|(token, _)| *token).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    for (got, want) in picked.iter().zip(&expected) {
+        assert_eq!(got.0, want.0);
+        assert_eq!(got.1.is_nan(), want.1.is_nan(), "the fallback must not invent a finite logprob");
+    }
+}
+
+/// Tokens the filters suppressed sit at `-inf` among finite ones, which is the
+/// shape every real decode step has once `apply_logit_filters` has run.
+#[test]
+fn vector_top_k_matches_the_scalar_scan_with_suppressed_tokens() {
+    use crate::whisper::vocab::{logsumexp_scalar, top_k_scalar};
+    let n = 51866usize;
+    let logits: Vec<f32> =
+        (0..n).map(|i| if i % 7 == 0 { f32::NEG_INFINITY } else { ((i as f32) * 1.37).cos() * 9.0 }).collect();
+    let logsum = logsumexp_scalar(&logits);
+    for k in [1usize, 5, 6, 8] {
+        let expected = top_k_scalar(&logits, k, logsum);
+        let actual = top_k_logprobs(&logits, k);
+        assert_eq!(actual.len(), k);
+        for (rank, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(got.0, want.0, "token at rank {rank} for k={k}");
+            assert!((got.1 - want.1).abs() < 1e-3, "logprob at rank {rank} for k={k}");
+        }
+    }
 }
