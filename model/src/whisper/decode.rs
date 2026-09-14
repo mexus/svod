@@ -687,6 +687,7 @@ fn start_attempt(
 fn seed_attempt_rows(
     jit: &mut WhisperDecoderStepJit,
     rows: &[usize],
+    cross_slot: usize,
     seed: &DecodeSeed,
     n_text_ctx: usize,
 ) -> Result<()> {
@@ -700,17 +701,21 @@ fn seed_attempt_rows(
         n_text_ctx.checked_mul(seed.per_pos_bytes).ok_or_else(|| decode_err("self cache stride overflow"))?;
     let cross_stride = seed.cross_cache_bytes;
     // Every row of this attempt decodes the same window, so its cross-attention
-    // cache is the same bytes. Write it into the first row and point the rest
-    // there: the step then reads the largest tensor it touches once per window
-    // instead of once per hypothesis. Rows of *other* attempts keep their own,
-    // which is what the map is for.
-    let owner = *rows.first().ok_or_else(|| decode_err("attempt reserved no rows"))?;
-    copy_device_cache_row(jit.cross_k_mut()?, owner, cross_stride, &seed.cross_k)?;
-    copy_device_cache_row(jit.cross_v_mut()?, owner, cross_stride, &seed.cross_v)?;
+    // cache is the same bytes: one copy in the attempt's own cross slot, with
+    // every row pointed at it. The step then reads the largest tensor it touches
+    // once per window instead of once per hypothesis, and the cache is sized by
+    // concurrent windows rather than by rows. The slot is the request index, not
+    // a decoder row -- there is one live attempt per request, so no two live
+    // attempts can name the same slot.
+    if rows.is_empty() {
+        return Err(decode_err("attempt reserved no rows"));
+    }
+    copy_device_cache_row(jit.cross_k_mut()?, cross_slot, cross_stride, &seed.cross_k)?;
+    copy_device_cache_row(jit.cross_v_mut()?, cross_slot, cross_stride, &seed.cross_v)?;
     for &row in rows {
         copy_device_cache_row(jit.self_k_cache_mut()?, row, self_stride, &seed.self_k_cache)?;
         copy_device_cache_row(jit.self_v_cache_mut()?, row, self_stride, &seed.self_v_cache)?;
-        write_cross_cache_row(jit, row, owner)?;
+        write_cross_cache_row(jit, row, cross_slot)?;
     }
     Ok(())
 }
@@ -844,7 +849,7 @@ pub(crate) fn run_fixed_slot_decode(
                 seeds[request].cross_cache_bytes,
             );
             let (_, wall) = timed_d2d(profile, &seeds[request].self_k_cache, || {
-                seed_attempt_rows(step_jit, &attempt.reserved_rows, &seeds[request], n_text_ctx)
+                seed_attempt_rows(step_jit, &attempt.reserved_rows, request, &seeds[request], n_text_ctx)
             })?;
             if profile {
                 stats.copies.d2d("scheduler_seeding", ops, bytes, wall);

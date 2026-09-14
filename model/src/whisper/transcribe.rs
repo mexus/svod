@@ -208,26 +208,34 @@ impl WhisperRecognizer {
         // Fixed concrete batch keeps tensor-core dimensions static and avoids
         // cache movement when lanes finish.
         let max_lanes = plan.decoder_slots;
+        // One cross cache per concurrently-decoded window, not per decoder row.
+        // A decode call schedules at most `encoder_batch` requests and holds at
+        // most one attempt per request, and every row of an attempt reads its
+        // owner's cache through `cross_cache_map` -- so rows beyond that were
+        // allocated, never written and never read. At large-v3 that is three of
+        // five copies of the largest buffer the decoder owns.
+        let cross_rows = plan.encoder_batch.max(1);
         let mut batched_step_jit = WhisperDecoderStepJit::new(model.clone());
         batched_step_jit.prepare_with_config(
             InputSpec::i32(&[max_lanes, 1]),
             InputSpec::f32(&[max_lanes, 1, n_text_state]),
             InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
             InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-            InputSpec::new(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_cache_dtype())
+            InputSpec::new(&[cross_rows, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_cache_dtype())
                 .device_local(),
-            InputSpec::new(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_cache_dtype())
+            InputSpec::new(&[cross_rows, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head], cross_cache_dtype())
                 .device_local(),
             InputSpec::i32(&[max_lanes]),
             InputSpec::i32(&[max_lanes]),
             &prepare_config,
         )?;
-        // The step graph runs every lane each dispatch, reserved or not, so the
-        // cross-cache map must name a real row from the start. Identity leaves an
-        // unseeded lane reading its own cache; seeding then points a whole attempt
-        // at one row.
+        // The step graph runs every lane each dispatch, reserved or not, and the
+        // kernel loads the mapped row without bounds-checking it, so every entry
+        // must name a real cross row from the start. Zero is the one index always
+        // in range; identity would leave lanes past `cross_rows` reading off the
+        // end of the cache. Seeding then points each attempt's rows at its own.
         {
-            let rows: Vec<i32> = (0..max_lanes as i32).collect();
+            let rows = vec![0i32; max_lanes];
             let buf = batched_step_jit.cross_cache_map_mut()?;
             let dst = buf.as_host_bytes_mut()?;
             let bytes: &[u8] = bytemuck::cast_slice(&rows);

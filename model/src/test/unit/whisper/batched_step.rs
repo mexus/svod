@@ -80,6 +80,39 @@ fn shared_cross_cache_map_matches_a_replicated_cache() {
     assert!(max_abs < 1e-5, "a shared cross cache diverged from a replicated one by {max_abs:e}");
 }
 
+/// The cross cache is sized by concurrent windows, so it has fewer rows than the
+/// decoder has lanes. A one-row cache read by both lanes must equal a two-row
+/// cache holding the same bytes twice -- on the tile path, which resolves the row
+/// with an index load, and on the generic path, which gathers.
+#[test]
+fn cross_cache_with_fewer_rows_than_lanes_matches_a_per_lane_cache() {
+    let dims = tiny_dims();
+    let model = Whisper::empty(dims.clone());
+    let (batch, n_audio_ctx) = (2usize, 8usize);
+    let d_head = dims.n_text_state / dims.n_text_head;
+    let layer_heads = dims.n_text_layer * dims.n_text_head;
+    let token = Tensor::from_slice([1i32, 2]).try_reshape([batch, 1]).unwrap();
+    let pos_emb = Tensor::randn(&[batch, 1, dims.n_text_state]).unwrap();
+    let self_k = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
+    let self_v = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
+    let key_lens = Tensor::from_slice([2i32, 5]);
+
+    let narrow_k = Tensor::randn(&[1, n_audio_ctx, layer_heads, d_head]).unwrap();
+    let narrow_v = Tensor::randn(&[1, n_audio_ctx, layer_heads, d_head]).unwrap();
+    let twice = |cache: &Tensor| Tensor::cat(&[cache, cache], 0).unwrap();
+
+    let step = |ck: &Tensor, cv: &Tensor, map: &[i32]| {
+        model.decode_step(&token, &pos_emb, &self_k, &self_v, ck, cv, &key_lens, &Tensor::from_slice(map)).unwrap().0
+    };
+    let one_row = step(&narrow_k, &narrow_v, &[0, 0]);
+    let two_rows = step(&twice(&narrow_k), &twice(&narrow_v), &[0, 1]);
+    Tensor::realize_batch([&one_row, &two_rows]).unwrap();
+
+    let (one_row, two_rows) = (one_row.as_vec::<f32>().unwrap(), two_rows.as_vec::<f32>().unwrap());
+    let max_abs = one_row.iter().zip(&two_rows).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_abs < 1e-5, "a cache narrower than the lane count diverged by {max_abs:e}");
+}
+
 /// `true` = attend: the cached prefix each lane filled, plus the key this step
 /// appended at the end of the cache.
 #[test]
