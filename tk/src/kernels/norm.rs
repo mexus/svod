@@ -34,11 +34,12 @@ use crate::scaffold::GlSpec;
 use crate::{Group, Kernel};
 
 /// The arches these kernels are enabled for. The bodies are arch-generic (wave
-/// size + butterfly shuffle), but the vector-width ladder and the block shapes
-/// below are measured on `mma.sync` (sm_86); another arch joins by measuring its
-/// own, not by inheriting this one.
-pub const NORM_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[]).with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+/// size + butterfly shuffle); the vector-width ladder and block shapes below are
+/// measured on sm_86 and gfx1151 (both wave32: 585 GB/s cache-resident and 90%
+/// of the DRAM copy rate once the working set spills), and a wave64 part joins
+/// by measuring its own.
+pub const NORM_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx1151])
+    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// Per-lane global-access widths, widest first: 8 bf16 is the 128-bit vector
 /// load, and a wave issuing it covers `32 × 16 = 512` contiguous bytes.
@@ -71,7 +72,8 @@ fn f32c(v: f64) -> Arc<UOp> {
 }
 
 /// A lane's `vec`-wide load at flat element offset `off` — one shaped access,
-/// which the renderer widens to a single `ld.global.v4`-class instruction.
+/// which the late coalescing folds to one 128-bit instruction on the LLVM GPU
+/// targets (`ld.global.v4` / `global_load_dwordx4`).
 pub fn vload(buf: &Arc<UOp>, off: &Arc<UOp>, vec: usize) -> Arc<UOp> {
     if vec == 1 {
         return load_off(buf, off.clone());
@@ -267,8 +269,8 @@ fn check_norm_operands(
 ///
 /// The outcome is three-way (via [`crate::launch_custom`]):
 ///
-/// - `Ok(None)` — *doesn't apply here:* the device is not CUDA sm_80+ with its
-///   LLVM backend ([`NORM_SUPPORTED_ARCHS`]), **or** the shape does not fit
+/// - `Ok(None)` — *doesn't apply here:* the device is not one of
+///   [`NORM_SUPPORTED_ARCHS`] with its LLVM backend, **or** the shape does not fit
 ///   ([`select_norm_cfg`]): `D` must be a multiple of the wave (32) and at most
 ///   `64·32 = 2048` (a row lives in registers). The caller substitutes
 ///   `Tensor::rms_norm_with`.

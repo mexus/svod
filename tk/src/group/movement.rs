@@ -444,8 +444,8 @@ impl<'k> Group<'k> {
         let row = imod(&row0, base_rows);
         let width = idiv(&col0, base_cols);
 
-        // One shaped scalar-dtype load of the contiguous `vw`-run. The compiler
-        // may coalesce these logical lanes without widening the storage dtype.
+        // One shaped scalar-dtype load of the contiguous `vw`-run: the late
+        // coalescing folds it to one 128-bit access on the LLVM GPU targets.
         let off = iadd(&src_i_base, &iadd(&imul(&row0, row_stride), &col0));
         let src_offsets =
             UOp::stack((0..vw).map(|lane| if lane == 0 { off.clone() } else { iadd(&off, &cidx(lane)) }).collect());

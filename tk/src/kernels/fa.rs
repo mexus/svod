@@ -599,8 +599,12 @@ pub struct FaPolicy {
 const IN_BYTES: usize = 2;
 
 impl FaPolicy {
-    /// gfx942 keeps the bench-calibrated `{32,32}` crossover and gfx1151 the
-    /// baseline tile. CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
+    /// CDNA keeps the bench-calibrated `{32,32}` crossover (gfx942). RDNA (measured
+    /// on gfx1151, rolled body) keeps the baseline `{16,32}` at d ≤ 64 (b=1/h=16/
+    /// n=2048: 1.19 ms vs 1.29 at `{16,16}`) and takes `{16,16}` at d = 128, where
+    /// the wider KV block costs occupancy (b=8/h=16/n=512 causal: 1.02 ms vs 1.64;
+    /// n=2048: 12.8 vs 16.7); the flat body is within ±5% and loses at d = 64.
+    /// CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
     /// `cp.async` K/V stream): the taller KV super-block `{16,64}` (117 registers,
     /// 32 KiB LDS at d=64 — two blocks per SM) is fastest on every grid that covers
     /// the SMs (GigaAM b=8/h=16/n=1536: 3.20 ms vs 3.26 at `{16,32}` and 3.55 at
@@ -617,8 +621,8 @@ impl FaPolicy {
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         let small = (Q_BLK, KV_BLK);
         let att_band = !crate::ArchCaps::for_arch(arch).acc_reusable_as_input();
-        match arch {
-            svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942) => Self {
+        match crate::arch::Family::of(arch) {
+            crate::arch::Family::Cdna => Self {
                 compute_units: 304,
                 big: &[(usize::MAX, (32, 32))],
                 small,
@@ -626,15 +630,15 @@ impl FaPolicy {
                 shared_max: 64 << 10,
                 att_band,
             },
-            svod_dtype::GpuArch::Amd(_) => Self {
+            crate::arch::Family::Rdna => Self {
                 compute_units: 40,
-                big: &[(usize::MAX, (Q_BLK, KV_BLK))],
+                big: &[(64, (Q_BLK, KV_BLK)), (128, (Q_BLK, Q_BLK))],
                 small,
                 unroll: false,
                 shared_max: 64 << 10,
                 att_band,
             },
-            svod_dtype::GpuArch::Cuda(_) => Self {
+            crate::arch::Family::Cuda => Self {
                 compute_units: 28,
                 big: &[(64, (Q_BLK, 2 * KV_BLK)), (128, (Q_BLK, Q_BLK))],
                 small,
@@ -646,7 +650,7 @@ impl FaPolicy {
             // `simdgroup_matrix` accumulator feeds an operand directly, so
             // `att_band` is false and the band costs nothing. The core count is not
             // reported by Metal; `for_device` leaves this default in place.
-            svod_dtype::GpuArch::Metal(_) => Self {
+            crate::arch::Family::Metal => Self {
                 compute_units: 40,
                 big: &[(usize::MAX, (Q_BLK, KV_BLK))],
                 small,

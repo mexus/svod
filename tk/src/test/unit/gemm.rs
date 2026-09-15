@@ -3,28 +3,33 @@
 //! invariants every tile must satisfy, plus the hardware-gated comparison of
 //! `gemm_nt` against the generic `Tensor::linear` on the transformer shapes.
 //!
-//! `SVOD_DEVICE=CUDA cargo test -p svod-tk --lib gemm -- --ignored --nocapture`.
+//! `SVOD_DEVICE={CUDA,AMD}:0 cargo test -p svod-tk --lib gemm -- --ignored --nocapture`.
 
 use proptest::prelude::*;
-use svod_dtype::DType;
+use svod_dtype::{DType, GpuArch};
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::kernels::gemm::{
-    Epilogue, GEMM_NT_SUPPORTED_ARCHS, GEMM_TILES, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K, gemm_nt,
-    gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
+    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K, RDNA_TILES,
+    gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
 };
 
 use super::device_supported;
 
-/// Every tile [`GemmPolicy`] can return. A shape is servable exactly when one of
-/// these tiles it, so the predicate tests are written against the same list the
-/// policy searches rather than a restatement of its divisibility rules.
-const TABLE: [GemmCfg; 2] = GEMM_TILES;
+/// Every tile the CUDA [`GemmPolicy`] can return. A shape is servable exactly
+/// when one of these tiles it, so the predicate tests are written against the
+/// same list the policy searches rather than a restatement of its divisibility
+/// rules.
+const TABLE: [GemmCfg; 2] = CUDA_TILES;
 
 /// The accumulator fragment width of every arch the GEMM is built for
-/// (`mma.sync`'s 16×16).
+/// (`mma.sync`'s and gfx11 WMMA's 16×16).
 const FRAG_COLS: usize = 16;
+
+const SM86: GpuArch = GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6));
+/// An RDNA part: the table is keyed by the family, not the part.
+const RDNA: GpuArch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1151);
 
 /// The static shared-memory a CUDA block may take without the opt-in dynamic
 /// allocation (48 KiB).
@@ -68,8 +73,33 @@ fn select_cfg_crossover(m: usize, n: usize, want: GemmCfg) {
 #[test]
 fn select_cfg_crossover_follows_the_sm_count() {
     let (m, k, n) = (128, 1024, 6144); // 96 blocks of the 128×64 tile
-    assert_eq!(GemmPolicy { compute_units: 28 }.cfg(m, k, n), Some(NT_64X64));
-    assert_eq!(GemmPolicy { compute_units: 8 }.cfg(m, k, n), Some(NT_128X64));
+    let cuda = GemmPolicy::for_arch(SM86);
+    assert_eq!(cuda.compute_units, 28);
+    assert_eq!(cuda.cfg(m, k, n), Some(NT_64X64));
+    assert_eq!(GemmPolicy { compute_units: 8, ..cuda }.cfg(m, k, n), Some(NT_128X64));
+}
+
+/// The RDNA table is its own: the same shape rules (`M`/`N` by 64, `K` by the
+/// strip) served by its tiles (`0` wide, `1` the deep-strip fine tile, `2` the
+/// short-K fine tile), with the crossover against the family's 40 CUs; a family
+/// with no measured table declines every shape.
+#[test_case(4096, 1024, 6144, Some(0); "gate_up keeps the wide tile")]
+#[test_case(1024, 1024, 6144, Some(0); "gate_up small M")]
+#[test_case(4096, 3072, 1024, Some(0); "512 blocks take the wide tile")]
+#[test_case(1024, 1024, 2048, Some(1); "256 blocks stay on the fine tile")]
+#[test_case(128, 1024, 6144, Some(1); "batch-1 prefill takes the fine tile")]
+#[test_case(64, 128, 192, Some(1); "short grid takes the deep strip")]
+#[test_case(64, 64, 192, Some(2); "a K too short for the deep strip")]
+#[test_case(128, 96, 6144, Some(2); "K of three strips")]
+#[test_case(100, 1024, 1024, None; "M not a multiple of 64")]
+#[test_case(1024, 48, 1024, None; "K not a multiple of the strip")]
+fn rdna_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) {
+    let policy = GemmPolicy::for_arch(RDNA);
+    assert_eq!(policy.compute_units, 40);
+    assert_eq!(policy.cfg(m, k, n), want.map(|i| RDNA_TILES[i]), "rdna cfg({m}, {k}, {n})");
+    let none = GemmPolicy::for_arch(GpuArch::Amd(svod_dtype::AmdArch::Gfx942));
+    assert_eq!(none.cfg(m, k, n), None, "a family without a table declines");
+    assert_eq!(none.swiglu_pair_width(), None);
 }
 
 /// A rank-1 operand is a structured `Err`, not a panic — the shape preconditions
@@ -121,17 +151,29 @@ proptest! {
 
 // ── Epilogue applicability (GPU-free) ────────────────────────────────────────
 
-/// Every tile the policy can pick reads the same gate/up row arrangement, so a
+/// Every tile a policy can pick reads the same gate/up row arrangement, so a
 /// weight permuted once at load is servable whatever `M` turns out to be — the
-/// invariant [`swiglu_pair_width`] exists to state.
-#[test]
-fn swiglu_pair_width_is_common_to_every_tile() {
-    let pair = swiglu_pair_width().expect("the tiles agree on a pair width");
-    assert_eq!(pair, NT_128X64.reg_n() / 2);
-    for cfg in TABLE {
+/// invariant [`GemmPolicy::swiglu_pair_width`] exists to state, on every arch
+/// table.
+#[test_case(SM86, &CUDA_TILES; "cuda")]
+#[test_case(RDNA, &RDNA_TILES; "rdna")]
+fn swiglu_pair_width_is_common_to_every_tile(arch: GpuArch, table: &[GemmCfg]) {
+    let policy = GemmPolicy::for_arch(arch);
+    assert_eq!(policy.tiles, table);
+    let pair = policy.swiglu_pair_width().expect("the tiles agree on a pair width");
+    assert_eq!(pair, table[0].reg_n() / 2);
+    for cfg in table {
         assert_eq!(cfg.reg_n() / 2, pair, "{cfg:?} reads a different gate/up block width");
         assert!(cfg.carries(Epilogue::SwiGlu { pair }, Some(FRAG_COLS)));
     }
+}
+
+/// The device-level [`swiglu_pair_width`] is the resolved arch's, and `None`
+/// where no arch resolves (the host), so a model on the CPU keeps its rows
+/// plainly stacked.
+#[test]
+fn swiglu_pair_width_is_none_off_the_gpu() {
+    assert_eq!(swiglu_pair_width(&svod_dtype::DeviceSpec::Cpu), None);
 }
 
 /// `Epilogue` is the shape contract too: SwiGLU halves the output columns, the
@@ -172,7 +214,7 @@ fn swiglu_declines_a_pair_off_the_fragment_grid() {
     assert!(!NT_128X64.carries(Epilogue::SwiGlu { pair: 16 }, None), "no matrix core, no SwiGLU");
 }
 
-// ── Hardware-gated correctness (CUDA sm_80+) ─────────────────────────────────
+// ── Hardware-gated correctness (CUDA sm_80+, RDNA) ───────────────────────────
 
 /// Realize, cast to f32, and read as a host `Vec<f32>`.
 fn to_f32_vec(t: &Tensor) -> Vec<f32> {
@@ -230,7 +272,7 @@ const SWIGLU_REL_TOL: f32 = 1.2e-2;
 #[ignore]
 fn gemm_nt_matches_linear_gpu(m: usize, k: usize, n: usize) {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_matches_linear_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_matches_linear_gpu: no supported device / toolchain");
         return;
     }
     let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
@@ -247,7 +289,7 @@ fn gemm_nt_matches_linear_gpu(m: usize, k: usize, n: usize) {
 #[ignore]
 fn gemm_nt_rank3_rows_match_rank2_gpu() {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_rank3_rows_match_rank2_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_rank3_rows_match_rank2_gpu: no supported device / toolchain");
         return;
     }
     let (b, l, k, n) = (4, 256, 192, 128);
@@ -265,7 +307,7 @@ fn gemm_nt_rank3_rows_match_rank2_gpu() {
 #[ignore]
 fn gemm_nt_f16_matches_linear_gpu() {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_f16_matches_linear_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_f16_matches_linear_gpu: no supported device / toolchain");
         return;
     }
     let (m, k, n) = (256usize, 1024usize, 1024usize);
@@ -287,7 +329,7 @@ fn gemm_nt_f16_matches_linear_gpu() {
 #[ignore]
 fn gemm_nt_split_k_matches_linear_gpu() {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_split_k_matches_linear_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_split_k_matches_linear_gpu: no supported device / toolchain");
         return;
     }
     for (m, k, n) in [(128usize, 1024usize, 6144usize), (256, 512, 1024)] {
@@ -311,7 +353,7 @@ fn gemm_nt_split_k_matches_linear_gpu() {
 #[ignore]
 fn gemm_nt_add_matches_graph_gpu(m: usize, k: usize, n: usize) {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_add_matches_graph_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_add_matches_graph_gpu: no supported device / toolchain");
         return;
     }
     let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
@@ -354,11 +396,11 @@ fn pair_rows(w: &Tensor, pair: usize) -> Tensor {
 #[ignore]
 fn gemm_nt_swiglu_matches_graph_gpu(m: usize, k: usize, n: usize) {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_swiglu_matches_graph_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_swiglu_matches_graph_gpu: no supported device / toolchain");
         return;
     }
-    let pair = swiglu_pair_width().expect("a common pair width");
     let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let pair = swiglu_pair_width(&x.device()).expect("a common pair width");
     let y = gemm_nt_with_epilogue(&x, &pair_rows(&w, pair), Epilogue::SwiGlu { pair })
         .expect("build")
         .expect("the kernel applies");
@@ -378,7 +420,7 @@ fn gemm_nt_swiglu_matches_graph_gpu(m: usize, k: usize, n: usize) {
 #[ignore]
 fn gemm_nt_epilogue_outcomes_gpu() {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_epilogue_outcomes_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_epilogue_outcomes_gpu: no supported device / toolchain");
         return;
     }
     let (m, k, n) = (128usize, 1024usize, 1024usize);
@@ -392,7 +434,7 @@ fn gemm_nt_epilogue_outcomes_gpu() {
     let e = gemm_nt_with_epilogue(&x, &w, Epilogue::Add(&f32res)).expect_err("an f32 residual is a caller bug");
     assert!(matches!(e, crate::launch::Error::Dtype { kernel: "gemm-nt", .. }), "got {e:?}");
 
-    let pair = swiglu_pair_width().expect("a common pair width");
+    let pair = swiglu_pair_width(&x.device()).expect("a common pair width");
     let e = gemm_nt_with_epilogue(&x, &w, Epilogue::SwiGlu { pair: 0 }).expect_err("a zero pair is a caller bug");
     assert!(matches!(e, crate::launch::Error::DimMultiple { kernel: "gemm-nt", .. }), "got {e:?}");
 
@@ -414,7 +456,7 @@ fn gemm_nt_epilogue_outcomes_gpu() {
 #[ignore]
 fn gemm_nt_outcomes_gpu() {
     if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
-        eprintln!("skip gemm_nt_outcomes_gpu: no CUDA sm_80+ device / toolchain");
+        eprintln!("skip gemm_nt_outcomes_gpu: no supported device / toolchain");
         return;
     }
     let ragged = operand(100, 1024, DType::BFloat16, 0.31);
