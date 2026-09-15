@@ -12,8 +12,11 @@ use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_commit, cp_async_wai
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, wave_offset};
-use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated};
-use crate::layout::LdmatrixX4;
+use crate::index::{
+    Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated, load_off_vec,
+    store_off_vec, vec_elem,
+};
+use crate::layout::{LaneMap, LdmatrixX4};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 use svod_ir::ops;
@@ -88,26 +91,32 @@ impl<'k> Group<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let src_i_base = Self::tile_base(st, src, idxs, axis);
 
+        // Unrolled over the passes, so every register index is a constant and the
+        // buffer stays in registers; a lane's `ept` run is one shaped load, which
+        // the late coalescing folds to the widest global access.
         let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
-        let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
-        let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
-        let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
-
-        let off = iadd(
-            &src_i_base,
-            &iadd(
-                &iadd(&imul(&height, geom.base_rows * row_stride), &imul(&width, geom.base_cols)),
-                &iadd(&imul(&row, row_stride), &col),
-            ),
-        );
-        let mut load = load_off(src.uop(), off);
-        if src.elem() != st.elem() {
-            load = load.cast(st.elem().clone());
-        }
         let stage_shape = [geom.total_calls as usize, geom.ept as usize];
-        let stored = flat_index(&stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)])
-            .store(load)
-            .end(smallvec![outer, inner]);
+        let ept = geom.ept as usize;
+        let mut stores = Vec::with_capacity(stage_shape[0] * ept);
+        for pass in 0..geom.total_calls {
+            let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+            let off = iadd(
+                &src_i_base,
+                &iadd(
+                    &iadd(&imul(&height, geom.base_rows * row_stride), &imul(&width, geom.base_cols)),
+                    &iadd(&imul(&row, row_stride), &col),
+                ),
+            );
+            let run = load_off_vec(src.uop(), &off, ept);
+            for e in 0..ept {
+                let mut v = vec_elem(&run, e, ept);
+                if src.elem() != st.elem() {
+                    v = v.cast(st.elem().clone());
+                }
+                stores.push(flat_index(&stage, &stage_shape, &[Idx::Const(pass), Idx::Const(e as i64)]).store(v));
+            }
+        }
+        let stored = super::group_or_single(stores);
         self.ker.push_store(stored.clone(), stage.clone());
         stage.after(smallvec![stored])
     }
@@ -120,17 +129,23 @@ impl<'k> Group<'k> {
     pub fn commit_reg_to_local(&self, st: ST, stage: &Arc<UOp>, barrier: bool) -> ST {
         // The LDS destination geometry is fully determined by the tile shape (the
         // global tile position only mattered when *staging* into the registers).
+        // Unrolled over the passes (constant register indices), each lane's run
+        // written as `ept / group` swizzle-safe vector stores ([`lds_group`]).
         let geom = self.lds_fill_geom(&st);
-        let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
-        let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
-        let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
-
         let stage_shape = [geom.total_calls as usize, geom.ept as usize];
-        let load = load_at(stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)]);
-        let stored = st_index(&st, &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)])
-            .store(load)
-            .end(smallvec![outer, inner]);
+        let group = lds_group(&st).min(geom.ept as usize);
+        let mut stores = Vec::with_capacity(stage_shape[0] * geom.ept as usize / group);
+        for pass in 0..geom.total_calls {
+            for g in (0..geom.ept as usize).step_by(group) {
+                let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(g as i64));
+                let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+                let off = st_swizzled_offset(&st, height, width, srow, scol);
+                let vals =
+                    (0..group).map(|e| load_at(stage, &stage_shape, &[Idx::Const(pass), Idx::Const((g + e) as i64)]));
+                stores.push(store_off_vec(st.uop(), &off, vals.collect()));
+            }
+        }
+        let stored = super::group_or_single(stores);
         let stored = if barrier { stored.barrier(SmallVec::new()) } else { stored };
         self.finalize_st(st, stored)
     }
@@ -516,6 +531,9 @@ impl<'k> Group<'k> {
         if let Some(plan) = self.ldmatrix_plan(&rt, st, transpose) {
             return self.ldmatrix_local_to_reg(rt, st, dst_idxs, idxs, plan);
         }
+        if let Some(group) = self.lds_vec_plan(&rt, st, transpose) {
+            return self.vec_local_to_reg(rt, st, dst_idxs, idxs, group);
+        }
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
@@ -536,6 +554,59 @@ impl<'k> Group<'k> {
         let mut didx: Vec<Idx> = dst_idxs.to_vec();
         didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
         let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+        self.finalize_reg(rt, ended)
+    }
+
+    /// The vector-gather plan for the LOCAL→REG hop, when it applies: a fragment
+    /// whose register axis runs along a row (the [`LaneMap::Strided`] operand maps,
+    /// read untransposed — each lane holds a contiguous K run of one row), no
+    /// cast, and a run that divides into swizzle-safe groups ([`lds_group`]), so
+    /// each group is one `ds_read_b64`/`b128` instead of `group` 16-bit reads.
+    fn lds_vec_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<usize> {
+        let group = lds_group(st);
+        (matches!(rt.base.map, LaneMap::Strided { .. })
+            && !transpose
+            && st.elem() == rt.elem()
+            && group > 1
+            && rt.base.base.elements_per_thread().is_multiple_of(group))
+        .then_some(group)
+    }
+
+    /// LOCAL→REG gather as `ept / group` vector reads per fragment: the group's
+    /// first element is swizzled, the rest follow at constant offsets (the swizzle
+    /// permutes whole groups), and every register index is a constant.
+    fn vec_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx], group: usize) -> RT<'k> {
+        let laneid = self.ker.laneid();
+        let ept = rt.base.base.elements_per_thread();
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        let at = |block: Option<&Idx>, frags: i64, i: i64| match block {
+            None => Idx::Const(i),
+            Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), frags), &cidx(i))),
+        };
+        let mut stores = Vec::with_capacity((rt_h * rt_w) as usize * ept);
+        for h in 0..rt_h {
+            for w in 0..rt_w {
+                for g in (0..ept).step_by(group) {
+                    let (row, col) = rt.lane_rc(false, &laneid, &cidx(g as i64));
+                    let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+                    let off = st_swizzled_offset(
+                        st,
+                        at(idxs.first(), rt_h, h).to_uop(),
+                        at(idxs.get(1), rt_w, w).to_uop(),
+                        srow,
+                        scol,
+                    );
+                    let run = load_off_vec(st.uop(), &off, group);
+                    for e in 0..group {
+                        let mut didx = dst_idxs.to_vec();
+                        didx.extend([Idx::Const(h), Idx::Const(w), Idx::Const((g + e) as i64)]);
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(vec_elem(&run, e, group)));
+                    }
+                }
+            }
+        }
+        let ended = super::group_or_single(stores);
         self.finalize_reg(rt, ended)
     }
 
@@ -821,6 +892,25 @@ impl<'k> Group<'k> {
         });
         self.finalize_gl(dst, ended)
     }
+}
+
+/// Elements per swizzle-safe LDS group of `st`: the XOR swizzles permute at
+/// 8-byte granularity (`st.cuh:96` `<< 3`), the chunk swizzle and the identity at
+/// 16, so a run of that many consecutive elements stays one contiguous access
+/// under the swizzle.
+fn lds_group(st: &ST) -> usize {
+    let bytes = if st.base.swizzle.keeps_16b_chunks() { 16 } else { 8 };
+    bytes / st.elem().base().bytes()
+}
+
+/// The flat LDS element offset of swizzled `(height, width, srow, scol)` in `st`,
+/// honoring the double-buffer parity [`ST::base_offset`].
+fn st_swizzled_offset(st: &ST, height: Arc<UOp>, width: Arc<UOp>, srow: Arc<UOp>, scol: Arc<UOp>) -> Arc<UOp> {
+    let mut off = flat_offset(st.shape(), &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)]);
+    if let Some(bo) = st.base_offset() {
+        off = off.try_add(bo).expect("swizzled offset: parity base offset add");
+    }
+    off
 }
 
 /// ST flat INDEX honoring the optional double-buffer parity [`ST::base_offset`].

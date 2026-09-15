@@ -29,7 +29,7 @@ use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
 use crate::group::{iadd, imul};
-use crate::index::{cidx, index_off, load_off};
+use crate::index::{cidx, load_off_vec, store_off_vec, vec_elem};
 use crate::scaffold::GlSpec;
 use crate::{Group, Kernel};
 
@@ -75,34 +75,17 @@ fn f32c(v: f64) -> Arc<UOp> {
 /// which the late coalescing folds to one 128-bit instruction on the LLVM GPU
 /// targets (`ld.global.v4` / `global_load_dwordx4`).
 pub fn vload(buf: &Arc<UOp>, off: &Arc<UOp>, vec: usize) -> Arc<UOp> {
-    if vec == 1 {
-        return load_off(buf, off.clone());
-    }
-    let idx = UOp::index().buffer(buf.clone()).indices(vec![spread(off, vec)]).call().expect("vector load INDEX");
-    UOp::load().index(idx).call()
+    load_off_vec(buf, off, vec)
 }
 
 /// Element `j` of a [`vload`] result.
 pub fn vpick(v: &Arc<UOp>, j: usize, vec: usize) -> Arc<UOp> {
-    if vec == 1 { v.clone() } else { v.index_axes(vec![j]) }
+    vec_elem(v, j, vec)
 }
 
 /// A lane's `vals.len()`-wide store at flat element offset `off`.
 pub fn vstore(buf: &Arc<UOp>, off: &Arc<UOp>, vals: Vec<Arc<UOp>>) -> Arc<UOp> {
-    if vals.len() == 1 {
-        return index_off(buf, off.clone()).store(vals.into_iter().next().expect("one value"));
-    }
-    UOp::index()
-        .buffer(buf.clone())
-        .indices(vec![spread(off, vals.len())])
-        .call()
-        .expect("vector store INDEX")
-        .store(UOp::stack(vals.into_iter().collect()))
-}
-
-/// `[off, off+1, …, off+w-1]` as one shaped index.
-fn spread(off: &Arc<UOp>, w: usize) -> Arc<UOp> {
-    UOp::stack((0..w as i64).map(|l| if l == 0 { off.clone() } else { iadd(off, &cidx(l)) }).collect())
+    store_off_vec(buf, off, vals)
 }
 
 /// `off + k` with the constant folded away when it is zero.
