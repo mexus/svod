@@ -292,9 +292,8 @@ fn fa_softmax_pv<'k>(
             let an = att.shape().len();
             let dims = (att.shape()[an - 3] * att.base.base.rows, att.shape()[an - 2] * att.base.base.cols);
             let band = att_smem.subtile(dims, (ctx.warpid.clone(), 0));
-            let stored = warp.store(band, att, MoveIdx::default());
-            let bar = stored.uop().barrier(smallvec![lp.index().clone(), norm_vec.uop().clone()]);
-            let stored = stored.rewrap(stored.uop().after(smallvec![bar]));
+            let deps = smallvec![lp.index().clone(), norm_vec.uop().clone()];
+            let stored = warp.store_local_fenced(band, &att, MoveIdx::default(), deps);
             warp.load(att_mma, stored, MoveIdx::default())
         }
     };
@@ -458,7 +457,9 @@ pub(crate) fn build_fa_mw_rdb(
     } else {
         let s0_k = g.stage_global_to_reg(&k_smem, &k, &p_kidx, 1);
         let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_kidx, 1);
-        (g.commit_reg_to_local(k_smem, &s0_k, true), g.commit_reg_to_local(v_smem, &s0_v, true))
+        let landed = g.commit_regs_to_local(&[(&k_smem, &s0_k), (&v_smem, &s0_v)]).barrier(smallvec![]);
+        ker.push_store(landed.clone(), k_smem.uop().clone());
+        (k_smem.after(&landed), v_smem.after(&landed))
     };
 
     // Rolled KV loop. `kv_bound` (the dynamic per-q-block causal trip count) is the
@@ -506,10 +507,8 @@ pub(crate) fn build_fa_mw_rdb(
     // drained after the loop.
     //
     // register-staged — stage block `kv+1` → VGPR, `ds_write` it into buf[nxt] (no
-    // per-commit barrier; emitted before the slice so the slice's `o_reg` A·V store
-    // stays the last terminal store on the stack), gather buf[cur], then the WAR
-    // barrier consumed by the gathers folds in the commits, gating both the
-    // cross-iteration RAW and WAR. The barrier-wrapped END (`endrange_barrier_to`)
+    // per-commit barrier: the store node is handed to the WAR barrier the gathers
+    // consume, which gates both the cross-iteration RAW and WAR), gather buf[cur]. The barrier-wrapped END (`endrange_barrier_to`)
     // is NOT used: it reorders the causal-mask WHERE past its consumer, leaving the
     // renderer without its SSA value — plain `endrange` keeps the render order.
     let (k_cur, v_cur, fence) = if async_stream {
@@ -521,9 +520,10 @@ pub(crate) fn build_fa_mw_rdb(
     } else {
         let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
         let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
-        let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
-        let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
-        (k_cur, v_cur, Some([commit_k.uop().clone(), commit_v.uop().clone()]))
+        // One store node for both strips; the gathers' WAR fence below is the
+        // barrier that covers it.
+        let committed = g.commit_regs_to_local(&[(&k_nxt, &s_k), (&v_nxt, &s_v)]);
+        (k_cur, v_cur, Some([committed]))
     };
 
     // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block landed last

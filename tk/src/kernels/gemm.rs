@@ -352,13 +352,15 @@ pub fn gemm_core(
     }
     let ended = match &stream {
         // The staged stream's `ds_write` of the next strip lands after this trip's
-        // MMAs (ordered through the last one), and its barrier-wrapped commit is
-        // the loop's terminal store: one fence per trip, covering the RAW on the
-        // half just written and the WAR on the half every wave just gathered.
+        // MMAs (ordered through the last one), and the one barrier-wrapped commit
+        // of both strips is the loop's terminal store: one fence per trip,
+        // covering the RAW on the half just written and the WAR on the half every
+        // wave just gathered.
         Stream::Staged { stage, nxt } => {
             let after_mma = prev_out.clone().expect("at least one accumulator");
-            let a_c = g.commit_reg_to_local(nxt[0].after(&after_mma), &stage[0], false);
-            let _ = g.commit_reg_to_local(nxt[1].after((&after_mma, a_c.uop())), &stage[1], true);
+            let (a_nxt, b_nxt) = (nxt[0].after(&after_mma), nxt[1].after(&after_mma));
+            let fenced = g.commit_regs_to_local(&[(&a_nxt, &stage[0]), (&b_nxt, &stage[1])]).barrier(smallvec![]);
+            ker.push_store(fenced, a_nxt.uop().clone());
             lp.close()
         }
         _ => lp.close(),
@@ -561,9 +563,10 @@ impl Strips<'_> {
         let (a0, b0) = self.at(&cidx(0));
         let s_a = g.stage_global_to_reg(&a_smem, self.a_gl, &a0, 2);
         let s_b = g.stage_global_to_reg(&b_smem, self.b_gl, &b0, 2);
-        let a_smem = g.commit_reg_to_local(half(&a_smem, &cidx(0)), &s_a, false);
-        let b_smem = g.commit_reg_to_local(half(&b_smem, &cidx(0)).after(a_smem.uop()), &s_b, true);
-        let a_smem = a_smem.after(b_smem.uop());
+        let (a_half, b_half) = (half(&a_smem, &cidx(0)), half(&b_smem, &cidx(0)));
+        let landed = g.commit_regs_to_local(&[(&a_half, &s_a), (&b_half, &s_b)]).barrier(smallvec![]);
+        g.kernel().push_store(landed.clone(), a_smem.uop().clone());
+        let (a_smem, b_smem) = (a_smem.after(&landed), b_smem.after(&landed));
 
         let idx = lp.index().clone();
         let nxt = idx.add(&cidx(1));

@@ -121,33 +121,44 @@ impl<'k> Group<'k> {
         stage.after(smallvec![stored])
     }
 
-    /// Commit a staged register buffer (from [`Self::stage_global_to_reg`]) into
-    /// the swizzled LDS tile — the VGPR→LDS `ds_write` half of the prefetch.
-    /// Recomputes the identical per-lane addressing. Ends in a workgroup barrier
-    /// when `barrier` (the single-buffer commit); the double-buffered pipeline
-    /// passes `false` and shares one barrier per iteration.
-    pub fn commit_reg_to_local(&self, st: ST, stage: &Arc<UOp>, barrier: bool) -> ST {
-        // The LDS destination geometry is fully determined by the tile shape (the
-        // global tile position only mattered when *staging* into the registers).
-        // Unrolled over the passes (constant register indices), each lane's run
-        // written as `ept / group` swizzle-safe vector stores ([`lds_group`]).
-        let geom = self.lds_fill_geom(&st);
-        let stage_shape = [geom.total_calls as usize, geom.ept as usize];
-        let group = lds_group(&st).min(geom.ept as usize);
-        let mut stores = Vec::with_capacity(stage_shape[0] * geom.ept as usize / group);
-        for pass in 0..geom.total_calls {
-            for g in (0..geom.ept as usize).step_by(group) {
-                let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(g as i64));
-                let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
-                let off = st_swizzled_offset(&st, height, width, srow, scol);
-                let vals =
-                    (0..group).map(|e| load_at(stage, &stage_shape, &[Idx::Const(pass), Idx::Const((g + e) as i64)]));
-                stores.push(store_off_vec(st.uop(), &off, vals.collect()));
+    /// Commit staged register buffers (from [`Self::stage_global_to_reg`]) into
+    /// their swizzled LDS tiles — the VGPR→LDS `ds_write` half of the prefetch —
+    /// as ONE store node, returned for the caller to fence: wrap it in the
+    /// barrier that covers it (the pipeline's per-trip fence, or
+    /// [`Self::commit_reg_to_local`]'s own), never leave it bare. A local store
+    /// the graph does not fence is fenced by the optimizer's implicit-barrier
+    /// pass, once per unfenced edge, so a commit whose fence is elsewhere must
+    /// hand its store to that fence instead of an ordering edge. Recomputes the
+    /// fill's per-lane addressing, unrolled over the passes (constant register
+    /// indices), each lane's run as `ept / group` swizzle-safe vector stores
+    /// ([`lds_group`]).
+    pub fn commit_regs_to_local(&self, commits: &[(&ST, &Arc<UOp>)]) -> Arc<UOp> {
+        let mut stores = Vec::new();
+        for (st, stage) in commits {
+            // The LDS destination geometry is fully determined by the tile shape
+            // (the global tile position only mattered when staging into registers).
+            let geom = self.lds_fill_geom(st);
+            let stage_shape = [geom.total_calls as usize, geom.ept as usize];
+            let group = lds_group(st).min(geom.ept as usize);
+            for pass in 0..geom.total_calls {
+                for g in (0..geom.ept as usize).step_by(group) {
+                    let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(g as i64));
+                    let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+                    let off = st_swizzled_offset(st, height, width, srow, scol);
+                    let vals = (0..group)
+                        .map(|e| load_at(stage, &stage_shape, &[Idx::Const(pass), Idx::Const((g + e) as i64)]));
+                    stores.push(store_off_vec(st.uop(), &off, vals.collect()));
+                }
             }
         }
-        let stored = super::group_or_single(stores);
-        let stored = if barrier { stored.barrier(SmallVec::new()) } else { stored };
-        self.finalize_st(st, stored)
+        super::group_or_single(stores)
+    }
+
+    /// [`Self::commit_regs_to_local`] for one tile, closed with its own workgroup
+    /// barrier (the single-buffer commit): the tile comes back ordered after it.
+    pub fn commit_reg_to_local(&self, st: ST, stage: &Arc<UOp>) -> ST {
+        let fenced = self.commit_regs_to_local(&[(&st, stage)]).barrier(SmallVec::new());
+        self.finalize_st(st, fenced)
     }
 
     /// Move a register tile `src` out into `dst` (tinygrad `Group.store`), with the
@@ -771,6 +782,20 @@ impl<'k> Group<'k> {
     /// REG→LOCAL fragment scatter: each lane writes its register fragment into
     /// the (swizzled) LDS tile (the layout-transpose hop before write-back).
     pub(super) fn store_reg_to_local(&self, st: ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST {
+        let ended = self.scatter_reg_to_local(&st, rt, idxs, src_idxs);
+        self.finalize_st(st, ended)
+    }
+
+    /// [`Self::store`]'s REG→LOCAL hop closed with a workgroup barrier carrying
+    /// `deps`, so the tile a whole workgroup then reads back (the RDNA softmax
+    /// relayout band) is fenced once, by this store, and the implicit-barrier
+    /// pass has no bare local store to fence again.
+    pub fn store_local_fenced(&self, st: ST, rt: &RT<'k>, ix: MoveIdx, deps: SmallVec<[Arc<UOp>; 4]>) -> ST {
+        let fenced = self.scatter_reg_to_local(&st, rt, &ix.block, &ix.frag).barrier(deps);
+        self.finalize_st(st, fenced)
+    }
+
+    fn scatter_reg_to_local(&self, st: &ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> Arc<UOp> {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
@@ -792,8 +817,7 @@ impl<'k> Group<'k> {
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
-        let ended = st_index(&st, &didx).store(load).end(smallvec![height, width, inner]);
-        self.finalize_st(st, ended)
+        st_index(st, &didx).store(load).end(smallvec![height, width, inner])
     }
 
     /// REG→GLOBAL write-back: each lane writes its register fragment to the
