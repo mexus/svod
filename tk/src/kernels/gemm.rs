@@ -676,20 +676,21 @@ pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_12
 /// The CUDA sm_80+ tiles, widest first.
 pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
 
-/// The RDNA (wave32 WMMA) tiles: the CUDA tiles on the register-staged pipeline
-/// without the L2 swizzle (single-XCD parts; ±3% either way), and the fine tile
-/// on a 64-deep strip, which halves the barriers per K and wins once the grid is
-/// short (batch-1 down projection 12.3 vs 7.1 TFLOP/s). A 32-deep 64×64 tile
-/// keeps a `K` of 64 or 96 servable. Measured on gfx1151: 19-21 TFLOP/s on the
-/// covering grids against 5-9 for the generic GEMM; 128×128 trails by 10-15%,
-/// `k_step = 64` on the wide tile halves its throughput (48 KiB of LDS).
-pub const RDNA_TILES: [GemmCfg; 3] = [
+/// The tiles of every family without a table of its own, measured on RDNA
+/// (gfx1151): the CUDA tiles on the register-staged pipeline without the L2
+/// swizzle (single-XCD parts; ±3% either way), and the fine tile on a 64-deep
+/// strip, which halves the barriers per K and wins once the grid is short
+/// (batch-1 down projection 12.3 vs 7.1 TFLOP/s). A 32-deep 64×64 tile keeps a
+/// `K` of 64 or 96 servable. 128×128 trailed by 10-15% and `k_step = 64` on the
+/// wide tile halved its throughput (48 KiB of LDS), so neither is a candidate.
+pub const GENERIC_TILES: [GemmCfg; 3] = [
     GemmCfg { l2_swizzle: false, ..NT_128X64 },
     GemmCfg { l2_swizzle: false, k_step: 64, ..NT_64X64 },
     GemmCfg { l2_swizzle: false, ..NT_64X64 },
 ];
 
-/// Tile selection for the NT GEMM: the family's measured tile table and the
+/// Tile selection for the NT GEMM: the family's tile table — the search space
+/// [`Self::tuned`] measures on first use — and, for the static choice, the
 /// device's compute-unit count, which sets how small a launch grid counts as
 /// starving the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -697,8 +698,7 @@ pub struct GemmPolicy {
     /// Compute units (SMs, CUs) on the device.
     pub compute_units: usize,
     /// The tiles to choose between: the widest first, then the finer ones in
-    /// preference order; empty where the family has no measured table (the
-    /// policy then declines every shape).
+    /// preference order.
     pub tiles: &'static [GemmCfg],
     /// Blocks of the widest tile per compute unit below which a finer tile wins.
     /// On CUDA the blocks resident per SM (~116 registers and 24 KiB of shared
@@ -710,14 +710,11 @@ pub struct GemmPolicy {
 impl GemmPolicy {
     /// The family's tile table with its measured part's compute-unit count (an
     /// RTX 3060's 28 SMs, Strix Halo's 40 CUs); [`Self::for_device`] reads the
-    /// real count. A family with no table declines.
+    /// real count. A family without a table of its own takes the generic one.
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         match crate::arch::Family::of(arch) {
             crate::arch::Family::Cuda => Self { compute_units: 28, tiles: &CUDA_TILES, resident: 4 },
-            crate::arch::Family::Rdna => Self { compute_units: 40, tiles: &RDNA_TILES, resident: 8 },
-            crate::arch::Family::Cdna | crate::arch::Family::Metal => {
-                Self { compute_units: 1, tiles: &[], resident: 1 }
-            }
+            _ => Self { compute_units: 40, tiles: &GENERIC_TILES, resident: 8 },
         }
     }
 
@@ -745,6 +742,53 @@ impl GemmPolicy {
             table.insert(0, *widest)
         }
         table.into_iter().find(|cfg| cfg.tiles(m, k, n))
+    }
+
+    /// The tile for an `m × k × n` NT GEMM under `epi` as measured on this device
+    /// ([`crate::tune`]): every table tile that tiles the shape and carries the
+    /// epilogue is timed once on synthetic operands and the fastest kept; the
+    /// static [`Self::cfg`] choice where tuning is off or nothing measured.
+    pub fn tuned(
+        &self,
+        spec: &svod_dtype::DeviceSpec,
+        arch: svod_dtype::GpuArch,
+        dtype: &DType,
+        (m, k, n): (usize, usize, usize),
+        epi: Epilogue<()>,
+    ) -> Option<GemmCfg> {
+        let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
+        let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, frag);
+        let candidates: Vec<GemmCfg> = self.tiles.iter().copied().filter(fits).collect();
+        let fallback = || self.cfg(m, k, n).filter(fits);
+        if candidates.len() < 2 || !crate::tune::enabled() {
+            return fallback();
+        }
+        let key = crate::tune::TuneKey::new("gemm_nt", spec, arch, &[m, k, n, dtype.bytes()], &candidates);
+        let measure = |i: usize| {
+            let cfg = candidates[i];
+            let caps = crate::ArchCaps::for_arch(arch);
+            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
+            let (x, w) = (operand(&[m, k])?, operand(&[n, k])?);
+            let mut y = Tensor::empty(&[m, n], dtype.clone()).to(spec.clone());
+            let dt = dtype.clone();
+            let launch = crate::launch::compile_kernel(
+                "gemm_nt_tune",
+                cfg.grid_dims(m, n),
+                cfg.threads(caps.wave_size),
+                &mut [&mut y],
+                &[&x, &w],
+                move |ker| {
+                    build_gemm_nt(ker, (m, k, n), cfg, dt.clone(), dt, Epilogue::Plain);
+                    ker.finish(cfg.acc_m)
+                },
+            )
+            .ok()?;
+            crate::tune::min_dispatch_ns(&launch, 3)
+        };
+        crate::tune::TuneStore::global()
+            .select(&key, candidates.len(), measure)
+            .map(|i| candidates[i])
+            .or_else(fallback)
     }
 
     /// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be
@@ -793,6 +837,11 @@ pub fn select_cfg(m: usize, k: usize, n: usize) -> Option<GemmCfg> {
 ///   table covers the shape ([`GemmPolicy::cfg`]): `M` and `N` must be multiples
 ///   of 64, `K` a multiple of the 32-wide strip and at least 64 (two strips, one
 ///   per pipeline stage). The caller pads to 128 or substitutes `Tensor::linear`.
+///
+/// The tile is the one measured fastest on this device for the shape
+/// ([`GemmPolicy::tuned`]): the first request of a shape times every candidate
+/// once and caches the winner on disk ([`crate::tune`]); `SVOD_TK_TUNE=0` keeps
+/// the table's static choice instead.
 /// - `Err` — *malformed request:* a symbolic dim, `x` below rank 2 or `w` not
 ///   rank 2, a dtype outside {bf16, f16}, a dtype mismatch between `x` and `w`,
 ///   or `w`'s K disagreeing with `x`'s.
@@ -846,8 +895,10 @@ pub fn gemm_nt_with_epilogue(
     w: &Tensor,
     epilogue: Epilogue<&Tensor>,
 ) -> crate::LaunchResult<Option<Tensor>> {
-    let spec = x.device();
-    build_gemm(x, w, epilogue, |arch, m, k, n| GemmPolicy::for_device(&spec, arch).cfg(m, k, n))
+    let (spec, dtype, kind) = (x.device(), x.uop().dtype(), epilogue.kind());
+    build_gemm(x, w, epilogue, |arch, m, k, n| {
+        GemmPolicy::for_device(&spec, arch).tuned(&spec, arch, &dtype, (m, k, n), kind)
+    })
 }
 
 /// The shared launcher body of the three entries above.

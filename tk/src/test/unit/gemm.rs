@@ -11,7 +11,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::kernels::gemm::{
-    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K, RDNA_TILES,
+    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GENERIC_TILES, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K,
     gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
 };
 
@@ -79,10 +79,10 @@ fn select_cfg_crossover_follows_the_sm_count() {
     assert_eq!(GemmPolicy { compute_units: 8, ..cuda }.cfg(m, k, n), Some(NT_128X64));
 }
 
-/// The RDNA table is its own: the same shape rules (`M`/`N` by 64, `K` by the
-/// strip) served by its tiles (`0` wide, `1` the deep-strip fine tile, `2` the
-/// short-K fine tile), with the crossover against the family's 40 CUs; a family
-/// with no measured table declines every shape.
+/// The generic table (RDNA and every family without its own): the same shape
+/// rules (`M`/`N` by 64, `K` by the strip) served by its tiles (`0` wide, `1`
+/// the deep-strip fine tile, `2` the short-K fine tile), with the crossover
+/// against the family's 40 CUs.
 #[test_case(4096, 1024, 6144, Some(0); "gate_up keeps the wide tile")]
 #[test_case(1024, 1024, 6144, Some(0); "gate_up small M")]
 #[test_case(4096, 3072, 1024, Some(0); "512 blocks take the wide tile")]
@@ -96,10 +96,9 @@ fn select_cfg_crossover_follows_the_sm_count() {
 fn rdna_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) {
     let policy = GemmPolicy::for_arch(RDNA);
     assert_eq!(policy.compute_units, 40);
-    assert_eq!(policy.cfg(m, k, n), want.map(|i| RDNA_TILES[i]), "rdna cfg({m}, {k}, {n})");
-    let none = GemmPolicy::for_arch(GpuArch::Amd(svod_dtype::AmdArch::Gfx942));
-    assert_eq!(none.cfg(m, k, n), None, "a family without a table declines");
-    assert_eq!(none.swiglu_pair_width(), None);
+    assert_eq!(policy.cfg(m, k, n), want.map(|i| GENERIC_TILES[i]), "rdna cfg({m}, {k}, {n})");
+    let cdna = GemmPolicy::for_arch(GpuArch::Amd(svod_dtype::AmdArch::Gfx942));
+    assert_eq!(cdna.tiles, &GENERIC_TILES, "a family without a table of its own takes the generic one");
 }
 
 /// A rank-1 operand is a structured `Err`, not a panic — the shape preconditions
@@ -156,7 +155,7 @@ proptest! {
 /// invariant [`GemmPolicy::swiglu_pair_width`] exists to state, on every arch
 /// table.
 #[test_case(SM86, &CUDA_TILES; "cuda")]
-#[test_case(RDNA, &RDNA_TILES; "rdna")]
+#[test_case(RDNA, &GENERIC_TILES; "rdna")]
 fn swiglu_pair_width_is_common_to_every_tile(arch: GpuArch, table: &[GemmCfg]) {
     let policy = GemmPolicy::for_arch(arch);
     assert_eq!(policy.tiles, table);
@@ -471,4 +470,50 @@ fn gemm_nt_outcomes_gpu() {
     let short = operand(1024, 512, DType::BFloat16, 0.17);
     let e = gemm_nt(&x, &short).expect_err("a K mismatch is a caller bug");
     assert!(matches!(e, crate::launch::Error::OperandShape { operand: "w", .. }), "got {e:?}");
+}
+
+// ── Render pins (host, no GPU) ───────────────────────────────────────────────
+
+/// The staged pipeline on gfx1151 rendered through the launch path's pipeline
+/// (post-optimization, linearize, render): the K loop pays exactly one
+/// workgroup barrier per strip — the commit of both operands is one fenced
+/// store — and the prologue one, so the implicit-barrier pass adds none. Also
+/// pins the vector LDS path: no 16-bit LDS access survives.
+#[test]
+fn staged_gemm_gfx1151_fences_each_strip_once() {
+    use std::sync::Arc;
+
+    use svod_dtype::{AmdArch, DeviceSpec};
+    use svod_ir::UOp;
+
+    use crate::kernels::gemm::build_gemm_nt;
+
+    let (m, k, n) = (128usize, 128usize, 64usize);
+    let cfg = GENERIC_TILES[0];
+    let caps = crate::ArchCaps::for_amd(AmdArch::Gfx1151);
+    let buffers: Vec<Arc<UOp>> =
+        [m * n, m * k, n * k].into_iter().map(|size| UOp::new_buffer(DeviceSpec::Cpu, size, DType::BFloat16)).collect();
+    let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), buffers, caps);
+    build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain);
+    let sink = ker.finish(cfg.acc_m);
+
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1151);
+    let opt = svod_schedule::OptimizerRenderer::for_amd_arch(AmdArch::Gfx1151).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&renderer),
+        None,
+    );
+    let optimized = svod_schedule::apply_post_optimization_with_renderer(sink, &opt).expect("post optimization");
+    let program =
+        svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu).expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear, Some("gemm_nt")).expect("render").code;
+
+    let barriers = code.lines().filter(|l| l.contains("llvm.amdgcn.s.barrier()") && !l.contains("declare")).count();
+    assert_eq!(barriers, 2, "one fence for the prologue and one per K strip:\n{code}");
+    assert!(code.contains("wmma.f32.16x16x16"), "the wave32 WMMA path");
+    let narrow = code.lines().filter(|l| l.contains("addrspace(3)") && l.contains(" bfloat,")).count();
+    assert_eq!(narrow, 0, "LDS is read and written in vector groups, never one element at a time");
 }

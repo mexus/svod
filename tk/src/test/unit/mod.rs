@@ -22,6 +22,7 @@ mod scaffold;
 mod shuffle;
 mod sq_attention;
 mod swizzle;
+mod tune;
 
 /// The env-selected device's caps when tk defines its matrix-core fragment layouts
 /// (AMD, CUDA sm_80+), else `None` — the skip gate for fragment-layout HW tests, so

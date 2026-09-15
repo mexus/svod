@@ -598,6 +598,11 @@ pub struct FaPolicy {
 /// Bytes per element of the 16-bit operand dtypes the kernel accepts.
 const IN_BYTES: usize = 2;
 
+/// The per-warp tiles [`FaPolicy::tuned`] measures on first use: the table
+/// entries every policy draws from, in increasing register footprint.
+pub const FA_TILES: [(usize, usize); 4] =
+    [(Q_BLK, Q_BLK), (Q_BLK, KV_BLK), (Q_BLK, 2 * KV_BLK), (2 * Q_BLK, 2 * Q_BLK)];
+
 impl FaPolicy {
     /// CDNA keeps the bench-calibrated `{32,32}` crossover (gfx942). RDNA (measured
     /// on gfx1151, rolled body) keeps the baseline `{16,32}` at d ≤ 64 (b=1/h=16/
@@ -699,6 +704,59 @@ impl FaPolicy {
         let (q_blk, kv_blk) = self.tile(b, n, h, d)?;
         Some(FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
     }
+
+    /// The config for a `[b, n, h, d]` attention over `h_kv` key heads as measured
+    /// on this device ([`crate::tune`]): every [`FA_TILES`] entry whose buffers fit
+    /// and whose block divides `n` is timed once on synthetic operands and the
+    /// fastest kept; the static [`Self::config`] choice where tuning is off or
+    /// nothing measured. The body form and masking are the policy's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tuned(
+        &self,
+        spec: &svod_dtype::DeviceSpec,
+        arch: svod_dtype::GpuArch,
+        dtype: &DType,
+        (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
+        causal: bool,
+    ) -> Option<FaConfig> {
+        let fits = |&(q_blk, kv_blk): &(usize, usize)| {
+            self.shared_bytes((q_blk, kv_blk), d) <= self.shared_max && n.is_multiple_of(q_blk * NUM_WARPS)
+        };
+        let candidates: Vec<(usize, usize)> = FA_TILES.into_iter().filter(fits).collect();
+        let fallback = || self.config(b, n, h, d, causal);
+        if candidates.len() < 2 || !crate::tune::enabled() {
+            return fallback();
+        }
+        let shape = [b, n, h, h_kv, d, usize::from(causal), dtype.bytes()];
+        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &candidates);
+        let measure = |i: usize| {
+            let (q_blk, kv_blk) = candidates[i];
+            let cfg = FaConfig { q_blk, kv_blk, unroll: self.unroll, causal };
+            let caps = crate::ArchCaps::for_arch(arch);
+            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
+            let (q, k, v) = (operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?);
+            let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
+            let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
+            let dt = dtype.clone();
+            let launch = crate::launch::compile_kernel(
+                "flash_attention_tune",
+                grid,
+                (NUM_WARPS * caps.wave_size) as i64,
+                &mut [&mut o],
+                &[&q, &k, &v],
+                move |ker| {
+                    build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dt, false);
+                    ker.finish(1)
+                },
+            )
+            .ok()?;
+            crate::tune::min_dispatch_ns(&launch, 3)
+        };
+        crate::tune::TuneStore::global()
+            .select(&key, candidates.len(), measure)
+            .map(|i| FaConfig { q_blk: candidates[i].0, kv_blk: candidates[i].1, unroll: self.unroll, causal })
+            .or_else(fallback)
+    }
 }
 
 /// Run the rolled double-buffered multi-wave flash-attention forward into `o`
@@ -776,6 +834,8 @@ impl Default for FaOpts<'_> {
 ///   ([`FA_SUPPORTED_ARCHS`] — gfx942/gfx1151/CUDA sm_80+ with its LLVM backend), **or** the
 ///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
 ///   substitutes its own attention (e.g. [`Tensor::scaled_dot_product_attention`]).
+///   The per-warp tile is the one measured fastest on this device for the shape
+///   ([`FaPolicy::tuned`]; `SVOD_TK_TUNE=0` keeps the policy's static choice).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
 ///   `q`/`k` not a statically-shaped rank-4 tensor, operand dtype ∉ {bf16, f16},
 ///   `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
@@ -831,6 +891,7 @@ pub fn flash_attention_tuned(
         .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
     let kv_seq_match = kd[1] == n && vd[1] == n;
     let (tiling_device, build_device) = (q.device(), q.device());
+    let tiling_dtype = dtype.clone();
 
     crate::launch_custom(
         &q.device(),
@@ -876,14 +937,15 @@ pub fn flash_attention_tuned(
         move |arch| {
             kv_seq_match
                 && policy(&tiling_device, arch)
-                    .tile(b, n, h, d)
-                    .is_some_and(|(q_blk, _)| n.is_multiple_of(q_blk * NUM_WARPS))
+                    .tuned(&tiling_device, arch, &tiling_dtype, (b, n, h, h_kv, d), opts.causal)
+                    .is_some_and(|cfg| n.is_multiple_of(cfg.q_blk * NUM_WARPS))
         },
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg =
-                policy(&build_device, arch).config(b, n, h, d, opts.causal).expect("checked by the tiling predicate");
+            let cfg = policy(&build_device, arch)
+                .tuned(&build_device, arch, &dtype, (b, n, h, h_kv, d), opts.causal)
+                .expect("checked by the tiling predicate");
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let masked = opts.key_lens.is_some();
