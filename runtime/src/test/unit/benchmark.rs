@@ -26,8 +26,14 @@ impl Program for MockKernel {
 #[test]
 fn test_benchmark_basic() {
     let kernel = MockKernel { name: "test".into(), sleep_micros: 100 };
-    let config =
-        BenchmarkConfig { warmup_runs: 1, timing_runs: 3, take_minimum: true, early_stop: None, clear_l2: false };
+    let config = BenchmarkConfig {
+        warmup_runs: 1,
+        timing_runs: 3,
+        take_minimum: true,
+        early_stop: None,
+        clear_l2: false,
+        warmup_budget: None,
+    };
 
     let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
 
@@ -45,6 +51,7 @@ fn test_benchmark_early_stop() {
         take_minimum: true,
         early_stop: Some(Duration::from_micros(100)),
         clear_l2: false,
+        warmup_budget: None,
     };
 
     let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
@@ -118,4 +125,42 @@ fn benchmark_prefers_gpu_stamped_durations() {
     let result =
         unsafe { benchmark_kernel(&StampedKernel, &[], &[], None, None, &BenchmarkConfig::default()) }.unwrap();
     assert!(result.runs.iter().all(|run| *run == Duration::from_micros(7)), "{:?}", result.runs);
+}
+
+/// The clock warm-up runs back to back for the budget and stops early the
+/// moment a dispatch fails, so a broken kernel does not burn the budget.
+#[test]
+fn warm_clock_runs_for_the_budget_and_stops_on_failure() {
+    let mut runs = 0;
+    warm_clock(Duration::from_millis(20), || {
+        runs += 1;
+        std::thread::sleep(Duration::from_millis(1));
+        true
+    });
+    assert!((5..=40).contains(&runs), "{runs} runs in 20 ms of 1 ms dispatches");
+
+    let mut runs = 0;
+    warm_clock(Duration::from_secs(10), || {
+        runs += 1;
+        runs < 3
+    });
+    assert_eq!(runs, 3, "stops at the first failure");
+}
+
+/// Candidates are timed in turn, round after round, each keeping its minimum;
+/// one that fails is excluded from then on and reports no time.
+#[test]
+fn round_robin_keeps_each_candidate_minimum_and_drops_failures() {
+    let mut calls = Vec::new();
+    let best = round_robin_min(3, 2, |i| {
+        calls.push(i);
+        match (i, calls.len()) {
+            (1, _) => None,
+            (0, n) => Some(Duration::from_micros(10 - n as u64)),
+            (2, n) => Some(Duration::from_micros(20 + n as u64)),
+            _ => unreachable!(),
+        }
+    });
+    assert_eq!(calls, vec![0, 1, 2, 0, 2], "candidate 1 is not retried after failing");
+    assert_eq!(best, vec![Some(Duration::from_micros(6)), None, Some(Duration::from_micros(23))]);
 }

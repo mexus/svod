@@ -27,6 +27,12 @@ pub struct BenchmarkConfig {
     /// Stabilises rankings — without this, second/third runs hit hot caches
     /// and bias beam toward smaller-tile candidates.
     pub clear_l2: bool,
+    /// Run the kernel back to back for this long before the first timed run
+    /// ([`warm_clock`]): a GPU idles at a fraction of its boost clock and takes
+    /// about a second of load to lift it, so a kernel timed cold measures the
+    /// clock, not the kernel. `None` skips the warm-up (a device already under
+    /// load, or the CPU).
+    pub warmup_budget: Option<Duration>,
 }
 
 impl Default for BenchmarkConfig {
@@ -35,8 +41,52 @@ impl Default for BenchmarkConfig {
         // and OS scheduling is much larger than per-run overhead, so the
         // min of 3 is a tighter estimate of the kernel's true cost than
         // any longer-running statistic.
-        Self { warmup_runs: 0, timing_runs: 3, take_minimum: true, early_stop: None, clear_l2: false }
+        Self {
+            warmup_runs: 0,
+            timing_runs: 3,
+            take_minimum: true,
+            early_stop: None,
+            clear_l2: false,
+            warmup_budget: None,
+        }
     }
+}
+
+/// The load a GPU needs before a timing means anything: the RTX 3060 idles at
+/// 210 MHz against a 2130 MHz boost and lifts within about a second; the same
+/// kernel times 3x apart cold.
+pub const CLOCK_WARMUP: Duration = Duration::from_millis(1500);
+
+/// Run `dispatch` back to back until `budget` of wall time has elapsed, or it
+/// reports failure. See [`BenchmarkConfig::warmup_budget`].
+pub fn warm_clock(budget: Duration, mut dispatch: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while start.elapsed() < budget && dispatch() {}
+}
+
+/// Each candidate's minimum over `rounds` rounds of timing every candidate in
+/// turn, so none is judged at a clock the others were not (timing them one after
+/// another lets the first lift the clock for the rest). `time(i)` is one timed
+/// run of candidate `i`; `None` excludes it for good.
+pub fn round_robin_min(
+    count: usize,
+    rounds: usize,
+    mut time: impl FnMut(usize) -> Option<Duration>,
+) -> Vec<Option<Duration>> {
+    let mut best: Vec<Option<Duration>> = vec![None; count];
+    let mut dead = vec![false; count];
+    for _ in 0..rounds {
+        for i in 0..count {
+            if dead[i] {
+                continue;
+            }
+            match time(i) {
+                Some(t) => best[i] = Some(best[i].map_or(t, |b| b.min(t))),
+                None => (dead[i], best[i]) = (true, None),
+            }
+        }
+    }
+    best
 }
 
 /// Result of kernel benchmarking.
@@ -82,7 +132,10 @@ pub unsafe fn benchmark_kernel(
     local_size: Option<[usize; 3]>,
     config: &BenchmarkConfig,
 ) -> Result<BenchmarkResult> {
-    // Warmup runs (discard timing)
+    // Warm-up (discarded): the clock budget, then the counted runs.
+    if let Some(budget) = config.warmup_budget {
+        warm_clock(budget, || unsafe { kernel.execute(buffers, vals, global_size, local_size, true).is_ok() });
+    }
     for _ in 0..config.warmup_runs {
         // wait=true: benchmark needs each dispatch to complete before the next
         // (async submit would measure queue time, not kernel time).
