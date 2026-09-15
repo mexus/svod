@@ -51,6 +51,10 @@ pub struct Transcript {
     /// one, `None` otherwise. Populated by models that run language detection
     /// (Whisper); left empty by models that don't.
     pub language: Option<String>,
+    /// Seconds of the window the decode consumed, for a model that opts into
+    /// [`WindowAdvance`]: the read head advances by this. `None` falls back to
+    /// the end of the last segment.
+    pub consumed_sec: Option<f32>,
 }
 
 /// One speech region's final transcript. `start_sec`/`end_sec` reference the
@@ -453,7 +457,8 @@ pub trait Transcriber {
                 let transcript = transcripts.pop().unwrap_or_default();
 
                 let window_sec = (decode_end - seek) as f32 / sample_rate;
-                let covered = transcript.segments.last().map_or(0.0, |s| s.end);
+                let covered =
+                    transcript.consumed_sec.unwrap_or_else(|| transcript.segments.last().map_or(0.0, |s| s.end));
                 let step = advance.advance_sec(covered, window_sec);
                 let step = (((step * sample_rate) as usize).max(1)).min(decode_end - seek);
 

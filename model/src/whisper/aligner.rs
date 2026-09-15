@@ -1,18 +1,19 @@
 //! Fixed-shape teacher-forced decoder alignment and host-side DTW.
 
-use crate::whisper::config::cross_cache_dtype;
 use std::time::{Duration, Instant};
+
+use svod_device::Buffer;
+use svod_dtype::DType;
 
 use crate::jit::InputSpec;
 
-use super::config::{HOP_LENGTH, N_AUDIO_CTX, N_FRAMES, N_TEXT_CTX, TOKENS_PER_SECOND, WhisperSize};
-use super::decode::WhisperTask;
+use super::config::{HOP_LENGTH, N_AUDIO_CTX, N_FRAMES, TOKENS_PER_SECOND, WhisperSize};
+use super::decode::{WhisperTask, decode_err, read_f32};
 use super::dtw::{find_alignment_path_selected, path_to_word_timings};
 use super::error::Result;
-
 use super::jit::{WhisperAlignmentJit, WhisperAlignmentModel};
 use super::model::Whisper;
-use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
+use super::profile::{CopyProfile, GraphProfile};
 use super::tokenizer::WhisperTokenizer;
 use super::transcribe::Word;
 
@@ -22,15 +23,19 @@ pub struct WhisperAligner {
     jit: WhisperAlignmentJit,
     n_heads: usize,
     batch_size: usize,
-    cache_stride: usize,
+    /// Token positions the graph is prepared for: prompt, `<|notimestamps|>`,
+    /// text, EOT.
+    text_ctx: usize,
+    cache_dtype: DType,
+    cache_bytes: usize,
 }
 
 /// Inputs for one lane of a prepared alignment batch.
 pub struct WhisperAlignmentInput<'a> {
     /// Device-resident packed cross-attention K cache for one recognition window.
-    pub cross_k: &'a svod_device::Buffer,
+    pub cross_k: &'a Buffer,
     /// Device-resident packed cross-attention V cache for one recognition window.
-    pub cross_v: &'a svod_device::Buffer,
+    pub cross_v: &'a Buffer,
     /// Recognition tokens, including timestamp tokens when emitted.
     pub decoded_tokens: &'a [u32],
     /// Decoder probability corresponding to each decoded token.
@@ -49,28 +54,34 @@ pub(crate) struct AlignmentProfile {
     pub(crate) cpu_dtw_wall: Duration,
 }
 
-impl AlignmentProfile {
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.graph.merge(other.graph);
-        self.cpu_dtw_wall = self.cpu_dtw_wall.saturating_add(other.cpu_dtw_wall);
-    }
+/// One lane's replayed prompt and the text it aligns.
+struct Lane {
+    text: Vec<u32>,
+    token_probs: Vec<f32>,
+    valid_text: usize,
+    prompt_len: usize,
 }
 
 impl WhisperAligner {
-    pub fn new(model: Whisper, size: WhisperSize, batch_size: usize) -> Result<Self> {
+    /// `max_tokens` bounds the text tokens one window hands over; the graph is
+    /// sized to that plus the prompt and terminators, never past the model's
+    /// context.
+    pub fn new(model: Whisper, size: WhisperSize, batch_size: usize, max_tokens: usize) -> Result<Self> {
         if batch_size == 0 {
-            return Err(super::error::Error::Decode { msg: "alignment batch must be non-zero".to_string() });
+            return Err(decode_err("alignment batch must be non-zero"));
         }
         let heads = size.alignment_heads().to_vec();
-        let n_state = model.dims.n_text_state;
-        let n_layer_heads = model.dims.n_text_layer * model.dims.n_text_head;
-        let d_head = n_state / model.dims.n_text_head;
-        let alignment_model = WhisperAlignmentModel::new(model, heads.clone());
-        let mut jit = WhisperAlignmentJit::new(alignment_model);
+        let dims = &model.dims;
+        let (layer_heads, d_head) = (dims.n_text_layer * dims.n_text_head, dims.n_text_state / dims.n_text_head);
+        let prompt_len = if dims.is_multilingual() { 3 } else { 1 };
+        let text_ctx = (max_tokens + prompt_len + 2).min(dims.n_text_ctx);
+        let cache_dtype = dims.cache_dtype();
+        let cache_bytes = N_AUDIO_CTX * layer_heads * d_head * cache_dtype.bytes();
         let cache_spec =
-            InputSpec::new(&[batch_size, N_AUDIO_CTX, n_layer_heads, d_head], cross_cache_dtype()).device_local();
-        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, N_TEXT_CTX]))?;
-        Ok(Self { jit, n_heads: heads.len(), batch_size, cache_stride: N_AUDIO_CTX * n_layer_heads * d_head })
+            InputSpec::new(&[batch_size, N_AUDIO_CTX, layer_heads, d_head], cache_dtype.clone()).device_local();
+        let mut jit = WhisperAlignmentJit::new(WhisperAlignmentModel::new(model, heads.clone()));
+        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, text_ctx]))?;
+        Ok(Self { jit, n_heads: heads.len(), batch_size, text_ctx, cache_dtype, cache_bytes })
     }
 
     /// Align up to the concrete batch capacity prepared at construction.
@@ -79,67 +90,54 @@ impl WhisperAligner {
         inputs: &[WhisperAlignmentInput<'_>],
         tokenizer: &WhisperTokenizer,
     ) -> Result<Vec<Vec<Word>>> {
-        self.align_batch_profiled(inputs, tokenizer, None).map(|(words, _)| words)
+        self.align_batch_profiled(inputs, tokenizer, &mut CopyProfile::default()).map(|(words, _)| words)
     }
 
     pub(crate) fn align_batch_profiled(
         &mut self,
         inputs: &[WhisperAlignmentInput<'_>],
         tokenizer: &WhisperTokenizer,
-        mut copies: Option<&mut CopyProfile>,
+        copies: &mut CopyProfile,
     ) -> Result<(Vec<Vec<Word>>, AlignmentProfile)> {
         if inputs.len() > self.batch_size {
-            return Err(super::error::Error::Decode {
-                msg: format!("alignment input {} exceeds prepared batch {}", inputs.len(), self.batch_size),
-            });
+            let msg = format!("alignment input {} exceeds prepared batch {}", inputs.len(), self.batch_size);
+            return Err(decode_err(&msg));
         }
         if inputs.is_empty() {
             return Ok((Vec::new(), AlignmentProfile::default()));
         }
 
-        let cache_bytes = self.cache_stride * cross_cache_dtype().bytes();
-        let (_, packing_wall) = timed_d2d(copies.is_some(), inputs[0].cross_k, || {
-            {
-                let packed_k = self.jit.cross_k_mut()?;
-                for (lane, input) in inputs.iter().enumerate() {
-                    if input.cross_k.dtype() != cross_cache_dtype()
-                        || input.cross_k.size() != cache_bytes
-                        || !std::ptr::eq(packed_k.allocator(), input.cross_k.allocator())
-                    {
-                        return Err(super::error::Error::Decode {
-                            msg: "alignment cross K has invalid dtype, size, or allocator".to_string(),
-                        });
+        let (cache_bytes, text_ctx) = (self.cache_bytes, self.text_ctx);
+        let cache_dtype = &self.cache_dtype;
+        let jit = &mut self.jit;
+        let fits = |cache: &Buffer, packed: &Buffer| {
+            cache.dtype() == *cache_dtype
+                && cache.size() == cache_bytes
+                && std::ptr::eq(packed.allocator(), cache.allocator())
+        };
+        copies.d2d(
+            "alignment_packing",
+            inputs.len() * 2,
+            inputs.len() * cache_bytes * 2,
+            inputs[0].cross_k,
+            || -> Result<()> {
+                let pack = |packed: &mut Buffer, cache: &Buffer, lane: usize| {
+                    if !fits(cache, packed) {
+                        return Err(decode_err("alignment cross cache has invalid dtype, size, or allocator"));
                     }
-                    packed_k.copy_region_from(lane * cache_bytes, input.cross_k, 0, cache_bytes)?;
-                }
-            }
-            {
-                let packed_v = self.jit.cross_v_mut()?;
+                    Ok(packed.copy_region_from(lane * cache_bytes, cache, 0, cache_bytes)?)
+                };
                 for (lane, input) in inputs.iter().enumerate() {
-                    if input.cross_v.dtype() != cross_cache_dtype()
-                        || input.cross_v.size() != cache_bytes
-                        || !std::ptr::eq(packed_v.allocator(), input.cross_v.allocator())
-                        || !std::ptr::eq(input.cross_k.allocator(), input.cross_v.allocator())
-                    {
-                        return Err(super::error::Error::Decode {
-                            msg: "alignment cross V has invalid dtype, size, or allocator".to_string(),
-                        });
-                    }
-                    packed_v.copy_region_from(lane * cache_bytes, input.cross_v, 0, cache_bytes)?;
+                    pack(jit.cross_k_mut()?, input.cross_k, lane)?;
+                    pack(jit.cross_v_mut()?, input.cross_v, lane)?;
                 }
-            }
-            Ok(())
-        })?;
-        if let Some(copies) = copies.as_deref_mut() {
-            copies.d2d("alignment_packing", inputs.len() * 2, inputs.len() * cache_bytes * 2, packing_wall);
-        }
+                Ok(())
+            },
+        )?;
 
-        let mut packed_tokens = vec![tokenizer.eot() as i32; self.batch_size * N_TEXT_CTX];
-        let mut metadata = Vec::with_capacity(inputs.len());
+        let mut packed_tokens = vec![tokenizer.eot() as i32; self.batch_size * text_ctx];
+        let mut lanes = Vec::with_capacity(inputs.len());
         for (lane, input) in inputs.iter().enumerate() {
-            let mut text_tokens: Vec<u32> =
-                input.decoded_tokens.iter().copied().filter(|&token| token < tokenizer.eot()).collect();
-            let mut token_probs = input.token_probs[..input.token_probs.len().min(text_tokens.len())].to_vec();
             let mut tokens = vec![tokenizer.sot()];
             if tokenizer.multilingual {
                 let language = input.language.unwrap_or("en");
@@ -149,71 +147,66 @@ impl WhisperAligner {
                     WhisperTask::Translate => tokenizer.translate(),
                 });
             }
-            let sot_len = tokens.len();
-            text_tokens.truncate(N_TEXT_CTX - sot_len - 2);
-            token_probs.truncate(text_tokens.len());
+            let prompt_len = tokens.len();
             tokens.push(tokenizer.no_timestamps());
-            tokens.extend_from_slice(&text_tokens);
+            let text: Vec<u32> = input
+                .decoded_tokens
+                .iter()
+                .copied()
+                .filter(|&token| token < tokenizer.eot())
+                .take(text_ctx - prompt_len - 2)
+                .collect();
+            let token_probs = input.token_probs[..input.token_probs.len().min(text.len())].to_vec();
+            tokens.extend_from_slice(&text);
             tokens.push(tokenizer.eot());
-            let valid_text = tokens.len();
-            for (index, token) in tokens.into_iter().enumerate() {
-                packed_tokens[lane * N_TEXT_CTX + index] = token as i32;
+            for (index, token) in tokens.iter().enumerate() {
+                packed_tokens[lane * text_ctx + index] = *token as i32;
             }
-            metadata.push((text_tokens, token_probs, valid_text, sot_len));
+            lanes.push(Lane { text, token_probs, valid_text: tokens.len(), prompt_len });
         }
 
-        let token_buffer = self.jit.tokens_mut()?;
-        let token_started = begin_host_copy(copies.is_some(), token_buffer)?;
-        token_buffer.as_host_bytes_mut()?.copy_from_slice(bytemuck::cast_slice(&packed_tokens));
-        if let (Some(copies), Some(started)) = (copies.as_deref_mut(), token_started) {
-            copies.h2d("alignment_tokens", 1, packed_tokens.len() * std::mem::size_of::<i32>(), started.elapsed());
-        }
-        let profiling = copies.is_some();
-        let (graph_wall, kernels) = if profiling {
-            let graph_started = Instant::now();
-            let kernels = self.jit.execute_profiled_static()?;
-            self.jit.output()?.synchronize()?;
-            (graph_started.elapsed(), kernels)
-        } else {
-            self.jit.execute()?;
-            (Duration::ZERO, Vec::new())
-        };
-        let output = self.jit.output()?;
-        let output_started = begin_host_copy(copies.is_some(), output)?;
-        let output_bytes = output.as_host_bytes()?;
-        let qk_stride = self.n_heads * N_TEXT_CTX * N_AUDIO_CTX;
-        let active_qk_bytes = inputs.len() * qk_stride * std::mem::size_of::<f32>();
-        let profiled_qk = output_started.map(|_| bytemuck::cast_slice(&output_bytes[..active_qk_bytes]).to_vec());
-        let qk: &[f32] = profiled_qk.as_deref().unwrap_or_else(|| bytemuck::cast_slice(output_bytes));
-        if let (Some(copies), Some(started)) = (copies, output_started) {
-            copies.d2h("alignment_qk", 1, active_qk_bytes, started.elapsed());
-        }
+        let bytes: &[u8] = bytemuck::cast_slice(&packed_tokens);
+        let fence = jit.tokens_mut()?.clone();
+        copies.h2d("alignment_tokens", 1, bytes.len(), &fence, || -> Result<()> {
+            jit.tokens_mut()?.as_host_bytes_mut()?.copy_from_slice(bytes);
+            Ok(())
+        })?;
+        let mut graph = GraphProfile::new(copies.enabled());
+        graph.execute(
+            jit,
+            |jit| -> Result<()> { Ok(jit.execute()?) },
+            |jit| {
+                let kernels = jit.execute_profiled_static()?;
+                jit.output()?.synchronize()?;
+                Ok(kernels)
+            },
+        )?;
+        let qk_stride = self.n_heads * text_ctx * N_AUDIO_CTX;
+        let output = jit.output()?;
+        let count = inputs.len() * qk_stride;
+        let qk = copies.d2h("alignment_qk", 1, count * size_of::<f32>(), output, || read_f32(output, 0, count))?;
 
         let cpu_started = Instant::now();
         let words = inputs
             .iter()
-            .zip(metadata)
+            .zip(lanes)
             .enumerate()
-            .map(|(lane, (input, (text_tokens, token_probs, valid_text, sot_len)))| {
+            .map(|(lane, (input, meta))| {
                 let lane_qk = &qk[lane * qk_stride..(lane + 1) * qk_stride];
                 let valid_audio = (input.audio_samples / HOP_LENGTH).min(N_FRAMES) / 2;
                 let (text_indices, time_indices) = find_alignment_path_selected(
                     lane_qk,
                     self.n_heads,
-                    N_TEXT_CTX,
+                    text_ctx,
                     N_AUDIO_CTX,
-                    valid_text,
+                    meta.valid_text,
                     valid_audio,
                     7,
-                    sot_len,
+                    meta.prompt_len,
                 );
-                words_from_path(&text_indices, &time_indices, &text_tokens, &token_probs, input.language, tokenizer)
+                words_from_path(&text_indices, &time_indices, &meta.text, &meta.token_probs, input.language, tokenizer)
             })
             .collect();
-        let mut graph = GraphProfile::default();
-        if profiling {
-            graph.record(graph_wall, kernels);
-        }
         Ok((words, AlignmentProfile { graph, cpu_dtw_wall: cpu_started.elapsed() }))
     }
 }
@@ -231,7 +224,7 @@ pub(crate) fn words_from_path(
     for tokens in &word_token_lists {
         word_boundaries.push(word_boundaries.last().copied().unwrap() + tokens.len());
     }
-    let mut timings = path_to_word_timings(
+    path_to_word_timings(
         text_indices,
         time_indices,
         &word_boundaries,
@@ -239,63 +232,9 @@ pub(crate) fn words_from_path(
         &word_token_lists,
         token_probs,
         TOKENS_PER_SECOND,
-    );
-    refine_word_timings(&mut timings);
-    timings
-        .into_iter()
-        .filter(|word| !word.word.trim().is_empty())
-        .map(|word| Word { text: word.word, start: word.start, end: word.end })
-        .collect()
-}
-
-fn refine_word_timings(words: &mut [super::dtw::WordTiming]) {
-    let mut durations: Vec<f32> =
-        words.iter().map(|word| word.end - word.start).filter(|&duration| duration > 0.0).collect();
-    durations.sort_by(|a, b| a.total_cmp(b));
-    let median = match durations.len() {
-        0 => 0.0,
-        len if len % 2 == 0 => (durations[len / 2 - 1] + durations[len / 2]) / 2.0,
-        len => durations[len / 2],
-    }
-    .min(0.7);
-    let max_duration = median * 2.0;
-    if max_duration > 0.0 {
-        const SENTENCE_END: &str = ".。!！?？";
-        for index in 1..words.len() {
-            if words[index].end - words[index].start > max_duration {
-                if SENTENCE_END.contains(words[index].word.as_str()) {
-                    words[index].end = words[index].start + max_duration;
-                } else if SENTENCE_END.contains(words[index - 1].word.as_str()) {
-                    words[index].start = words[index].end - max_duration;
-                }
-            }
-        }
-    }
-
-    const PREPEND: &str = "\"'“¿([{-";
-    const APPEND: &str = "\"'.。,，!！?？:：”)]}、";
-    let mut following = words.len().saturating_sub(1);
-    for previous in (0..words.len().saturating_sub(1)).rev() {
-        if words[previous].word.starts_with(' ') && PREPEND.contains(words[previous].word.trim()) {
-            let prefix = std::mem::take(&mut words[previous].word);
-            words[following].word.insert_str(0, &prefix);
-            let mut tokens = std::mem::take(&mut words[previous].tokens);
-            tokens.append(&mut words[following].tokens);
-            words[following].tokens = tokens;
-        } else {
-            following = previous;
-        }
-    }
-
-    let mut previous = 0;
-    for following in 1..words.len() {
-        if !words[previous].word.ends_with(' ') && APPEND.contains(words[following].word.as_str()) {
-            let suffix = std::mem::take(&mut words[following].word);
-            words[previous].word.push_str(&suffix);
-            let tokens = std::mem::take(&mut words[following].tokens);
-            words[previous].tokens.extend(tokens);
-        } else {
-            previous = following;
-        }
-    }
+    )
+    .into_iter()
+    .filter(|word| !word.word.trim().is_empty())
+    .map(|word| Word { text: word.word, start: word.start, end: word.end })
+    .collect()
 }

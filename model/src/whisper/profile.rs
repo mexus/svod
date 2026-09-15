@@ -1,4 +1,8 @@
-//! Internal Whisper copy profiling.
+//! Internal Whisper profiling: graph executions and the copies around them.
+//!
+//! Both recorders carry an `enabled` flag so a call site is one line whether or
+//! not a profile is being collected: disabled, they run the work and record
+//! nothing.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -6,37 +10,53 @@ use std::time::{Duration, Instant};
 use svod_device::Buffer;
 use svod_runtime::{KernelProfile, StageProfile};
 
-use super::error::Result;
+type DeviceError = svod_device::error::Error;
 
 #[derive(Debug, Default)]
 pub(crate) struct GraphProfile {
+    enabled: bool,
     pub(crate) wall: Duration,
     pub(crate) executions: usize,
     pub(crate) kernels: Vec<KernelProfile>,
 }
 
 impl GraphProfile {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self { enabled, ..Self::default() }
+    }
+
+    /// Run a prepared graph. Profiling swaps the plain execution for the
+    /// instrumented one and charges its synchronized wall to this stage; the
+    /// instrumented closure must wait for the graph's output before returning.
+    pub(crate) fn execute<J, E>(
+        &mut self,
+        jit: &mut J,
+        run: impl FnOnce(&mut J) -> Result<(), E>,
+        profiled: impl FnOnce(&mut J) -> Result<Vec<KernelProfile>, E>,
+    ) -> Result<(), E> {
+        if !self.enabled {
+            return run(jit);
+        }
+        let started = Instant::now();
+        let kernels = profiled(jit)?;
+        self.record(started.elapsed(), kernels);
+        Ok(())
+    }
+
     pub(crate) fn record(&mut self, wall: Duration, kernels: Vec<KernelProfile>) {
         self.wall = self.wall.saturating_add(wall);
         self.executions = self.executions.saturating_add(1);
         self.kernels.extend(kernels);
     }
 
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.wall = self.wall.saturating_add(other.wall);
-        self.executions = self.executions.saturating_add(other.executions);
-        self.kernels.extend(other.kernels);
-    }
-
+    /// Every numeric entry is a plain counter so per-window profiles sum when
+    /// the pipeline merges them.
     pub(crate) fn stage(self, name: &str) -> StageProfile {
         let kernel_dispatches = self.kernels.len();
-        let average_wall_ms =
-            if self.executions == 0 { 0.0 } else { self.wall.as_secs_f64() * 1e3 / self.executions as f64 };
         let mut stage = StageProfile::gpu(name, self.wall, self.kernels);
         stage.meta.insert("executions".into(), self.executions.to_string());
         stage.meta.insert("kernel_dispatches".into(), kernel_dispatches.to_string());
         stage.meta.insert("accumulated_wall_ms".into(), format!("{:.3}", self.wall.as_secs_f64() * 1e3));
-        stage.meta.insert("average_execution_wall_ms".into(), format!("{average_wall_ms:.3}"));
         stage.meta.insert(
             "timing_semantics".into(),
             "accumulated host wall per execution from profiled submission through explicit output synchronization"
@@ -47,21 +67,17 @@ impl GraphProfile {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct CopyStats {
-    pub(crate) ops: usize,
-    pub(crate) bytes: usize,
-    pub(crate) wall: Duration,
+struct CopyStats {
+    ops: usize,
+    bytes: usize,
+    wall: Duration,
 }
 
 impl CopyStats {
-    pub(crate) fn add(&mut self, ops: usize, bytes: usize, wall: Duration) {
+    fn add(&mut self, ops: usize, bytes: usize, wall: Duration) {
         self.ops = self.ops.saturating_add(ops);
         self.bytes = self.bytes.saturating_add(bytes);
         self.wall = self.wall.saturating_add(wall);
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.add(other.ops, other.bytes, other.wall);
     }
 }
 
@@ -77,103 +93,101 @@ impl CopyCategory {
         self.breakdown.entry(name).or_default().add(ops, bytes, wall);
     }
 
-    fn merge(&mut self, other: Self) {
-        self.total.merge(other.total);
-        for (name, stats) in other.breakdown {
-            self.breakdown.entry(name).or_default().merge(stats);
-        }
-    }
-
-    fn stage(&self, name: &str) -> Option<StageProfile> {
+    fn stage(&self, name: &str, semantics: &str) -> Option<StageProfile> {
         (self.total.bytes != 0).then(|| {
             let mut stage = StageProfile::host(name, self.total.wall);
             stage.meta.insert("ops".into(), self.total.ops.to_string());
             stage.meta.insert("bytes".into(), self.total.bytes.to_string());
-            let gbps = if self.total.wall.is_zero() {
-                0.0
-            } else {
-                self.total.bytes as f64 / self.total.wall.as_secs_f64() / 1e9
-            };
-            stage.meta.insert("effective_gbps".into(), format!("{gbps:.3}"));
-            let semantics = match name {
-                "copy_d2d" => {
-                    "device synchronized immediately before and after each transfer group; host wall, not hardware DMA timestamps"
-                }
-                "copy_h2d" => {
-                    "prior device work fenced before host-visible writes; synchronized host wall, not hardware DMA timestamps"
-                }
-                _ => {
-                    "producer work fenced before host-visible reads; synchronized host copy wall, not hardware DMA timestamps"
-                }
-            };
             stage.meta.insert("timing_semantics".into(), semantics.into());
             for (breakdown, stats) in &self.breakdown {
                 stage.meta.insert(format!("{breakdown}_ops"), stats.ops.to_string());
                 stage.meta.insert(format!("{breakdown}_bytes"), stats.bytes.to_string());
                 stage.meta.insert(format!("{breakdown}_wall_ms"), format!("{:.3}", stats.wall.as_secs_f64() * 1e3));
-                let gbps = if stats.wall.is_zero() {
-                    0.0
-                } else {
-                    stats.bytes as f64 / stats.wall.as_secs_f64() / 1e9
-                };
-                stage.meta.insert(format!("{breakdown}_effective_gbps"), format!("{gbps:.3}"));
             }
             stage
         })
     }
 }
 
+/// Synchronized host wall around groups of transfers, by direction. These are
+/// not DMA timestamps: a fence drains prior graph work before the clock starts
+/// so the producing graph is not charged to the copy, and a second fence
+/// after device-to-device groups waits for the whole asynchronous group.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CopyProfile {
+    enabled: bool,
     h2d: CopyCategory,
     d2d: CopyCategory,
     d2h: CopyCategory,
 }
 
 impl CopyProfile {
-    pub(crate) fn h2d(&mut self, name: &'static str, ops: usize, bytes: usize, wall: Duration) {
-        self.h2d.record(name, ops, bytes, wall);
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self { enabled, ..Self::default() }
     }
 
-    pub(crate) fn d2d(&mut self, name: &'static str, ops: usize, bytes: usize, wall: Duration) {
-        self.d2d.record(name, ops, bytes, wall);
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
     }
 
-    pub(crate) fn d2h(&mut self, name: &'static str, ops: usize, bytes: usize, wall: Duration) {
-        self.d2h.record(name, ops, bytes, wall);
+    fn begin<E: From<DeviceError>>(&self, fence: &Buffer) -> Result<Option<Instant>, E> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        fence.synchronize()?;
+        Ok(Some(Instant::now()))
     }
 
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.h2d.merge(other.h2d);
-        self.d2d.merge(other.d2d);
-        self.d2h.merge(other.d2h);
+    pub(crate) fn h2d<T, E: From<DeviceError>>(
+        &mut self,
+        name: &'static str,
+        ops: usize,
+        bytes: usize,
+        fence: &Buffer,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Some(started) = self.begin(fence)? else { return work() };
+        let value = work()?;
+        self.h2d.record(name, ops, bytes, started.elapsed());
+        Ok(value)
+    }
+
+    pub(crate) fn d2h<T, E: From<DeviceError>>(
+        &mut self,
+        name: &'static str,
+        ops: usize,
+        bytes: usize,
+        fence: &Buffer,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Some(started) = self.begin(fence)? else { return work() };
+        let value = work()?;
+        self.d2h.record(name, ops, bytes, started.elapsed());
+        Ok(value)
+    }
+
+    pub(crate) fn d2d<T, E: From<DeviceError>>(
+        &mut self,
+        name: &'static str,
+        ops: usize,
+        bytes: usize,
+        fence: &Buffer,
+        work: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let Some(started) = self.begin(fence)? else { return work() };
+        let value = work()?;
+        fence.synchronize()?;
+        self.d2d.record(name, ops, bytes, started.elapsed());
+        Ok(value)
     }
 
     pub(crate) fn stages(&self) -> impl Iterator<Item = StageProfile> + '_ {
-        [self.h2d.stage("copy_h2d"), self.d2d.stage("copy_d2d"), self.d2h.stage("copy_d2h")].into_iter().flatten()
+        [
+            self.h2d.stage("copy_h2d", "prior device work fenced before host-visible writes; synchronized host wall"),
+            self.d2d.stage("copy_d2d", "device synchronized before and after each transfer group; host wall"),
+            self.d2h.stage("copy_d2h", "producer work fenced before host-visible reads; synchronized host wall"),
+        ]
+        .into_iter()
+        .flatten()
     }
-}
-
-/// Fence before starting so prior graph work is excluded, then fence after the
-/// final transfer. This measures synchronized group wall, not SDMA timestamps.
-pub(crate) fn timed_d2d<T>(enabled: bool, fence: &Buffer, work: impl FnOnce() -> Result<T>) -> Result<(T, Duration)> {
-    if !enabled {
-        return work().map(|value| (value, Duration::ZERO));
-    }
-    fence.synchronize()?;
-    let started = Instant::now();
-    let value = work()?;
-    fence.synchronize()?;
-    Ok((value, started.elapsed()))
-}
-
-/// Drain prior device work before timing a host-visible read or write. Without
-/// this fence, the mapping's implicit synchronization is incorrectly charged
-/// to the copy instead of the graph that produced the buffer.
-pub(crate) fn begin_host_copy(enabled: bool, buffer: &Buffer) -> Result<Option<Instant>> {
-    if !enabled {
-        return Ok(None);
-    }
-    buffer.synchronize()?;
-    Ok(Some(Instant::now()))
 }

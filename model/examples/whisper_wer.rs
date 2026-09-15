@@ -73,7 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         task: WhisperTask::Transcribe,
         language: (args.language != "auto").then(|| args.language.clone()),
         strategy: DecodeStrategy::Beam { size: args.beam_size },
-        fallback: (!args.no_fallback).then(Default::default),
+        fallback_temperatures: if args.no_fallback {
+            Vec::new()
+        } else {
+            DecodeOptions::default().fallback_temperatures
+        },
         ..Default::default()
     };
     let window = CHUNK_LENGTH * SAMPLE_RATE;

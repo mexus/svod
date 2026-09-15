@@ -370,6 +370,29 @@ fn the_next_window_starts_where_the_last_decode_stopped() {
     assert_eq!(t.window_lens, vec![30, 30, 15]);
 }
 
+/// A decode that consumed `consumed` seconds of its window while its segments
+/// stop at `segment_end` — the two disagree on purpose.
+fn consumed(text: &str, consumed: f32, segment_end: f32) -> Transcript {
+    Transcript { consumed_sec: Some(consumed), ..reached(text, segment_end) }
+}
+
+#[test]
+fn a_reported_consumption_outranks_the_last_segments_end() {
+    let waveform = vec![0.0_f32; 60];
+    let chunks = vec![AudioChunk::new(0, 30), AudioChunk::new(30, 60)];
+    // Segments that stop at 5 s would advance by the floor (half a window);
+    // the reported consumption walks 20 then 25 instead.
+    let mut t = WalkTranscriber::new(
+        Some(WindowAdvance::default()),
+        vec![consumed("a", 20.0, 5.0), consumed("b", 25.0, 5.0), consumed("c", 30.0, 5.0)],
+    );
+    let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
+
+    assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 20.0, 45.0]);
+    assert_eq!(t.window_lens, vec![30, 30, 15]);
+    assert_eq!(out.text, "a b c");
+}
+
 #[test]
 fn a_window_that_covers_itself_advances_a_whole_stride() {
     let waveform = vec![0.0_f32; 60];

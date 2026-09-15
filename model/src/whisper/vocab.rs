@@ -48,22 +48,56 @@ fn exp_nonpos<S: Simd>(x: S::f32s) -> S::f32s {
 }
 
 #[inline(always)]
-fn logsumexp_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
+fn max_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
     let lanes = S::f32s::N;
     let mut acc = S::f32s::splat(simd, f32::NEG_INFINITY);
     let mut pass = arr.chunks_exact(lanes);
     for chunk in &mut pass {
         acc = acc.max(S::f32s::from_slice(simd, chunk));
     }
-    let max_val = acc.as_slice().iter().chain(pass.remainder()).fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    acc.as_slice().iter().chain(pass.remainder()).fold(f32::NEG_INFINITY, |a, &b| a.max(b))
+}
+
+/// `exp((x - max) * scale)` into `out`, returning the sum. `-inf` entries are
+/// floored as in `logsumexp_inner`, so a suppressed token keeps a weight of
+/// about `1.6e-38` instead of zero: unreachable by the sampler at f32 spacing.
+#[inline(always)]
+fn scaled_exp_inner<S: Simd>(simd: S, arr: &[f32], scale: f32, out: &mut [f32]) -> f32 {
+    let lanes = S::f32s::N;
+    let max_val = max_inner(simd, arr);
+    if max_val == f32::NEG_INFINITY {
+        out.fill(0.0);
+        return 0.0;
+    }
+    let (mv, floor, k) = (S::f32s::splat(simd, max_val), S::f32s::splat(simd, -87.0), S::f32s::splat(simd, scale));
+    let mut sum = S::f32s::splat(simd, 0.0);
+    let mut src = arr.chunks_exact(lanes);
+    let mut dst = out.chunks_exact_mut(lanes);
+    for (chunk, slot) in (&mut src).zip(&mut dst) {
+        let e = exp_nonpos::<S>(((S::f32s::from_slice(simd, chunk) - mv) * k).max(floor));
+        slot.copy_from_slice(e.as_slice());
+        sum += e;
+    }
+    let mut tail = 0.0;
+    for (&value, slot) in src.remainder().iter().zip(dst.into_remainder()) {
+        *slot = ((value - max_val) * scale).max(-87.0).exp();
+        tail += *slot;
+    }
+    sum.as_slice().iter().sum::<f32>() + tail
+}
+
+#[inline(always)]
+fn logsumexp_inner<S: Simd>(simd: S, arr: &[f32]) -> f32 {
+    let lanes = S::f32s::N;
+    let max_val = max_inner(simd, arr);
     if max_val == f32::NEG_INFINITY {
         return f32::NEG_INFINITY;
     }
 
     let mv = S::f32s::splat(simd, max_val);
-    // exp(-87) is the smallest normal f32, so clamping there keeps `-inf`
-    // (suppressed tokens) out of the polynomial's range while contributing less
-    // than 2^-126 each to a sum whose largest term is exp(0) = 1.
+    // exp(-87) is about 1.6e-38, next to the smallest normal f32, so clamping
+    // there keeps `-inf` (suppressed tokens) out of the polynomial's range while
+    // contributing nothing measurable to a sum whose largest term is exp(0) = 1.
     let floor = S::f32s::splat(simd, -87.0);
     let (mut s0, mut s1) = (S::f32s::splat(simd, 0.0), S::f32s::splat(simd, 0.0));
     let mut pass = arr.chunks_exact(lanes * 2);
@@ -124,6 +158,32 @@ pub(crate) fn logsumexp(arr: &[f32]) -> f32 {
         return logsumexp_scalar(arr);
     }
     dispatch!(Level::new(), simd => logsumexp_inner(simd, arr))
+}
+
+/// `exp((x - max(x)) / temperature)` for every entry, and their sum: the
+/// sampling distribution before normalization.
+pub(crate) fn scaled_exp(arr: &[f32], temperature: f32) -> (Vec<f32>, f32) {
+    let mut out = vec![0f32; arr.len()];
+    let scale = temperature.recip();
+    let sum = if arr.len() < SIMD_FLOOR {
+        scaled_exp_scalar(arr, scale, &mut out)
+    } else {
+        dispatch!(Level::new(), simd => scaled_exp_inner(simd, arr, scale, &mut out))
+    };
+    (out, sum)
+}
+
+/// The reference the vector path is checked against, and the short-input path.
+pub(crate) fn scaled_exp_scalar(arr: &[f32], scale: f32, out: &mut [f32]) -> f32 {
+    let max_val = arr.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    if max_val == f32::NEG_INFINITY {
+        out.fill(0.0);
+        return 0.0;
+    }
+    arr.iter().zip(out).fold(0.0, |sum, (&value, slot)| {
+        *slot = ((value - max_val) * scale).exp();
+        sum + *slot
+    })
 }
 
 /// The reference the vector path is checked against, and the short-input path.

@@ -125,107 +125,6 @@ pub fn median_filter(data: &[f32], n_rows: usize, n_cols: usize, filter_width: u
     out
 }
 
-/// Extract alignment matrix from cross-attention weights and run DTW.
-///
-/// `qk_weights[layer]` is `[B, H, S_text, S_audio]` softmaxed attention weights.
-/// `alignment_heads` is a list of `(layer, head)` pairs.
-/// `num_frames` is the actual number of audio frames to use (≤ S_audio).
-/// `medfilt_width` is the median filter width (default 7).
-///
-/// Returns `(text_indices, time_indices)` from DTW on the alignment matrix.
-#[allow(clippy::too_many_arguments)]
-pub fn find_alignment_path(
-    qk_weights: &[Vec<f32>], // per-layer, flattened [B*H*S_text*S_audio]
-    _batch: usize,
-    _n_heads: usize,
-    s_text: usize,
-    s_audio: usize,
-    alignment_heads: &[(usize, usize)],
-    num_frames: usize,
-    medfilt_width: usize,
-    sot_len: usize, // prefix tokens to strip from text axis (SOT sequence only, not no_timestamps)
-) -> (Vec<usize>, Vec<usize>) {
-    let n_heads_sel = alignment_heads.len();
-    let audio_frames = (num_frames / 2).min(s_audio);
-
-    // Collect weights for selected heads: [n_sel, s_text, audio_frames]
-    let mut weights = vec![0.0f32; n_heads_sel * s_text * audio_frames];
-    for (sel_i, &(layer, head)) in alignment_heads.iter().enumerate() {
-        let layer_data = &qk_weights[layer];
-        // layer_data is [B, H, S_text, S_audio]. We use batch=0.
-        for t in 0..s_text {
-            for f in 0..audio_frames {
-                let src = (head * s_text + t) * s_audio + f;
-                let dst = (sel_i * s_text + t) * audio_frames + f;
-                weights[dst] = layer_data[src];
-            }
-        }
-    }
-
-    // Softmax over time axis (last axis)
-    for sel_i in 0..n_heads_sel {
-        for t in 0..s_text {
-            let row = &mut weights[(sel_i * s_text + t) * audio_frames..(sel_i * s_text + t + 1) * audio_frames];
-            let max_val = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            if max_val == f32::NEG_INFINITY {
-                continue;
-            }
-            let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = (*v - max_val).exp();
-                sum += *v;
-            }
-            for v in row.iter_mut() {
-                *v /= sum.max(1e-10);
-            }
-        }
-    }
-
-    // Standardize over token axis (axis=1): (x - mean) / std
-    for sel_i in 0..n_heads_sel {
-        for f in 0..audio_frames {
-            // Collect column values
-            let col: Vec<f32> = (0..s_text).map(|t| weights[(sel_i * s_text + t) * audio_frames + f]).collect();
-            let mean = col.iter().sum::<f32>() / s_text as f32;
-            let variance = col.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / s_text as f32;
-            let std = variance.sqrt().max(1e-10);
-            for t in 0..s_text {
-                let idx = (sel_i * s_text + t) * audio_frames + f;
-                weights[idx] = (weights[idx] - mean) / std;
-            }
-        }
-    }
-
-    // Median filter over time axis
-    let filtered = median_filter(&weights, n_heads_sel * s_text, audio_frames, medfilt_width);
-
-    // Average over selected heads → [s_text, audio_frames]
-    let mut matrix = vec![0.0f32; s_text * audio_frames];
-    for t in 0..s_text {
-        for f in 0..audio_frames {
-            let mut sum = 0.0f32;
-            for sel_i in 0..n_heads_sel {
-                sum += filtered[(sel_i * s_text + t) * audio_frames + f];
-            }
-            matrix[t * audio_frames + f] = sum / n_heads_sel as f32;
-        }
-    }
-
-    // Strip SOT prefix and EOT suffix from text axis
-    let text_len = s_text - sot_len - 1; // -1 for EOT
-    let stripped: Vec<f32> = (0..text_len)
-        .flat_map(|t| {
-            let row_start = (t + sot_len) * audio_frames;
-            &matrix[row_start..row_start + audio_frames]
-        })
-        .copied()
-        .collect();
-
-    // DTW on negated matrix
-    let negated: Vec<f32> = stripped.iter().map(|&x| -x).collect();
-    dtw(&negated, text_len, audio_frames)
-}
-
 /// Extract an alignment path from statically packed selected-head raw QK
 /// scores. Compiled strides are separate from the valid unpadded extents.
 #[allow(clippy::too_many_arguments)]
@@ -412,6 +311,8 @@ pub fn clean_up_word_timings(words: &mut [WordTiming]) {
 fn merge_punctuations(words: &mut [WordTiming], prepended: &str, appended: &str) {
     let mut following = words.len().saturating_sub(1);
     for previous in (0..words.len().saturating_sub(1)).rev() {
+        // A whitespace-only fragment trims to the empty string, which every
+        // pattern contains: it rides along onto the next word, keeping its spacing.
         if words[previous].word.starts_with(' ') && prepended.contains(words[previous].word.trim()) {
             let prefix = std::mem::take(&mut words[previous].word);
             words[following].word.insert_str(0, &prefix);

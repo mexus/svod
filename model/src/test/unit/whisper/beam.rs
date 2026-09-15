@@ -1,12 +1,14 @@
 use std::collections::HashSet;
+use std::time::Duration;
+
+use svod_runtime::{RunProfile, StageProfile};
 
 use crate::whisper::decode::{
     BeamCandidate, BeamHypothesis, BeamSurvivor, DecodeScheduleStats, SlotAllocator, attempt_strategies,
-    beam_clone_copy_accounting, cache_append_copy_accounting, collect_ordered, derived_sampling_seed,
-    finalize_beam_hypotheses, plan_beam_rows, remaining_sample_steps, scheduler_seed_copy_accounting,
-    select_beam_candidates, strategy_width,
+    collect_ordered, derived_sampling_seed, finalize_beam_hypotheses, plan_beam_rows, select_beam_candidates,
+    strategy_width,
 };
-use crate::whisper::{DecodeOptions, DecodeStrategy, FallbackPolicy};
+use crate::whisper::{DecodeOptions, DecodeStrategy};
 
 fn parent(logical_id: usize, sum_logprob: f32) -> BeamHypothesis {
     BeamHypothesis { logical_id, tokens: vec![logical_id as u32], token_probs: vec![], sum_logprob }
@@ -112,13 +114,6 @@ fn row_assignment_invariants_hold_for_all_small_parent_sequences() {
 }
 
 #[test]
-fn generated_token_budget_counts_the_prefill_token() {
-    assert_eq!(remaining_sample_steps(0), 0);
-    assert_eq!(remaining_sample_steps(1), 0);
-    assert_eq!(remaining_sample_steps(5), 4);
-}
-
-#[test]
 fn admission_is_atomic_for_mixed_widths_and_refills_after_release() {
     let mut slots = SlotAllocator::new(5);
     let beam = slots.reserve(10, 3).unwrap().unwrap();
@@ -149,7 +144,7 @@ fn admission_rejects_width_over_capacity_without_ownership() {
 fn fallback_sequence_changes_beam_attempt_to_width_one_sampling() {
     let options = DecodeOptions {
         strategy: DecodeStrategy::Beam { size: 5 },
-        fallback: Some(FallbackPolicy { sampling_temperatures: vec![0.4, 0.8], ..FallbackPolicy::default() }),
+        fallback_temperatures: vec![0.4, 0.8],
         ..DecodeOptions::default()
     };
     let strategies = attempt_strategies(&options);
@@ -162,6 +157,10 @@ fn fallback_sequence_changes_beam_attempt_to_width_one_sampling() {
         ]
     );
     assert_eq!(strategies.into_iter().map(strategy_width).collect::<Vec<_>>(), [5, 1, 1]);
+
+    // An empty temperature list is how fallback is switched off.
+    let without = DecodeOptions { fallback_temperatures: Vec::new(), ..options };
+    assert_eq!(attempt_strategies(&without), [DecodeStrategy::Beam { size: 5 }]);
 }
 
 #[test]
@@ -200,49 +199,92 @@ fn scheduler_collection_preserves_input_order_after_out_of_order_completion() {
     assert_eq!(collect_ordered(completed).unwrap(), ["first", "second", "third"]);
 }
 
+/// The schedule counters no longer merge themselves: each window annotates its
+/// own stage and the run profile sums the numeric metadata. The accumulation
+/// across encoder batches must still be a plain per-counter sum.
 #[test]
-fn scheduler_stats_merge_across_encoder_batches() {
-    let mut total = DecodeScheduleStats {
-        dispatches: 2,
-        active_row_steps: 6,
-        reserved_row_steps: 8,
-        capacity_row_steps: 10,
-        cache_clone_ops: 1,
-        cache_clone_bytes: 128,
-        attempts: 2,
-        fallback_attempts: 0,
-        copies: Default::default(),
+fn scheduler_stats_accumulate_across_encoder_batches_through_the_run_profile() {
+    let annotated = |stats: DecodeScheduleStats, wall| {
+        let mut stage = StageProfile::host("decode", wall);
+        stats.annotate(&mut stage);
+        let mut profile = RunProfile::default();
+        profile.push(stage);
+        profile
     };
-    total.merge(DecodeScheduleStats {
-        dispatches: 1,
-        active_row_steps: 2,
-        reserved_row_steps: 3,
-        capacity_row_steps: 5,
-        cache_clone_ops: 2,
-        cache_clone_bytes: 256,
-        attempts: 2,
-        fallback_attempts: 1,
-        copies: Default::default(),
-    });
-    assert_eq!(
-        total,
+
+    let mut total = annotated(
         DecodeScheduleStats {
-            dispatches: 3,
-            active_row_steps: 8,
-            reserved_row_steps: 11,
-            capacity_row_steps: 15,
-            cache_clone_ops: 3,
-            cache_clone_bytes: 384,
-            attempts: 4,
-            fallback_attempts: 1,
-            copies: Default::default(),
-        }
+            dispatches: 2,
+            active_row_steps: 6,
+            reserved_row_steps: 8,
+            capacity_row_steps: 10,
+            cache_clone_ops: 1,
+            cache_clone_bytes: 128,
+            attempts: 2,
+            fallback_attempts: 0,
+        },
+        Duration::from_millis(4),
     );
+    total.merge(annotated(
+        DecodeScheduleStats {
+            dispatches: 1,
+            active_row_steps: 2,
+            reserved_row_steps: 3,
+            capacity_row_steps: 5,
+            cache_clone_ops: 2,
+            cache_clone_bytes: 256,
+            attempts: 2,
+            fallback_attempts: 1,
+        },
+        Duration::from_millis(1),
+    ));
+
+    let stage = total.stage("decode").unwrap();
+    assert_eq!(stage.wall, Duration::from_millis(5));
+    for (key, expected) in [
+        ("dispatches", "3"),
+        ("active_row_steps", "8"),
+        ("reserved_row_steps", "11"),
+        ("capacity_row_steps", "15"),
+        ("cache_clone_ops", "3"),
+        ("cache_clone_bytes", "384"),
+        ("attempts", "4"),
+        ("fallback_attempts", "1"),
+    ] {
+        assert_eq!(stage.meta[key], expected, "counter {key}");
+    }
 }
 
+/// A single window's counters are the values the scheduler held, rendered as
+/// the plain integers the merge above can sum.
 #[test]
-fn scheduler_copy_accounting_counts_physical_transfers() {
-    assert_eq!(scheduler_seed_copy_accounting(3, 120, 400), (12, 3120));
-    assert_eq!(cache_append_copy_accounting(3, 64), (6, 384));
-    assert_eq!(beam_clone_copy_accounting(2, 5, 64), (4, 1280));
+fn scheduler_stats_annotate_every_counter() {
+    let stats = DecodeScheduleStats {
+        dispatches: 7,
+        active_row_steps: 11,
+        reserved_row_steps: 13,
+        capacity_row_steps: 17,
+        cache_clone_ops: 19,
+        cache_clone_bytes: 23,
+        attempts: 29,
+        fallback_attempts: 31,
+    };
+    let mut stage = StageProfile::host("decode", Duration::ZERO);
+    stats.annotate(&mut stage);
+
+    let mut rendered: Vec<(&str, &str)> = stage.meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    rendered.sort_unstable();
+    assert_eq!(
+        rendered,
+        [
+            ("active_row_steps", "11"),
+            ("attempts", "29"),
+            ("cache_clone_bytes", "23"),
+            ("cache_clone_ops", "19"),
+            ("capacity_row_steps", "17"),
+            ("dispatches", "7"),
+            ("fallback_attempts", "31"),
+            ("reserved_row_steps", "13"),
+        ]
+    );
 }

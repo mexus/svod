@@ -45,164 +45,45 @@ impl ModelDimensions {
         self.n_vocab - 51765 - self.is_multilingual() as usize
     }
 
-    /// Known model size presets.  Dims match OpenAI's checkpoints.
+    /// The dtype both K/V caches are stored at. The projections produce the
+    /// activation dtype, so storing anything else either widens for nothing or
+    /// narrows silently; fp8 is the exception, since attention cannot read it.
+    pub fn cache_dtype(&self) -> DType {
+        let fp8 = [DType::FP8E4M3, DType::FP8E4M3FNUZ, DType::FP8E5M2, DType::FP8E5M2FNUZ];
+        if fp8.contains(&self.dtype) { DType::Float16 } else { self.dtype.clone() }
+    }
+
+    /// Known model size presets. Dims match OpenAI's checkpoints; the encoder
+    /// and decoder share width and head count in every one.
     pub fn for_size(size: WhisperSize) -> Self {
-        match size {
-            WhisperSize::TinyEn => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 384,
-                n_audio_head: 6,
-                n_audio_layer: 4,
-                n_vocab: 51864,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 384,
-                n_text_head: 6,
-                n_text_layer: 4,
-                dtype: DType::Float16,
-            },
-            WhisperSize::Tiny => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 384,
-                n_audio_head: 6,
-                n_audio_layer: 4,
-                n_vocab: 51865,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 384,
-                n_text_head: 6,
-                n_text_layer: 4,
-                dtype: DType::Float16,
-            },
-            WhisperSize::BaseEn => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 512,
-                n_audio_head: 8,
-                n_audio_layer: 6,
-                n_vocab: 51864,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 512,
-                n_text_head: 8,
-                n_text_layer: 6,
-                dtype: DType::Float16,
-            },
-            WhisperSize::Base => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 512,
-                n_audio_head: 8,
-                n_audio_layer: 6,
-                n_vocab: 51865,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 512,
-                n_text_head: 8,
-                n_text_layer: 6,
-                dtype: DType::Float16,
-            },
-            WhisperSize::SmallEn => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 768,
-                n_audio_head: 12,
-                n_audio_layer: 12,
-                n_vocab: 51864,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 768,
-                n_text_head: 12,
-                n_text_layer: 12,
-                dtype: DType::Float16,
-            },
-            WhisperSize::Small => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 768,
-                n_audio_head: 12,
-                n_audio_layer: 12,
-                n_vocab: 51865,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 768,
-                n_text_head: 12,
-                n_text_layer: 12,
-                dtype: DType::Float16,
-            },
-            WhisperSize::MediumEn => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 1024,
-                n_audio_head: 16,
-                n_audio_layer: 24,
-                n_vocab: 51864,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 1024,
-                n_text_head: 16,
-                n_text_layer: 24,
-                dtype: DType::Float16,
-            },
-            WhisperSize::Medium => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 1024,
-                n_audio_head: 16,
-                n_audio_layer: 24,
-                n_vocab: 51865,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 1024,
-                n_text_head: 16,
-                n_text_layer: 24,
-                dtype: DType::Float16,
-            },
-            WhisperSize::LargeV1 | WhisperSize::LargeV2 => Self {
-                n_mels: 80,
-                n_audio_ctx: 1500,
-                n_audio_state: 1280,
-                n_audio_head: 20,
-                n_audio_layer: 32,
-                n_vocab: 51865,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 1280,
-                n_text_head: 20,
-                n_text_layer: 32,
-                dtype: DType::Float16,
-            },
-            WhisperSize::LargeV3 => Self {
-                n_mels: 128,
-                n_audio_ctx: 1500,
-                n_audio_state: 1280,
-                n_audio_head: 20,
-                n_audio_layer: 32,
-                n_vocab: 51866,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 1280,
-                n_text_head: 20,
-                n_text_layer: 32,
-                dtype: DType::Float16,
-            },
-            WhisperSize::Turbo => Self {
-                n_mels: 128,
-                n_audio_ctx: 1500,
-                n_audio_state: 1280,
-                n_audio_head: 20,
-                n_audio_layer: 4,
-                n_vocab: 51866,
-                n_text_ctx: N_TEXT_CTX,
-                n_text_state: 1280,
-                n_text_head: 20,
-                n_text_layer: 8,
-                dtype: DType::Float16,
-            },
+        use WhisperSize::*;
+        let (n_mels, n_state, n_head, n_audio_layer, n_text_layer, n_vocab) = match size {
+            TinyEn => (80, 384, 6, 4, 4, 51864),
+            Tiny => (80, 384, 6, 4, 4, 51865),
+            BaseEn => (80, 512, 8, 6, 6, 51864),
+            Base => (80, 512, 8, 6, 6, 51865),
+            SmallEn => (80, 768, 12, 12, 12, 51864),
+            Small => (80, 768, 12, 12, 12, 51865),
+            MediumEn => (80, 1024, 16, 24, 24, 51864),
+            Medium => (80, 1024, 16, 24, 24, 51865),
+            LargeV1 | LargeV2 => (80, 1280, 20, 32, 32, 51865),
+            LargeV3 => (128, 1280, 20, 32, 32, 51866),
+            Turbo => (128, 1280, 20, 32, 4, 51866),
+        };
+        Self {
+            n_mels,
+            n_audio_ctx: N_AUDIO_CTX,
+            n_audio_state: n_state,
+            n_audio_head: n_head,
+            n_audio_layer,
+            n_vocab,
+            n_text_ctx: N_TEXT_CTX,
+            n_text_state: n_state,
+            n_text_head: n_head,
+            n_text_layer,
+            dtype: DType::Float16,
         }
     }
-}
-
-/// Element type of the cross-attention K/V caches.
-///
-/// The projection produces these in the model's activation dtype and they are
-/// only read back by attention, which accumulates in f32 regardless. Storing
-/// them wider buys nothing and costs twice the VRAM and twice the bandwidth of
-/// the kernel that streams them -- at large-v3 that is gigabytes.
-pub(crate) fn cross_cache_dtype() -> DType {
-    DType::Float16
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,48 +136,6 @@ impl WhisperSize {
             "large" => Some(Self::LargeV3),
             "turbo" => Some(Self::Turbo),
             _ => None,
-        }
-    }
-
-    /// OpenAI download URL for the `.pt` checkpoint.
-    pub fn url(&self) -> &'static str {
-        match self {
-            Self::TinyEn => {
-                "https://openaipublic.azureedge.net/main/whisper/models/d3dd57d32accea0b295c96e26691aa14d8822fac7d9d27d5dc00b4ca2826dd03/tiny.en.pt"
-            }
-            Self::Tiny => {
-                "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"
-            }
-            Self::BaseEn => {
-                "https://openaipublic.azureedge.net/main/whisper/models/25a8566e1d0c1e2231d1c762132cd20e0f96a85d16145c3a00adf5d1ac670ead/base.en.pt"
-            }
-            Self::Base => {
-                "https://openaipublic.azureedge.net/main/whisper/models/ed3a0b6b1c0edf879ad9b11b1af5a0e6ab5db9205f891f668f8b0e6c6326e34e/base.pt"
-            }
-            Self::SmallEn => {
-                "https://openaipublic.azureedge.net/main/whisper/models/f953ad0fd29cacd07d5a9eda5624af0f6bcf2258be67c92b79389873d91e0872/small.en.pt"
-            }
-            Self::Small => {
-                "https://openaipublic.azureedge.net/main/whisper/models/9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt"
-            }
-            Self::MediumEn => {
-                "https://openaipublic.azureedge.net/main/whisper/models/d7440d1dc186f76616474e0ff0b3b6b879abc9d1a4926b7adfa41db2d497ab4f/medium.en.pt"
-            }
-            Self::Medium => {
-                "https://openaipublic.azureedge.net/main/whisper/models/345ae4da62f9b3d59415adc60127b97c714f32e89e936602e85993674d08dcb1/medium.pt"
-            }
-            Self::LargeV1 => {
-                "https://openaipublic.azureedge.net/main/whisper/models/e4b87e7e0bf463eb8e6956e646f1e277e901512310def2c24bf0e11bd3c28e9a/large-v1.pt"
-            }
-            Self::LargeV2 => {
-                "https://openaipublic.azureedge.net/main/whisper/models/81f7c96c852ee8fc832187b0132e569d6c3065a3252ed18e56effd0b6a73e524/large-v2.pt"
-            }
-            Self::LargeV3 => {
-                "https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt"
-            }
-            Self::Turbo => {
-                "https://openaipublic.azureedge.net/main/whisper/models/aff26ae408abcba5fbf8813c21e62b0941638c5f6eebfb145be0c9839262a19a/large-v3-turbo.pt"
-            }
         }
     }
 

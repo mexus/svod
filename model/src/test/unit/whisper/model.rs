@@ -1,21 +1,37 @@
 //! Forward shape + state-dict round-trip tests for Whisper model.
 
-use crate::whisper::config::cross_cache_dtype;
 use std::collections::BTreeSet;
+use std::mem::size_of;
 
 use svod_dtype::DType;
 use svod_ir::{AxisType, ConstValue, Op};
+use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::jit::InputSpec;
 use crate::whisper::blocks::linear_forward;
 use crate::whisper::{
-    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, ModelDimensions, Whisper, WhisperAlignmentJit,
-    WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
+    DecodeOptions, DecodeResult, DecodeStrategy, ModelDimensions, Whisper, WhisperAlignmentJit, WhisperAlignmentModel,
+    WhisperDecoderStepJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
 use svod_ir::ops;
 use svod_tensor::nn::{Layer, Module};
+
+// The cross projection has no wrapper of its own any more -- prefill owns it --
+// but the shape of the graph it emits is still worth pinning, so the tests
+// compile one.
+jit_wrapper! {
+    CrossKvProbeJit(Whisper) {
+        audio_features: Tensor,
+
+        outputs { cross_k, cross_v }
+
+        build(audio_features) {
+            model.project_cross_kv(audio_features)
+        }
+    }
+}
 
 fn make_dims() -> ModelDimensions {
     ModelDimensions::for_size(WhisperSize::Tiny)
@@ -36,6 +52,8 @@ fn encoder_forward_shape() {
     // conv stride 2: 3000/2 = 1500
     assert_eq!(shape[1].as_const(), Some(1500));
     assert_eq!(shape[2].as_const(), Some(dims.n_audio_state));
+    // Encoder features leave in the activation dtype; prefill consumes them there.
+    assert_eq!(out.dtype(), dims.dtype);
 }
 
 #[test]
@@ -74,6 +92,21 @@ fn small_decoder_dims() -> ModelDimensions {
     }
 }
 
+/// Both K/V caches follow the activation dtype, because the projections that
+/// fill them already produce it. FP8 is the one exception: attention cannot
+/// read it, so the cache widens to f16.
+#[test_case(DType::Float32, DType::Float32; "f32 passes through")]
+#[test_case(DType::Float16, DType::Float16; "f16 passes through")]
+#[test_case(DType::BFloat16, DType::BFloat16; "bf16 passes through")]
+#[test_case(DType::FP8E4M3, DType::Float16; "fp8 e4m3 widens")]
+#[test_case(DType::FP8E4M3FNUZ, DType::Float16; "fp8 e4m3fnuz widens")]
+#[test_case(DType::FP8E5M2, DType::Float16; "fp8 e5m2 widens")]
+#[test_case(DType::FP8E5M2FNUZ, DType::Float16; "fp8 e5m2fnuz widens")]
+fn cache_dtype_follows_the_activation_dtype_except_fp8(activation: DType, expected: DType) {
+    let dims = ModelDimensions { dtype: activation, ..small_decoder_dims() };
+    assert_eq!(dims.cache_dtype(), expected);
+}
+
 fn reference_cross_kv_projection(model: &Whisper, audio: &Tensor) -> (Tensor, Tensor) {
     let mut keys = Vec::with_capacity(model.decoder.blocks.len());
     let mut values = Vec::with_capacity(model.decoder.blocks.len());
@@ -95,8 +128,8 @@ fn as_f32(t: &Tensor) -> Vec<f32> {
     t.cast(DType::Float32).to_vec::<f32>().unwrap()
 }
 
-fn stored_as_f32(t: &Tensor) -> Vec<f32> {
-    as_f32(&t.cast(cross_cache_dtype()))
+fn stored_as_f32(t: &Tensor, cache_dtype: DType) -> Vec<f32> {
+    as_f32(&t.cast(cache_dtype))
 }
 
 #[test]
@@ -115,12 +148,12 @@ fn materialized_cross_kv_matches_reference_projection() {
 
     let expected_shape = [2, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     for (expected, actual) in [(&expected_k, &actual_k), (&expected_v, &actual_v)] {
-        assert_eq!(actual.dtype(), cross_cache_dtype());
+        assert_eq!(actual.dtype(), dims.cache_dtype());
         assert_eq!(actual.dims().unwrap(), expected_shape);
-        // The cache stores narrower than the reference computes, so round the
+        // The cache may store narrower than the reference computes, so round the
         // reference through it: this keeps the check on the projection rather
         // than on the storage's own quantization.
-        let expected = stored_as_f32(expected);
+        let expected = stored_as_f32(expected, dims.cache_dtype());
         let actual = as_f32(actual);
         let max_delta = expected.iter().zip(&actual).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         // One ULP of the storage dtype at these magnitudes. Rounding is a step
@@ -149,8 +182,9 @@ fn low_precision_cross_projection_runs_in_the_activation_dtype() {
     for ((expected, legacy), actual) in
         [(&expected_k, &legacy_k), (&expected_v, &legacy_v)].into_iter().zip([&actual_k, &actual_v])
     {
-        assert_eq!(actual.dtype(), cross_cache_dtype());
-        let (expected, legacy) = (stored_as_f32(expected), stored_as_f32(legacy));
+        assert_eq!(actual.dtype(), dims.cache_dtype());
+        let (expected, legacy) =
+            (stored_as_f32(expected, dims.cache_dtype()), stored_as_f32(legacy, dims.cache_dtype()));
         let actual = as_f32(actual);
         assert_eq!(actual, expected, "projection must run in the model activation dtype before cache storage");
         assert_ne!(legacy, expected, "fixture must detect projection inherited from the f32 encoder output");
@@ -200,6 +234,10 @@ fn quantized_weight_scale_scales_output_channels() {
     assert_eq!(loaded.to_vec::<f32>().unwrap(), expected);
 }
 
+/// Prefill owns the cross projection now, so the cache dtype is a property of
+/// what it hands back rather than of what it is handed. Storage must be the
+/// declared cache dtype, must not re-round what `project_cross_kv` produced,
+/// and must not narrow the compute that reads it back in the same pass.
 #[test]
 fn low_precision_prefill_does_not_inherit_cache_storage_dtype() {
     let source_dims = small_decoder_dims();
@@ -213,17 +251,24 @@ fn low_precision_prefill_does_not_inherit_cache_storage_dtype() {
     .try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state])
     .unwrap();
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    assert_eq!(cross_k.dtype(), cross_cache_dtype());
 
-    // Storage width must not reach the compute dtype, so a cache widened to f32
-    // has to give exactly what the natively-stored one gives. Narrowing instead
-    // would be a no-op now that the cache is already the narrow type.
-    let (actual, _, _) =
-        model.decode_prefill(&tokens, &cross_k.cast(DType::Float32), &cross_v.cast(DType::Float32), 0).unwrap();
-    let (expected, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
-    Tensor::realize_batch([&actual, &expected]).unwrap();
-    assert_eq!(actual.as_vec::<f32>().unwrap(), expected.as_vec::<f32>().unwrap());
+    let (projected_k, projected_v) = model.project_cross_kv(&audio).unwrap();
+    let (logits, self_k, self_v, cross_k, cross_v) = model.decode_prefill(&tokens, &audio, 0).unwrap();
+    // The un-stored path: the decoder never round-trips anything through the cache.
+    let direct = model.decode(&tokens, &audio, 0).unwrap();
+    Tensor::realize_batch([&projected_k, &projected_v, &logits, &self_k, &self_v, &cross_k, &cross_v, &direct])
+        .unwrap();
+
+    for cache in [&self_k, &self_v, &cross_k, &cross_v] {
+        assert_eq!(cache.dtype(), dims.cache_dtype());
+    }
+    for (prefilled, projected) in [(&cross_k, &projected_k), (&cross_v, &projected_v)] {
+        assert_eq!(as_f32(prefilled), as_f32(projected), "prefill must hand back the projection it stored");
+    }
+
+    let (direct, prefilled) = (direct.as_vec::<f32>().unwrap(), logits.as_vec::<f32>().unwrap());
+    let max_delta = direct.iter().zip(&prefilled).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_delta < 2e-2, "cache storage changed low-precision prefill compute by {max_delta}");
 }
 
 #[test]
@@ -232,7 +277,7 @@ fn prepared_cross_kv_materializes_each_projection_before_packing() {
     dims.n_text_layer = 3;
     let seed = Whisper::empty(dims.clone());
     let model = Whisper::from_state_dict(&seed.state_dict(""), dims.clone()).unwrap();
-    let mut jit = WhisperCrossKvJit::new(model);
+    let mut jit = CrossKvProbeJit::new(model);
     jit.prepare(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state])).unwrap();
 
     let kernels = jit.prepared_kernels().unwrap();
@@ -269,17 +314,20 @@ fn projected_cross_kv_and_prefill_shapes_are_concrete() {
     let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32);
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
 
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let expected_cross = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    for cache in [&cross_k, &cross_v] {
+    let (projected_k, projected_v) = model.project_cross_kv(&audio).unwrap();
+    for cache in [&projected_k, &projected_v] {
         assert_eq!(cache.dims().unwrap(), expected_cross);
     }
 
-    let (logits, self_k, self_v) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    let (logits, self_k, self_v, cross_k, cross_v) = model.decode_prefill(&tokens, &audio, 0).unwrap();
     assert_eq!(logits.dims().unwrap(), [1, 3, dims.n_vocab]);
     let expected_self = [1, 3, dims.n_text_layer * dims.n_text_head, 4];
     for cache in [&self_k, &self_v] {
         assert_eq!(cache.dims().unwrap(), expected_self);
+    }
+    for cache in [&cross_k, &cross_v] {
+        assert_eq!(cache.dims().unwrap(), expected_cross);
     }
 }
 
@@ -292,8 +340,7 @@ fn prepared_cross_kv_prefill_matches_direct_decoder() {
     let tokens = Tensor::from_slice([1i32, 2, 3]).try_reshape([1usize, 3]).unwrap();
 
     let direct = model.decode(&tokens, &audio, 0).unwrap();
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    let (prepared, _, _) = model.decode_prefill(&tokens, &cross_k, &cross_v, 0).unwrap();
+    let prepared = model.decode_prefill(&tokens, &audio, 0).unwrap().0;
     Tensor::realize_batch([&direct, &prepared]).unwrap();
     let direct = direct.as_vec::<f32>().unwrap();
     let prepared = prepared.as_vec::<f32>().unwrap();
@@ -311,41 +358,38 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     let audio_values: Vec<f32> =
         (0..dims.n_audio_ctx * dims.n_text_state).map(|index| (index as f32 - 17.0) * 0.021).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let mut prefix = vec![1i32, 7, 3];
     let prefix_tensor = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
-    let (_, prefill_k, prefill_v) = model.decode_prefill(&prefix_tensor, &cross_k, &cross_v, 0).unwrap();
-    Tensor::realize_batch([&prefill_k, &prefill_v]).unwrap();
+    let (_, prefill_k, prefill_v, cross_k, cross_v) = model.decode_prefill(&prefix_tensor, &audio, 0).unwrap();
+    Tensor::realize_batch([&prefill_k, &prefill_v, &cross_k, &cross_v]).unwrap();
+
+    // The host-side cache mirror is f32, which is the cache dtype of these dims.
+    assert_eq!(dims.cache_dtype(), DType::Float32);
+    assert_eq!(cross_k.dtype(), dims.cache_dtype());
+    assert_eq!(prefill_k.dtype(), dims.cache_dtype());
 
     let mut cache_k = vec![0.0f32; cache_elements];
     let mut cache_v = vec![0.0f32; cache_elements];
     let prefill_elements = prefix.len() * layer_heads * d_head;
     cache_k[..prefill_elements].copy_from_slice(&prefill_k.as_vec::<f32>().unwrap());
     cache_v[..prefill_elements].copy_from_slice(&prefill_v.as_vec::<f32>().unwrap());
-    assert_eq!(cache_k.len() * std::mem::size_of::<f32>(), dims.n_text_ctx * layer_heads * d_head * 4);
-    assert_eq!(cross_k.dtype(), cross_cache_dtype());
-    assert_eq!(prefill_k.dtype(), DType::Float32);
+    assert_eq!(cache_k.len() * size_of::<f32>(), dims.n_text_ctx * layer_heads * d_head * 4);
 
     for next_token in [5i32, 11] {
         let pos = prefix.len();
         let token = Tensor::from_slice([next_token]).try_reshape([1usize, 1]).unwrap();
-        let pos_emb = model
-            .decoder
-            .positional_embedding
-            .try_shrink([Some((pos as isize, pos as isize + 1)), None])
-            .unwrap()
-            .try_unsqueeze(0)
-            .unwrap();
         let self_k = Tensor::from_slice(&cache_k).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
         let self_v = Tensor::from_slice(&cache_v).try_reshape([1usize, dims.n_text_ctx, layer_heads, d_head]).unwrap();
+        // Each row's cached-key count is also its position, so the graph gathers
+        // the positional embedding from it -- no host-side `pos_emb` input.
         let key_lens = Tensor::from_slice([pos as i32]);
         let cross_map = Tensor::from_slice([0i32]);
 
         let (step_logits, new_k, new_v) =
-            model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map).unwrap();
+            model.decode_step(&token, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map).unwrap();
         prefix.push(next_token);
         let full_tokens = Tensor::from_slice(&prefix).try_reshape([1usize, prefix.len()]).unwrap();
-        let teacher = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
+        let teacher = model.decode_prefill(&full_tokens, &audio, 0).unwrap().0;
         Tensor::realize_batch([&step_logits, &new_k, &new_v, &teacher]).unwrap();
 
         let step = step_logits.as_vec::<f32>().unwrap();
@@ -361,20 +405,22 @@ fn cached_steps_match_teacher_forced_full_prefix() {
     }
 }
 
+/// `detect_language` reads logits row 0 of the prefill graph, which is
+/// conditioned on SOT alone. A one-token prompt and a full-length one must
+/// therefore agree on that row, down to the ranking of the language tokens.
 #[test]
 fn one_token_language_logits_match_full_context_sot_logits() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
     let audio_values: Vec<f32> = (0..dims.n_audio_ctx * dims.n_text_state).map(|i| i as f32 * 0.013).collect();
     let audio = Tensor::from_slice(audio_values).try_reshape([1usize, dims.n_audio_ctx, dims.n_text_state]).unwrap();
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
     let mut padded_tokens = vec![0i32; dims.n_text_ctx];
     padded_tokens[0] = 1;
     let full_tokens = Tensor::from_slice(padded_tokens).try_reshape([1usize, dims.n_text_ctx]).unwrap();
     let one_token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
 
-    let full = model.decode_with_cross_kv(&full_tokens, &cross_k, &cross_v).unwrap();
-    let one = model.decode_with_cross_kv(&one_token, &cross_k, &cross_v).unwrap();
+    let full = model.decode_prefill(&full_tokens, &audio, 0).unwrap().0;
+    let one = model.decode_prefill(&one_token, &audio, 0).unwrap().0;
     Tensor::realize_batch([&full, &one]).unwrap();
     let full = full.as_vec::<f32>().unwrap();
     let one = one.as_vec::<f32>().unwrap();
@@ -391,28 +437,37 @@ fn one_token_language_logits_match_full_context_sot_logits() {
 }
 
 #[test]
-fn prepared_language_detector_has_one_token_and_one_logits_row() {
+fn prepared_language_detector_reads_the_sot_row_of_the_prefill_graph() {
     const WHISPER_TEXT_CONTEXT: i64 = 448;
 
     let dims = small_decoder_dims();
-    let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
     let model = Whisper::empty(dims.clone());
     let audio = Tensor::zeros(&[1, dims.n_audio_ctx, dims.n_text_state], DType::Float32);
-    let (cross_k, cross_v) = model.project_cross_kv(&audio).unwrap();
-    let token = Tensor::from_slice([1i32]).try_reshape([1usize, 1]).unwrap();
-    let logits = model.decode_with_cross_kv(&token, &cross_k, &cross_v).unwrap();
-    assert_eq!(logits.dims().unwrap(), [1, 1, dims.n_vocab]);
+    // `detect_language` fills the whole prompt with SOT; only row 0 is read, and
+    // it must not depend on what follows.
+    let prompt_len = 3usize;
+    let sot_prompt = model
+        .decode_prefill(&Tensor::from_slice([1i32; 3]).try_reshape([1usize, prompt_len]).unwrap(), &audio, 0)
+        .unwrap()
+        .0;
+    let mixed_prompt = model
+        .decode_prefill(&Tensor::from_slice([1i32, 4, 9]).try_reshape([1usize, prompt_len]).unwrap(), &audio, 0)
+        .unwrap()
+        .0;
+    Tensor::realize_batch([&sot_prompt, &mixed_prompt]).unwrap();
+    assert_eq!(sot_prompt.dims().unwrap(), [1, prompt_len, dims.n_vocab]);
+    let (sot_prompt, mixed_prompt) = (sot_prompt.as_vec::<f32>().unwrap(), mixed_prompt.as_vec::<f32>().unwrap());
+    assert_eq!(sot_prompt[..dims.n_vocab], mixed_prompt[..dims.n_vocab], "row 0 must depend on SOT alone");
 
-    let mut detector = WhisperDecoderJit::new(model);
+    let mut detector = WhisperPrefillJit::new(model);
     detector
         .prepare(
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::i32(&[1, 1]),
+            InputSpec::i32(&[1, prompt_len]),
+            InputSpec::new(&[1, dims.n_audio_ctx, dims.n_text_state], dims.dtype.clone()).device_local(),
         )
         .unwrap();
-    assert_eq!(detector.tokens_mut().unwrap().size(), std::mem::size_of::<i32>());
-    assert_eq!(detector.output().unwrap().size(), dims.n_vocab * std::mem::size_of::<f32>());
+    assert_eq!(detector.tokens_mut().unwrap().size(), prompt_len * size_of::<i32>());
+    assert_eq!(detector.logits().unwrap().size(), prompt_len * dims.n_vocab * size_of::<f32>());
     assert!(detector.prepared_kernels().unwrap().iter().all(|kernel| {
         kernel.ast.toposort().into_iter().all(|uop| {
             !matches!(uop.op(), Op::Const(value) if matches!(value.0, ConstValue::Int(WHISPER_TEXT_CONTEXT) | ConstValue::UInt(448)))
@@ -420,50 +475,58 @@ fn prepared_language_detector_has_one_token_and_one_logits_row() {
     }));
 }
 
+/// Element count of one packed cache of `positions` rows.
+fn cache_shape(dims: &ModelDimensions, rows: usize, positions: usize) -> [usize; 4] {
+    [rows, positions, dims.n_text_layer * dims.n_text_head, dims.n_text_state / dims.n_text_head]
+}
+
 #[test]
-#[ignore = "heavy: prepares the cross projection and prefill graphs through the CPU backend"]
-fn prepared_cross_kv_graph_reuses_device_local_outputs() {
+#[ignore = "heavy: prepares and runs the prefill and decoder-step graphs through the CPU backend"]
+fn prefill_cross_kv_seeds_the_decoder_step_device_locally() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
-    let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let config = svod_tensor::PrepareConfig::device_local();
+    let cache_bytes = |shape: [usize; 4]| shape.iter().product::<usize>() * dims.cache_dtype().bytes();
+    let cache = |shape: [usize; 4]| InputSpec::new(&shape, dims.cache_dtype()).device_local();
 
-    let mut cross = WhisperCrossKvJit::new(model.clone());
-    cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
-    cross.execute().unwrap();
-
-    let mut prefill = WhisperPrefillJit::new(model);
+    let mut prefill = WhisperPrefillJit::new(model.clone());
     prefill
         .prepare(
             InputSpec::i32(&[1, 3]),
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::new(&[1, dims.n_audio_ctx, dims.n_text_state], dims.dtype.clone()).device_local(),
         )
         .unwrap();
-    let cross_k = cross.cross_k().unwrap();
-    prefill.prepared_cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
-    let cross_v = cross.cross_v().unwrap();
-    prefill.prepared_cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
     prefill.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[1i32, 2, 3])).unwrap();
     prefill.execute().unwrap();
 
-    assert_eq!(prefill.logits().unwrap().size(), 3 * dims.n_vocab * std::mem::size_of::<f32>());
-    assert_eq!(prefill.prepared_cross_k_mut().unwrap().size(), cross_k.size());
-    assert_eq!(prefill.prepared_cross_v_mut().unwrap().size(), cross_v.size());
+    assert_eq!(prefill.logits().unwrap().size(), 3 * dims.n_vocab * size_of::<f32>());
+    for (buffer, shape) in [
+        (prefill.self_k().unwrap(), cache_shape(&dims, 1, 3)),
+        (prefill.self_v().unwrap(), cache_shape(&dims, 1, 3)),
+        (prefill.cross_k().unwrap(), cache_shape(&dims, 1, dims.n_audio_ctx)),
+        (prefill.cross_v().unwrap(), cache_shape(&dims, 1, dims.n_audio_ctx)),
+    ] {
+        assert_eq!(buffer.size(), cache_bytes(shape));
+    }
 
-    let mut detector = WhisperDecoderJit::new(Whisper::empty(dims.clone()));
-    detector
-        .prepare(
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::i32(&[1, 1]),
-        )
-        .unwrap();
-    detector.prepared_cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
-    detector.prepared_cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
-    detector.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[0i32])).unwrap();
-    detector.execute().unwrap();
-    assert_eq!(detector.output().unwrap().size(), dims.n_vocab * std::mem::size_of::<f32>());
+    // The cross caches prefill produced feed the step graph without a host round trip.
+    let mut step = WhisperDecoderStepJit::new(model);
+    step.prepare(
+        InputSpec::i32(&[1, 1]),
+        cache(cache_shape(&dims, 1, dims.n_text_ctx)),
+        cache(cache_shape(&dims, 1, dims.n_text_ctx)),
+        cache(cache_shape(&dims, 1, dims.n_audio_ctx)),
+        cache(cache_shape(&dims, 1, dims.n_audio_ctx)),
+        InputSpec::i32(&[1]),
+        InputSpec::i32(&[1]),
+    )
+    .unwrap();
+    let cross_k = prefill.cross_k().unwrap();
+    step.cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
+    let cross_v = prefill.cross_v().unwrap();
+    step.cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
+    step.token_mut().unwrap().copyin(bytemuck::cast_slice(&[5i32])).unwrap();
+    step.execute().unwrap();
+    assert_eq!(step.logits().unwrap().size(), dims.n_vocab * size_of::<f32>());
 }
 
 #[test]
@@ -498,7 +561,7 @@ fn alignment_compute_does_not_inherit_cache_storage_dtype() {
     let tokens = Tensor::from_slice([1i32, 2, 3, 4]).try_reshape([1usize, 4]).unwrap();
     let heads = [(0, 0), (1, 1)];
     let (cross_k, cross_v) = model.project_cross_kv(&features).unwrap();
-    assert_eq!(cross_k.dtype(), cross_cache_dtype());
+    assert_eq!(cross_k.dtype(), dims.cache_dtype());
 
     // Storage width must not reach the compute dtype, so a cache widened to f32
     // has to give exactly what the natively-stored one gives. Narrowing instead
@@ -576,48 +639,36 @@ fn cached_cross_alignment_matches_audio_feature_reference() {
 }
 
 #[test]
-#[ignore = "heavy: prepares cross projection, prefill, and alignment graphs through the CPU backend"]
+#[ignore = "heavy: prepares the prefill and alignment graphs through the CPU backend"]
 fn recognition_cross_kv_seeds_prefill_and_alignment_device_locally() {
     let dims = small_decoder_dims();
     let model = Whisper::empty(dims.clone());
-    let cache_shape = [1, dims.n_audio_ctx, dims.n_text_layer * dims.n_text_head, 4];
-    let config = svod_tensor::PrepareConfig::device_local();
-
-    let mut cross = WhisperCrossKvJit::new(model.clone());
-    cross.prepare_with_config(InputSpec::f32(&[1, dims.n_audio_ctx, dims.n_text_state]), &config).unwrap();
-    cross.execute().unwrap();
+    let cross_spec = || InputSpec::new(&cache_shape(&dims, 1, dims.n_audio_ctx), dims.cache_dtype()).device_local();
 
     let mut prefill = WhisperPrefillJit::new(model.clone());
     prefill
         .prepare(
             InputSpec::i32(&[1, 3]),
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::f32(&cache_shape).device_local(),
+            InputSpec::new(&[1, dims.n_audio_ctx, dims.n_text_state], dims.dtype.clone()).device_local(),
         )
         .unwrap();
     let alignment_model = WhisperAlignmentModel::new(model, vec![(0, 0), (1, 1)]);
     let mut alignment = WhisperAlignmentJit::new(alignment_model);
-    alignment
-        .prepare(
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::f32(&cache_shape).device_local(),
-            InputSpec::i32(&[1, 3]),
-        )
-        .unwrap();
+    alignment.prepare(cross_spec(), cross_spec(), InputSpec::i32(&[1, 3])).unwrap();
 
-    let cross_k = cross.cross_k().unwrap();
-    let cross_v = cross.cross_v().unwrap();
-    prefill.prepared_cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
-    prefill.prepared_cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
-    alignment.cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
-    alignment.cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
     prefill.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[1i32, 2, 3])).unwrap();
-    alignment.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[1i32, 2, 3])).unwrap();
     prefill.execute().unwrap();
+
+    // Seed the aligner from prefill's own device-local cross caches.
+    let cross_k = prefill.cross_k().unwrap();
+    alignment.cross_k_mut().unwrap().copy_region_from(0, cross_k, 0, cross_k.size()).unwrap();
+    let cross_v = prefill.cross_v().unwrap();
+    alignment.cross_v_mut().unwrap().copy_region_from(0, cross_v, 0, cross_v.size()).unwrap();
+    alignment.tokens_mut().unwrap().copyin(bytemuck::cast_slice(&[1i32, 2, 3])).unwrap();
     alignment.execute().unwrap();
 
-    assert_eq!(prefill.logits().unwrap().size(), 3 * dims.n_vocab * std::mem::size_of::<f32>());
-    assert_eq!(alignment.output().unwrap().size(), 2 * 3 * dims.n_audio_ctx * std::mem::size_of::<f32>());
+    assert_eq!(prefill.logits().unwrap().size(), 3 * dims.n_vocab * size_of::<f32>());
+    assert_eq!(alignment.output().unwrap().size(), 2 * 3 * dims.n_audio_ctx * size_of::<f32>());
 }
 
 #[test]
@@ -730,9 +781,10 @@ fn dims_table() {
     assert_eq!(large_v3.n_mels, 128);
     assert_eq!(large_v3.n_vocab, 51866);
 
+    // Turbo is large-v3's encoder with a four-layer decoder distilled onto it.
     let turbo = ModelDimensions::for_size(WhisperSize::Turbo);
-    assert_eq!(turbo.n_audio_layer, 4);
-    assert_eq!(turbo.n_text_layer, 8);
+    assert_eq!(turbo.n_audio_layer, 32);
+    assert_eq!(turbo.n_text_layer, 4);
     assert_eq!(turbo.n_audio_state, 1280);
 }
 
@@ -766,7 +818,9 @@ fn prepared_plan_has_concrete_nonzero_capacities() {
 fn default_decode_policy_is_explicit_openai_fallback() {
     let options = DecodeOptions::default();
     assert_eq!(options.strategy, DecodeStrategy::Beam { size: 5 });
-    assert_eq!(options.fallback.unwrap().sampling_temperatures, [0.2, 0.4, 0.6, 0.8, 1.0]);
+    assert_eq!(options.fallback_temperatures, [0.2, 0.4, 0.6, 0.8, 1.0]);
+    assert_eq!(options.compression_ratio_threshold, Some(2.4));
+    assert_eq!(options.logprob_threshold, Some(-1.0));
 }
 
 #[test]
@@ -777,14 +831,21 @@ fn decode_policy_rejects_invalid_geometry_and_temperatures() {
     let invalid_sample = DecodeOptions { strategy: DecodeStrategy::Sample { temperature: 0.0 }, ..Default::default() };
     assert!(invalid_sample.validate().is_err());
 
-    let invalid_fallback = DecodeOptions {
-        fallback: Some(FallbackPolicy { sampling_temperatures: vec![f32::NAN], ..FallbackPolicy::default() }),
-        ..Default::default()
-    };
+    let invalid_fallback = DecodeOptions { fallback_temperatures: vec![f32::NAN], ..Default::default() };
     assert!(invalid_fallback.validate().is_err());
+
+    let invalid_compression = DecodeOptions { compression_ratio_threshold: Some(0.0), ..Default::default() };
+    assert!(invalid_compression.validate().is_err());
+
+    let invalid_logprob = DecodeOptions { logprob_threshold: Some(f32::NEG_INFINITY), ..Default::default() };
+    assert!(invalid_logprob.validate().is_err());
 
     let invalid_silence = DecodeOptions { no_speech_threshold: Some(1.1), ..Default::default() };
     assert!(invalid_silence.validate().is_err());
+
+    // An empty temperature list disables fallback; it is not a geometry error.
+    let no_fallback = DecodeOptions { fallback_temperatures: Vec::new(), ..Default::default() };
+    no_fallback.validate().unwrap();
 }
 
 #[test]
@@ -812,7 +873,6 @@ fn no_speech_skip_respects_logprob_override() {
 #[test]
 fn confident_silence_cancels_quality_fallback() {
     let options = DecodeOptions::default();
-    let fallback = options.fallback.as_ref().unwrap();
     let result = DecodeResult {
         tokens: Vec::new(),
         token_probs: Vec::new(),
@@ -823,5 +883,5 @@ fn confident_silence_cancels_quality_fallback() {
         compression_ratio: 3.0,
         language: Some("en".to_string()),
     };
-    assert!(!crate::whisper::decode::check_fallback(&result, fallback, &options));
+    assert!(!crate::whisper::decode::check_fallback(&result, &options));
 }

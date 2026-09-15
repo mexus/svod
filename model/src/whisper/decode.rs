@@ -1,17 +1,20 @@
 //! Scheduled Whisper decoding, temperature fallback, and language detection.
 
-use super::error::{Error, Result};
-
-use super::jit::{WhisperDecoderJit, WhisperDecoderStepJit, WhisperPrefillJit};
-use super::profile::{CopyProfile, GraphProfile, begin_host_copy, timed_d2d};
-use super::tokenizer::WhisperTokenizer;
-use super::vocab::{logsumexp, top_k_logprobs};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
+
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use svod_arch::pipelines::audio::Segment;
 use svod_device::{Buffer, BufferSpec};
+use svod_runtime::StageProfile;
+
+use super::config::TOKENS_PER_SECOND;
+use super::error::{Error, Result};
+use super::jit::{WhisperDecoderStepJit, WhisperPrefillJit};
+use super::profile::{CopyProfile, GraphProfile};
+use super::tokenizer::WhisperTokenizer;
+use super::vocab::{logsumexp, scaled_exp, top_k_logprobs};
 
 // ─── Language detection ─────────────────────────────────────────────────────
 
@@ -22,63 +25,44 @@ pub struct LanguageDetection {
     pub probabilities: Vec<(String, f32)>,
 }
 
+/// Detect the spoken language from the prefill graph's SOT-conditioned logits.
 pub fn detect_language(
-    decoder_jit: &mut WhisperDecoderJit,
-    _n_text_ctx: usize,
+    prefill_jit: &mut WhisperPrefillJit,
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
 ) -> Result<LanguageDetection> {
-    detect_language_profile(decoder_jit, n_vocab, tokenizer, None, None)
+    detect_language_profile(prefill_jit, n_vocab, tokenizer, &mut CopyProfile::default(), &mut GraphProfile::default())
 }
 
 pub(crate) fn detect_language_profile(
-    decoder_jit: &mut WhisperDecoderJit,
+    prefill_jit: &mut WhisperPrefillJit,
     n_vocab: usize,
     tokenizer: &WhisperTokenizer,
-    mut copies: Option<&mut CopyProfile>,
-    graph_profile: Option<&mut GraphProfile>,
+    copies: &mut CopyProfile,
+    graph: &mut GraphProfile,
 ) -> Result<LanguageDetection> {
-    let sot = tokenizer.sot() as i32;
-    let started = begin_host_copy(copies.is_some(), decoder_jit.tokens_mut()?)?;
-    write_uncached(decoder_jit, &[sot])?;
-    if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
-        copies.h2d("language_tokens", 1, std::mem::size_of::<i32>(), started.elapsed());
-    }
-    if let Some(graph_profile) = graph_profile {
-        let graph_started = std::time::Instant::now();
-        let kernels = decoder_jit.execute_profiled_static()?;
-        decoder_jit.output()?.synchronize()?;
-        graph_profile.record(graph_started.elapsed(), kernels);
-    } else {
-        decoder_jit.execute()?;
-    }
-    let started = begin_host_copy(copies.is_some(), decoder_jit.output()?)?;
-    let sot_logits = read_uncached(decoder_jit, n_vocab)?;
-    if let (Some(copies), Some(started)) = (copies, started) {
-        copies.d2h("language_logits", 1, n_vocab * std::mem::size_of::<f32>(), started.elapsed());
-    }
+    // Row 0 of the prefill logits is conditioned on SOT alone, so the tokens
+    // after it may be anything; SOT again keeps the prompt well-formed.
+    let prompt_len = prefill_jit.tokens_mut()?.size() / size_of::<i32>();
+    write_prefill_tokens(prefill_jit, &vec![tokenizer.sot() as i32; prompt_len], copies, "language_tokens")?;
+    run_prefill_graph(prefill_jit, graph)?;
+    let logits = read_prefill_logits(prefill_jit, n_vocab, copies, "language_logits")?;
 
-    let lang_tokens = tokenizer.all_language_tokens();
-    let lang_codes = tokenizer.all_language_codes();
-    let mut masked = vec![f32::NEG_INFINITY; n_vocab];
-    for &tok in &lang_tokens {
-        masked[tok as usize] = sot_logits[tok as usize];
-    }
-    let best_tok = argmax(&masked) as u32;
-    let max_val = masked.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let sum: f32 = masked.iter().map(|&l| (l - max_val).exp()).sum();
-    let logsum = sum.ln() + max_val;
-
-    let mut probabilities: Vec<(String, f32)> = lang_tokens
-        .iter()
-        .zip(&lang_codes)
-        .map(|(&tok, code)| ((masked[tok as usize] - logsum).exp(), code.clone()))
-        .map(|(p, c)| (c, p))
+    let tokens = tokenizer.all_language_tokens();
+    let scores: Vec<f32> = tokens.iter().map(|&token| logits[token as usize]).collect();
+    let Some(&language_token) = tokens.get(argmax(&scores)) else {
+        return Err(decode_err("model has no language tokens"));
+    };
+    let logsum = logsumexp(&scores);
+    let mut probabilities: Vec<(String, f32)> = tokenizer
+        .all_language_codes()
+        .into_iter()
+        .zip(&scores)
+        .map(|(code, &score)| (code, (score - logsum).exp()))
         .collect();
-    probabilities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let language = tokenizer.code_for_token(best_tok).unwrap_or_else(|| "en".into());
-    Ok(LanguageDetection { language, language_token: best_tok, probabilities })
+    probabilities.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let language = tokenizer.code_for_token(language_token).unwrap_or_else(|| "en".into());
+    Ok(LanguageDetection { language, language_token, probabilities })
 }
 
 // ─── Decode options & result ────────────────────────────────────────────────
@@ -121,27 +105,6 @@ impl DecodeStrategy {
     }
 }
 
-/// Quality-gated sampling attempts after the primary decode is rejected.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FallbackPolicy {
-    /// Positive sampling temperatures tried in order.
-    pub sampling_temperatures: Vec<f32>,
-    /// Retry when text compression exceeds this threshold.
-    pub compression_ratio_threshold: Option<f32>,
-    /// Retry below this average log-probability.
-    pub logprob_threshold: Option<f32>,
-}
-
-impl Default for FallbackPolicy {
-    fn default() -> Self {
-        Self {
-            sampling_temperatures: vec![0.2, 0.4, 0.6, 0.8, 1.0],
-            compression_ratio_threshold: Some(2.4),
-            logprob_threshold: Some(-1.0),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct DecodeOptions {
     /// Whether to transcribe source speech or translate it to English.
@@ -150,8 +113,14 @@ pub struct DecodeOptions {
     pub language: Option<String>,
     /// Search algorithm for the first decode attempt.
     pub strategy: DecodeStrategy,
-    /// Optional quality-gated sampling retries.
-    pub fallback: Option<FallbackPolicy>,
+    /// Sampling temperatures retried in order when an attempt fails a quality
+    /// gate; empty disables fallback.
+    pub fallback_temperatures: Vec<f32>,
+    /// Retry when the text's zlib compression ratio exceeds this: repetition.
+    pub compression_ratio_threshold: Option<f32>,
+    /// Retry below this average log-probability. A window above it is never
+    /// skipped as silence, whatever its no-speech probability.
+    pub logprob_threshold: Option<f32>,
     /// Base seed for reproducible per-request sampling streams.
     pub sampling_seed: Option<u64>,
     /// Maximum generated token count; defaults to half the text context.
@@ -172,7 +141,9 @@ impl Default for DecodeOptions {
             task: WhisperTask::Transcribe,
             language: None,
             strategy: DecodeStrategy::Beam { size: 5 },
-            fallback: Some(FallbackPolicy::default()),
+            fallback_temperatures: vec![0.2, 0.4, 0.6, 0.8, 1.0],
+            compression_ratio_threshold: Some(2.4),
+            logprob_threshold: Some(-1.0),
             sampling_seed: None,
             sample_len: None,
             suppress_blank: true,
@@ -185,44 +156,28 @@ impl Default for DecodeOptions {
 
 impl DecodeOptions {
     /// Validate strategy geometry and sampling parameters before graph preparation.
-    pub fn validate(&self) -> std::result::Result<(), &'static str> {
-        match self.strategy {
-            DecodeStrategy::Beam { size: 0 } => return Err("beam size must be non-zero"),
-            DecodeStrategy::Sample { temperature } if !valid_temperature(temperature) => {
-                return Err("sampling temperature must be finite and positive");
-            }
-            _ => {}
-        }
-        if let Some(fallback) = &self.fallback {
-            if fallback.sampling_temperatures.is_empty() {
-                return Err("fallback sampling temperatures must be non-empty");
-            }
-            if fallback.sampling_temperatures.iter().any(|&temperature| !valid_temperature(temperature)) {
-                return Err("fallback sampling temperatures must be finite and positive");
-            }
-            if fallback.compression_ratio_threshold.is_some_and(|threshold| !threshold.is_finite() || threshold <= 0.0)
-            {
-                return Err("compression ratio threshold must be finite and positive");
-            }
-            if fallback.logprob_threshold.is_some_and(|threshold| !threshold.is_finite()) {
-                return Err("log-probability threshold must be finite");
-            }
-        }
-        if self.no_speech_threshold.is_some_and(|threshold| !threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
-        {
-            return Err("no-speech threshold must be between zero and one");
-        }
-        Ok(())
+    pub fn validate(&self) -> Result<()> {
+        let valid_temperature = |temperature: f32| temperature.is_finite() && temperature > 0.0;
+        let check = |ok: bool, message: &str| if ok { Ok(()) } else { Err(decode_err(message)) };
+        check(!matches!(self.strategy, DecodeStrategy::Beam { size: 0 }), "beam size must be non-zero")?;
+        check(
+            !matches!(self.strategy, DecodeStrategy::Sample { temperature } if !valid_temperature(temperature)),
+            "sampling temperature must be finite and positive",
+        )?;
+        check(
+            self.fallback_temperatures.iter().all(|&temperature| valid_temperature(temperature)),
+            "fallback sampling temperatures must be finite and positive",
+        )?;
+        check(
+            self.compression_ratio_threshold.is_none_or(|threshold| threshold.is_finite() && threshold > 0.0),
+            "compression ratio threshold must be finite and positive",
+        )?;
+        check(self.logprob_threshold.is_none_or(f32::is_finite), "log-probability threshold must be finite")?;
+        check(
+            self.no_speech_threshold.is_none_or(|threshold| (0.0..=1.0).contains(&threshold)),
+            "no-speech threshold must be between zero and one",
+        )
     }
-}
-
-fn valid_temperature(temperature: f32) -> bool {
-    temperature.is_finite() && temperature > 0.0
-}
-
-#[cfg(test)]
-pub(crate) fn remaining_sample_steps(sample_len: usize) -> usize {
-    sample_len.saturating_sub(1)
 }
 
 #[derive(Clone, Debug)]
@@ -239,18 +194,11 @@ pub struct DecodeResult {
 }
 
 impl DecodeResult {
+    /// Silence: no-speech probability over the threshold, unless the decode
+    /// was confident anyway.
     pub fn should_skip(&self, options: &DecodeOptions) -> bool {
-        let Some(no_speech_threshold) = options.no_speech_threshold else {
-            return false;
-        };
-        if self.no_speech_prob <= no_speech_threshold {
-            return false;
-        }
-        options
-            .fallback
-            .as_ref()
-            .and_then(|fallback| fallback.logprob_threshold)
-            .is_none_or(|threshold| self.avg_logprob <= threshold)
+        options.no_speech_threshold.is_some_and(|threshold| self.no_speech_prob > threshold)
+            && options.logprob_threshold.is_none_or(|threshold| self.avg_logprob <= threshold)
     }
 
     pub fn clear_speech(&mut self) {
@@ -260,33 +208,40 @@ impl DecodeResult {
     }
 }
 
-pub(crate) fn check_fallback(result: &DecodeResult, fallback: &FallbackPolicy, options: &DecodeOptions) -> bool {
-    let repetitive = fallback.compression_ratio_threshold.is_some_and(|threshold| result.compression_ratio > threshold);
-    let low_confidence = fallback.logprob_threshold.is_some_and(|threshold| result.avg_logprob < threshold);
+/// Whether a finished attempt fails a quality gate and the next temperature
+/// should be tried. Low confidence over silence is not worth retrying.
+pub(crate) fn check_fallback(result: &DecodeResult, options: &DecodeOptions) -> bool {
+    let repetitive = options.compression_ratio_threshold.is_some_and(|threshold| result.compression_ratio > threshold);
+    let low_confidence = options.logprob_threshold.is_some_and(|threshold| result.avg_logprob < threshold);
     let silence =
         options.no_speech_threshold.is_some_and(|threshold| result.no_speech_prob > threshold) && low_confidence;
     (repetitive || low_confidence) && !silence
 }
 
-// ─── Fixed-slot mixed-strategy scheduler ────────────────────────────────────
+// ─── Prefill ─────────────────────────────────────────────────────────────────
 
-/// Immutable output of token prefill. Fallback attempts reuse this seed rather
-/// than rerunning prefill. Cache snapshots remain device-local and are copied
-/// into a row only when that row changes request ownership.
+pub(crate) struct PrefillMetadata {
+    pub(crate) initial_tokens: Vec<u32>,
+    /// Prompt length: where sampled tokens start, and how many cache positions
+    /// prefill filled.
+    pub(crate) sample_begin: usize,
+    pub(crate) suppress_tokens: Vec<i32>,
+    /// The prompt's last logits row: the distribution over the first sampled token.
+    pub(crate) logits: Vec<f32>,
+    pub(crate) no_speech_prob: f32,
+}
+
+/// Immutable output of one window's prefill. Fallback attempts reuse it rather
+/// than rerunning prefill; the snapshots stay device-local and are copied into
+/// decoder rows when an attempt takes them over.
 pub(crate) struct DecodeSeed {
     pub(crate) metadata: PrefillMetadata,
-    pub(crate) self_k_cache: Buffer,
-    pub(crate) self_v_cache: Buffer,
+    self_k: Buffer,
+    self_v: Buffer,
     pub(crate) cross_k: Buffer,
     pub(crate) cross_v: Buffer,
-    pub(crate) per_pos_bytes: usize,
-    /// One cross-cache position in bytes: the same element count as
-    /// `per_pos_bytes`, at the cross cache's own width.
-    pub(crate) cross_per_pos_bytes: usize,
-    pub(crate) self_cache_bytes: usize,
-    pub(crate) cross_cache_bytes: usize,
-    pub(crate) self_positions: usize,
-    pub(crate) cross_positions: usize,
+    /// Bytes of one cached position in the self cache.
+    per_pos_bytes: usize,
 }
 
 impl DecodeSeed {
@@ -296,53 +251,33 @@ impl DecodeSeed {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefill_decode_seed(
     prefill_jit: &mut WhisperPrefillJit,
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
     n_text_ctx: usize,
     n_vocab: usize,
-    pos_embedding: &[f32],
-    n_state: usize,
-    mut copies: Option<&mut CopyProfile>,
-    graph_profile: Option<&mut GraphProfile>,
+    copies: &mut CopyProfile,
+    graph: &mut GraphProfile,
 ) -> Result<DecodeSeed> {
-    let metadata = execute_prefill(
-        prefill_jit,
-        tokenizer,
-        options,
-        n_vocab,
-        pos_embedding,
-        n_state,
-        copies.as_deref_mut(),
-        graph_profile,
-    )?;
-    let self_k_src = prefill_jit.self_k()?.clone();
-    let self_v_src = prefill_jit.self_v()?.clone();
-    let cross_k_src = prefill_jit.prepared_cross_k_mut()?.clone();
-    let cross_v_src = prefill_jit.prepared_cross_v_mut()?.clone();
-    let bytes = self_k_src
-        .size()
-        .saturating_add(self_v_src.size())
-        .saturating_add(cross_k_src.size())
-        .saturating_add(cross_v_src.size());
-    let ((self_k, self_v, cross_k, cross_v), wall) = timed_d2d(copies.is_some(), &self_k_src, || {
+    let metadata = execute_prefill(prefill_jit, tokenizer, options, n_vocab, copies, graph)?;
+    if metadata.sample_begin > n_text_ctx {
+        return Err(decode_err("prefill prompt exceeds text context"));
+    }
+    // The graph's outputs are overwritten by the next window, so the seed
+    // snapshots them.
+    let (self_k, self_v) = (prefill_jit.self_k()?, prefill_jit.self_v()?);
+    let (cross_k, cross_v) = (prefill_jit.cross_k()?, prefill_jit.cross_v()?);
+    let bytes = self_k.size() + self_v.size() + cross_k.size() + cross_v.size();
+    let (self_k, self_v, cross_k, cross_v) = copies.d2d("seed_snapshots", 4, bytes, self_k, || -> Result<_> {
         Ok((
-            clone_device_cache(&self_k_src)?,
-            clone_device_cache(&self_v_src)?,
-            clone_device_cache(&cross_k_src)?,
-            clone_device_cache(&cross_v_src)?,
+            clone_device_cache(self_k)?,
+            clone_device_cache(self_v)?,
+            clone_device_cache(cross_k)?,
+            clone_device_cache(cross_v)?,
         ))
     })?;
-    if let Some(copies) = copies {
-        copies.d2d("seed_snapshots", 4, bytes, wall);
-    }
-    let seed = build_decode_seed(metadata, self_k, self_v, cross_k, cross_v)?;
-    if seed.self_positions > n_text_ctx {
-        return Err(decode_err("prefill self cache exceeds text context"));
-    }
-    Ok(seed)
+    build_decode_seed(metadata, self_k, self_v, cross_k, cross_v)
 }
 
 pub(crate) fn clone_device_cache(src: &Buffer) -> Result<Buffer> {
@@ -367,54 +302,111 @@ pub(crate) fn build_decode_seed(
     cross_k: Buffer,
     cross_v: Buffer,
 ) -> Result<DecodeSeed> {
-    if metadata.init_len == 0 || self_k.size() == 0 || self_k.size() != self_v.size() {
+    let positions = metadata.sample_begin;
+    if positions == 0
+        || self_k.size() == 0
+        || self_k.size() != self_v.size()
+        || !self_k.size().is_multiple_of(positions)
+    {
         return Err(decode_err("invalid prefill self-cache geometry"));
     }
     if cross_k.size() == 0 || cross_k.size() != cross_v.size() {
         return Err(decode_err("invalid prefill cross-cache geometry"));
     }
-    for cache in [&self_v, &cross_k, &cross_v] {
-        if !std::ptr::eq(self_k.allocator(), cache.allocator()) {
-            return Err(decode_err("prefill caches use different allocators"));
-        }
+    if [&self_v, &cross_k, &cross_v].iter().any(|cache| !std::ptr::eq(self_k.allocator(), cache.allocator())) {
+        return Err(decode_err("prefill caches use different allocators"));
     }
-    let per_pos_bytes = self_k
-        .size()
-        .checked_div(metadata.init_len)
-        .filter(|&bytes| bytes != 0 && bytes.checked_mul(metadata.init_len) == Some(self_k.size()))
-        .ok_or_else(|| decode_err("self cache is not position-aligned"))?;
-    let self_element = self_k.dtype().bytes();
-    if self_element == 0 || per_pos_bytes % self_element != 0 {
-        return Err(decode_err("self cache position is not element-aligned"));
-    }
-    // Self and cross may be stored at different widths, so one position is the
-    // same element count but a different byte count in each.
-    let cross_per_pos_bytes = (per_pos_bytes / self_element)
-        .checked_mul(cross_k.dtype().bytes())
-        .filter(|&bytes| bytes != 0)
-        .ok_or_else(|| decode_err("cross cache position stride overflow"))?;
-    let cross_positions = cross_k
-        .size()
-        .checked_div(cross_per_pos_bytes)
-        .filter(|&positions| positions != 0 && positions.checked_mul(cross_per_pos_bytes) == Some(cross_k.size()))
-        .ok_or_else(|| decode_err("cross cache is not position-aligned"))?;
-    let self_cache_bytes = self_k.size();
-    let cross_cache_bytes = cross_k.size();
+    let per_pos_bytes = self_k.size() / positions;
+    Ok(DecodeSeed { metadata, self_k, self_v, cross_k, cross_v, per_pos_bytes })
+}
 
-    Ok(DecodeSeed {
-        self_k_cache: self_k,
-        self_v_cache: self_v,
-        cross_k,
-        cross_v,
-        per_pos_bytes,
-        cross_per_pos_bytes,
-        self_cache_bytes,
-        cross_cache_bytes,
-        self_positions: metadata.init_len,
-        cross_positions,
-        metadata,
+fn execute_prefill(
+    prefill_jit: &mut WhisperPrefillJit,
+    tokenizer: &WhisperTokenizer,
+    options: &DecodeOptions,
+    n_vocab: usize,
+    copies: &mut CopyProfile,
+    graph: &mut GraphProfile,
+) -> Result<PrefillMetadata> {
+    let mut initial_tokens = vec![tokenizer.sot()];
+    if tokenizer.multilingual {
+        let language = options.language.as_ref().ok_or_else(|| decode_err("language required"))?;
+        let task = match options.task {
+            WhisperTask::Transcribe => tokenizer.transcribe(),
+            WhisperTask::Translate => tokenizer.translate(),
+        };
+        initial_tokens.extend([tokenizer.language_token_for(language).unwrap_or_else(|| tokenizer.sot()), task]);
+    }
+    let sample_begin = initial_tokens.len();
+    let prompt: Vec<i32> = initial_tokens.iter().map(|&token| token as i32).collect();
+    write_prefill_tokens(prefill_jit, &prompt, copies, "prefill_tokens")?;
+    run_prefill_graph(prefill_jit, graph)?;
+    let mut logits = read_prefill_logits(prefill_jit, sample_begin * n_vocab, copies, "prefill_logits")?;
+    // No-speech is read at SOT, the first row; the last row seeds sampling.
+    let no_speech_prob =
+        tokenizer.no_speech().map(|token| softmax_prob(&logits[..n_vocab], token as usize)).unwrap_or(f32::NAN);
+    logits.drain(..(sample_begin - 1) * n_vocab);
+    Ok(PrefillMetadata {
+        initial_tokens,
+        sample_begin,
+        suppress_tokens: get_suppress_tokens(tokenizer, options),
+        logits,
+        no_speech_prob,
     })
 }
+
+fn write_prefill_tokens(
+    jit: &mut WhisperPrefillJit,
+    tokens: &[i32],
+    copies: &mut CopyProfile,
+    name: &'static str,
+) -> Result<()> {
+    let fence = jit.tokens_mut()?.clone();
+    let bytes: &[u8] = bytemuck::cast_slice(tokens);
+    copies.h2d(name, 1, bytes.len(), &fence, || -> Result<()> {
+        let dst = jit.tokens_mut()?.as_host_bytes_mut()?;
+        if dst.len() != bytes.len() {
+            return Err(decode_err("prompt length differs from the prepared prefill graph"));
+        }
+        dst.copy_from_slice(bytes);
+        Ok(())
+    })
+}
+
+fn run_prefill_graph(jit: &mut WhisperPrefillJit, graph: &mut GraphProfile) -> Result<()> {
+    graph.execute(
+        jit,
+        |jit| -> Result<()> { Ok(jit.execute()?) },
+        |jit| {
+            let kernels = jit.execute_profiled_static()?;
+            jit.logits()?.synchronize()?;
+            Ok(kernels)
+        },
+    )
+}
+
+fn read_prefill_logits(
+    jit: &WhisperPrefillJit,
+    count: usize,
+    copies: &mut CopyProfile,
+    name: &'static str,
+) -> Result<Vec<f32>> {
+    let logits = jit.logits()?;
+    copies.d2h(name, 1, count * size_of::<f32>(), logits, || read_f32(logits, 0, count))
+}
+
+/// Copy `count` floats from element `offset` of a device buffer over the copy
+/// engine. Reading a device-resident buffer through its host mapping faults
+/// the pages across one at a time, at a measured 0.32 GB/s; one bulk copy of
+/// the same range moves the same data as a single transfer.
+pub(crate) fn read_f32(buffer: &Buffer, offset: usize, count: usize) -> Result<Vec<f32>> {
+    let mut out = vec![0f32; count];
+    let element = size_of::<f32>();
+    buffer.view(offset * element, count * element)?.copyout_prefix(bytemuck::cast_slice_mut(&mut out))?;
+    Ok(out)
+}
+
+// ─── Fixed-slot mixed-strategy scheduler ────────────────────────────────────
 
 pub(crate) fn strategy_width(strategy: DecodeStrategy) -> usize {
     match strategy {
@@ -424,12 +416,9 @@ pub(crate) fn strategy_width(strategy: DecodeStrategy) -> usize {
 }
 
 pub(crate) fn attempt_strategies(options: &DecodeOptions) -> Vec<DecodeStrategy> {
-    let mut strategies = vec![options.strategy];
-    if let Some(fallback) = &options.fallback {
-        strategies
-            .extend(fallback.sampling_temperatures.iter().map(|&temperature| DecodeStrategy::Sample { temperature }));
-    }
-    strategies
+    std::iter::once(options.strategy)
+        .chain(options.fallback_temperatures.iter().map(|&temperature| DecodeStrategy::Sample { temperature }))
+        .collect()
 }
 
 pub(crate) fn collect_ordered<T>(results: Vec<Option<T>>) -> std::result::Result<Vec<T>, &'static str> {
@@ -446,33 +435,26 @@ pub(crate) struct DecodeScheduleStats {
     pub(crate) cache_clone_bytes: usize,
     pub(crate) attempts: usize,
     pub(crate) fallback_attempts: usize,
-    pub(crate) copies: CopyProfile,
 }
 
 impl DecodeScheduleStats {
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.dispatches += other.dispatches;
-        self.active_row_steps += other.active_row_steps;
-        self.reserved_row_steps += other.reserved_row_steps;
-        self.capacity_row_steps += other.capacity_row_steps;
-        self.cache_clone_ops += other.cache_clone_ops;
-        self.cache_clone_bytes += other.cache_clone_bytes;
-        self.attempts += other.attempts;
-        self.fallback_attempts += other.fallback_attempts;
-        self.copies.merge(other.copies);
+    /// Attach the counters to a stage. They are plain sums, so per-window
+    /// profiles add up when the pipeline merges them; utilization is
+    /// `active_row_steps / capacity_row_steps`.
+    pub(crate) fn annotate(&self, stage: &mut StageProfile) {
+        for (key, value) in [
+            ("dispatches", self.dispatches),
+            ("active_row_steps", self.active_row_steps),
+            ("reserved_row_steps", self.reserved_row_steps),
+            ("capacity_row_steps", self.capacity_row_steps),
+            ("cache_clone_ops", self.cache_clone_ops),
+            ("cache_clone_bytes", self.cache_clone_bytes),
+            ("attempts", self.attempts),
+            ("fallback_attempts", self.fallback_attempts),
+        ] {
+            stage.meta.insert(key.into(), value.to_string());
+        }
     }
-}
-
-pub(crate) fn scheduler_seed_copy_accounting(rows: usize, self_bytes: usize, cross_bytes: usize) -> (usize, usize) {
-    (rows.saturating_mul(4), rows.saturating_mul(self_bytes.saturating_add(cross_bytes)).saturating_mul(2))
-}
-
-pub(crate) fn cache_append_copy_accounting(rows: usize, per_pos_bytes: usize) -> (usize, usize) {
-    (rows.saturating_mul(2), rows.saturating_mul(per_pos_bytes).saturating_mul(2))
-}
-
-pub(crate) fn beam_clone_copy_accounting(copies: usize, positions: usize, per_pos_bytes: usize) -> (usize, usize) {
-    (copies.saturating_mul(2), copies.saturating_mul(positions).saturating_mul(per_pos_bytes).saturating_mul(2))
 }
 
 /// Small independently-testable allocator enforcing whole-attempt admission.
@@ -497,16 +479,12 @@ impl SlotAllocator {
         if width > self.owners.len() {
             return Err("decode attempt width exceeds decoder slots");
         }
-        if self.owners.iter().filter(|slot| slot.is_none()).count() < width {
+        let free: Vec<usize> =
+            self.owners.iter().enumerate().filter_map(|(row, current)| current.is_none().then_some(row)).collect();
+        if free.len() < width {
             return Ok(None);
         }
-        let rows: Vec<_> = self
-            .owners
-            .iter()
-            .enumerate()
-            .filter_map(|(row, current)| current.is_none().then_some(row))
-            .take(width)
-            .collect();
+        let rows = free[..width].to_vec();
         for &row in &rows {
             self.owners[row] = Some(owner);
         }
@@ -531,47 +509,90 @@ impl SlotAllocator {
     }
 }
 
-struct SingleAttempt {
-    next_token: u32,
-    tokens: Vec<u32>,
-    token_probs: Vec<f32>,
-    sum_logprob: f32,
-}
-
-struct BeamAttempt {
+/// One request's live search over its reserved rows. Greedy and sampling are
+/// beams of width one whose single candidate per step is picked rather than
+/// ranked; everything after candidate generation is shared.
+struct Attempt {
+    strategy_index: usize,
+    strategy: DecodeStrategy,
+    reserved_rows: Vec<usize>,
+    /// Positions cached so far, which is also the position decoded next.
+    pos: usize,
+    generated: usize,
     active: Vec<BeamHypothesis>,
+    /// The row each active hypothesis occupies.
     rows: Vec<usize>,
     finished: Vec<BeamHypothesis>,
     next_logical_id: usize,
 }
 
-enum AttemptKind {
-    Single(SingleAttempt),
-    Beam(BeamAttempt),
-}
+impl Attempt {
+    fn width(&self) -> usize {
+        self.reserved_rows.len()
+    }
 
-struct ScheduledAttempt {
-    strategy_index: usize,
-    strategy: DecodeStrategy,
-    reserved_rows: Vec<usize>,
-    pos: usize,
-    generated_tokens: usize,
-    kind: AttemptKind,
-}
+    fn is_done(&self, sample_len: usize) -> bool {
+        self.generated >= sample_len || self.active.is_empty() || self.finished.len() >= self.width()
+    }
 
-impl ScheduledAttempt {
-    fn is_done(&self, sample_len: usize, eot: u32) -> bool {
-        match &self.kind {
-            AttemptKind::Single(single) => {
-                sample_len == 0 || single.next_token == eot || single.tokens.len() >= sample_len
+    /// Score one hypothesis's logits row into the candidates this strategy
+    /// considers: the top `size + 1` for a beam, one pick otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn candidates(
+        &self,
+        parent_index: usize,
+        row: usize,
+        logits: &mut [f32],
+        seed: &PrefillMetadata,
+        tokenizer: &WhisperTokenizer,
+        options: &DecodeOptions,
+        rng: &mut StdRng,
+        out: &mut Vec<BeamCandidate>,
+    ) {
+        let hypothesis = &self.active[parent_index];
+        apply_logit_filters(
+            logits,
+            tokenizer,
+            options,
+            &hypothesis.tokens,
+            seed.sample_begin,
+            self.generated,
+            &seed.suppress_tokens,
+        );
+        let picks = match self.strategy {
+            DecodeStrategy::Beam { size } => top_k_logprobs(logits, size + 1),
+            strategy => {
+                let token = pick_token_with_rng(logits, strategy.temperature(), rng) as usize;
+                vec![(token, logits[token] - logsumexp(logits))]
             }
-            AttemptKind::Beam(beam) => {
-                sample_len == 0
-                    || self.generated_tokens >= sample_len
-                    || beam.active.is_empty()
-                    || beam.finished.len() >= self.reserved_rows.len()
-            }
-        }
+        };
+        out.extend(picks.into_iter().map(|(token, logprob)| BeamCandidate {
+            parent_index,
+            parent_logical_id: hypothesis.logical_id,
+            parent_row: row,
+            token_id: token as u32,
+            token_logprob: logprob,
+            sum_logprob: hypothesis.sum_logprob + logprob,
+        }));
+    }
+
+    /// Rank the candidates, retire the finished, and assign survivors to rows.
+    fn advance(&mut self, candidates: Vec<BeamCandidate>, eot: u32) -> Result<RowAssignment> {
+        let width = self.width();
+        let (active, finished, survivors) = select_beam_candidates(
+            &self.active,
+            candidates,
+            width,
+            eot,
+            width - self.finished.len(),
+            &mut self.next_logical_id,
+        );
+        self.finished.extend(finished);
+        let assignment = plan_beam_rows(&self.reserved_rows, &survivors).map_err(decode_err)?;
+        self.active = active;
+        self.rows.clone_from(&assignment.rows);
+        self.generated += 1;
+        Ok(assignment)
     }
 }
 
@@ -583,106 +604,37 @@ fn start_attempt(
     seed: &DecodeSeed,
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
-    n_vocab: usize,
     rng: &mut StdRng,
-) -> Result<ScheduledAttempt> {
+    sample_len: usize,
+) -> Result<Attempt> {
     let metadata = &seed.metadata;
-    let last = metadata
-        .prefill_logits
-        .get((metadata.init_len - 1) * n_vocab..metadata.init_len * n_vocab)
-        .ok_or_else(|| decode_err("prefill logits are truncated"))?;
-    let mut filtered = last.to_vec();
-    apply_logit_filters(
-        &mut filtered,
-        tokenizer,
-        options,
-        &metadata.initial_tokens,
-        metadata.sample_begin,
-        0,
-        &metadata.suppress_tokens,
-    );
-    let kind = match strategy {
-        DecodeStrategy::Greedy | DecodeStrategy::Sample { .. } => {
-            if options.sample_len == Some(0) {
-                return Ok(ScheduledAttempt {
-                    strategy_index,
-                    strategy,
-                    reserved_rows: rows,
-                    pos: metadata.init_len,
-                    generated_tokens: 0,
-                    kind: AttemptKind::Single(SingleAttempt {
-                        next_token: tokenizer.eot(),
-                        tokens: Vec::new(),
-                        token_probs: Vec::new(),
-                        sum_logprob: 0.0,
-                    }),
-                });
-            }
-            let next_token = pick_token_with_rng(&filtered, strategy.temperature(), rng);
-            let sum_logprob = log_softmax(&filtered, next_token as usize);
-            let (tokens, token_probs) = if next_token == tokenizer.eot() {
-                (Vec::new(), Vec::new())
-            } else {
-                (vec![next_token], vec![sum_logprob.exp()])
-            };
-            AttemptKind::Single(SingleAttempt { next_token, tokens, token_probs, sum_logprob })
-        }
-        DecodeStrategy::Beam { size } => {
-            if options.sample_len == Some(0) {
-                let active = vec![BeamHypothesis {
-                    logical_id: 0,
-                    tokens: metadata.initial_tokens.clone(),
-                    token_probs: Vec::new(),
-                    sum_logprob: 0.0,
-                }];
-                return Ok(ScheduledAttempt {
-                    strategy_index,
-                    strategy,
-                    reserved_rows: rows.clone(),
-                    pos: metadata.init_len,
-                    generated_tokens: 0,
-                    kind: AttemptKind::Beam(BeamAttempt {
-                        active,
-                        rows: vec![rows[0]],
-                        finished: Vec::new(),
-                        next_logical_id: 1,
-                    }),
-                });
-            }
-            let mut active = Vec::with_capacity(size);
-            let mut finished = Vec::new();
-            let mut next_logical_id = 0;
-            for (token, logprob) in top_k_logprobs(&filtered, size + 1) {
-                if active.len() >= size {
-                    break;
-                }
-                let mut tokens = metadata.initial_tokens.clone();
-                tokens.push(token as u32);
-                let hypothesis = BeamHypothesis {
-                    logical_id: next_logical_id,
-                    tokens,
-                    token_probs: vec![logprob.exp()],
-                    sum_logprob: logprob,
-                };
-                next_logical_id += 1;
-                if token as u32 == tokenizer.eot() {
-                    finished.push(hypothesis);
-                } else {
-                    active.push(hypothesis);
-                }
-            }
-            let active_rows = rows[..active.len()].to_vec();
-            AttemptKind::Beam(BeamAttempt { active, rows: active_rows, finished, next_logical_id })
-        }
+    let root = BeamHypothesis {
+        logical_id: 0,
+        tokens: metadata.initial_tokens.clone(),
+        token_probs: Vec::new(),
+        sum_logprob: 0.0,
     };
-    Ok(ScheduledAttempt {
+    let mut attempt = Attempt {
         strategy_index,
         strategy,
+        rows: vec![rows[0]],
         reserved_rows: rows,
-        pos: metadata.init_len,
-        generated_tokens: 1,
-        kind,
-    })
+        pos: metadata.sample_begin,
+        generated: 0,
+        active: vec![root],
+        finished: Vec::new(),
+        next_logical_id: 1,
+    };
+    if sample_len == 0 {
+        return Ok(attempt);
+    }
+    // The prompt's logits are the first step. Every reserved row holds the
+    // prefill cache, so the children it fans out to need no cache copies.
+    let mut logits = metadata.logits.clone();
+    let mut candidates = Vec::new();
+    attempt.candidates(0, attempt.rows[0], &mut logits, metadata, tokenizer, options, rng, &mut candidates);
+    attempt.advance(candidates, tokenizer.eot())?;
+    Ok(attempt)
 }
 
 fn seed_attempt_rows(
@@ -692,35 +644,24 @@ fn seed_attempt_rows(
     seed: &DecodeSeed,
     n_text_ctx: usize,
 ) -> Result<()> {
-    if seed.self_positions > n_text_ctx
-        || seed.self_positions.checked_mul(seed.per_pos_bytes) != Some(seed.self_cache_bytes)
-        || seed.cross_positions.checked_mul(seed.cross_per_pos_bytes) != Some(seed.cross_cache_bytes)
-    {
-        return Err(decode_err("decode seed cache geometry mismatch"));
-    }
-    let self_stride =
-        n_text_ctx.checked_mul(seed.per_pos_bytes).ok_or_else(|| decode_err("self cache stride overflow"))?;
-    let cross_stride = seed.cross_cache_bytes;
     // Every row of this attempt decodes the same window, so its cross-attention
     // cache is the same bytes: one copy in the attempt's own cross slot, with
-    // every row pointed at it. The step then reads the largest tensor it touches
-    // once per window instead of once per hypothesis, and the cache is sized by
-    // concurrent windows rather than by rows. The slot is the request index, not
-    // a decoder row -- there is one live attempt per request, so no two live
-    // attempts can name the same slot.
-    if rows.is_empty() {
-        return Err(decode_err("attempt reserved no rows"));
-    }
+    // every row pointed at it. The slot is the request index, not a decoder
+    // row -- there is one live attempt per request, so no two live attempts
+    // can name the same slot.
+    let cross_stride = seed.cross_k.size();
     copy_device_cache_row(jit.cross_k_mut()?, cross_slot, cross_stride, &seed.cross_k)?;
     copy_device_cache_row(jit.cross_v_mut()?, cross_slot, cross_stride, &seed.cross_v)?;
+    let self_stride = n_text_ctx * seed.per_pos_bytes;
     for &row in rows {
-        copy_device_cache_row(jit.self_k_cache_mut()?, row, self_stride, &seed.self_k_cache)?;
-        copy_device_cache_row(jit.self_v_cache_mut()?, row, self_stride, &seed.self_v_cache)?;
-        write_cross_cache_row(jit, row, cross_slot)?;
+        copy_device_cache_row(jit.self_k_cache_mut()?, row, self_stride, &seed.self_k)?;
+        copy_device_cache_row(jit.self_v_cache_mut()?, row, self_stride, &seed.self_v)?;
     }
-    Ok(())
+    let slot = i32::try_from(cross_slot).map_err(|_| decode_err("cross cache row exceeds i32"))?;
+    write_rows(jit.cross_cache_map_mut()?, &rows.iter().map(|&row| (row, slot)).collect::<Vec<_>>())
 }
 
+/// Append the step's K/V output for `row` at cache position `pos`.
 fn append_row_cache(
     jit: &mut WhisperDecoderStepJit,
     row: usize,
@@ -728,11 +669,8 @@ fn append_row_cache(
     per_pos_bytes: usize,
     row_stride_bytes: usize,
 ) -> Result<()> {
-    let dst = row
-        .checked_mul(row_stride_bytes)
-        .and_then(|base| pos.checked_mul(per_pos_bytes).and_then(|offset| base.checked_add(offset)))
-        .ok_or_else(|| decode_err("self cache append offset overflow"))?;
-    let src = row.checked_mul(per_pos_bytes).ok_or_else(|| decode_err("step cache output offset overflow"))?;
+    let dst = row * row_stride_bytes + pos * per_pos_bytes;
+    let src = row * per_pos_bytes;
     jit.copy_output_to_self_k_cache(1, dst, src, per_pos_bytes)?;
     Ok(jit.copy_output_to_self_v_cache(2, dst, src, per_pos_bytes)?)
 }
@@ -744,14 +682,9 @@ fn clone_cache_prefix(
     per_pos_bytes: usize,
     row_stride_bytes: usize,
 ) -> Result<()> {
-    let len = positions.checked_mul(per_pos_bytes).ok_or_else(|| decode_err("cache prefix length overflow"))?;
+    let len = positions * per_pos_bytes;
     for copy in copies {
-        let src =
-            copy.src_row.checked_mul(row_stride_bytes).ok_or_else(|| decode_err("cache source offset overflow"))?;
-        let dst = copy
-            .dst_row
-            .checked_mul(row_stride_bytes)
-            .ok_or_else(|| decode_err("cache destination offset overflow"))?;
+        let (src, dst) = (copy.src_row * row_stride_bytes, copy.dst_row * row_stride_bytes);
         jit.self_k_cache_mut()?.copy_within(dst, src, len)?;
         jit.self_v_cache_mut()?.copy_within(dst, src, len)?;
     }
@@ -759,34 +692,18 @@ fn clone_cache_prefix(
 }
 
 fn finish_attempt(
-    attempt: ScheduledAttempt,
+    attempt: Attempt,
     seed: &DecodeSeed,
     tokenizer: &WhisperTokenizer,
     options: &DecodeOptions,
 ) -> Result<DecodeResult> {
-    match attempt.kind {
-        AttemptKind::Single(single) => finish_decode(
-            &single.tokens,
-            &single.token_probs,
-            tokenizer,
-            if options.sample_len == Some(0) { 0.0 } else { single.sum_logprob },
-            seed.metadata.no_speech_prob,
-            options,
-        ),
-        AttemptKind::Beam(beam) => {
-            let size = attempt.reserved_rows.len();
-            let best =
-                finalize_beam_hypotheses(beam.active, beam.finished, size, tokenizer.eot(), seed.metadata.sample_begin)
-                    .ok_or_else(|| decode_err("beam produced nothing"))?;
-            let tokens: Vec<_> = best.tokens[seed.metadata.sample_begin..]
-                .iter()
-                .copied()
-                .take_while(|&token| token != tokenizer.eot())
-                .collect();
-            let token_probs = best.token_probs.into_iter().take(tokens.len()).collect::<Vec<_>>();
-            finish_decode(&tokens, &token_probs, tokenizer, best.sum_logprob, seed.metadata.no_speech_prob, options)
-        }
-    }
+    let (eot, sample_begin) = (tokenizer.eot(), seed.metadata.sample_begin);
+    let width = attempt.width();
+    let best = finalize_beam_hypotheses(attempt.active, attempt.finished, width, eot, sample_begin)
+        .ok_or_else(|| decode_err("attempt produced no hypothesis"))?;
+    let tokens: Vec<u32> = best.tokens[sample_begin..].iter().copied().take_while(|&token| token != eot).collect();
+    let token_probs: Vec<f32> = best.token_probs.into_iter().take(tokens.len()).collect();
+    finish_decode(&tokens, &token_probs, tokenizer, best.sum_logprob, seed.metadata.no_speech_prob, options)
 }
 
 /// Decode all requests through one concrete `[decoder_slots, ...]` step graph.
@@ -801,27 +718,28 @@ pub(crate) fn run_fixed_slot_decode(
     tokenizer: &WhisperTokenizer,
     n_text_ctx: usize,
     n_vocab: usize,
-    profile: bool,
-) -> Result<(Vec<DecodeResult>, DecodeScheduleStats, GraphProfile)> {
+    copies: &mut CopyProfile,
+    graph: &mut GraphProfile,
+) -> Result<(Vec<DecodeResult>, DecodeScheduleStats)> {
     if seeds.len() != request_options.len() {
         return Err(decode_err("decode seed/options count mismatch"));
     }
     for options in request_options {
-        options.validate().map_err(decode_err)?;
-        for strategy in attempt_strategies(options) {
-            if strategy_width(strategy) > capacity {
-                return Err(decode_err("decode attempt width exceeds decoder slots"));
-            }
+        options.validate()?;
+        if attempt_strategies(options).into_iter().any(|strategy| strategy_width(strategy) > capacity) {
+            return Err(decode_err("decode attempt width exceeds decoder slots"));
         }
     }
 
+    let eot = tokenizer.eot();
     let strategies: Vec<_> = request_options.iter().map(attempt_strategies).collect();
+    let sample_lens: Vec<usize> =
+        request_options.iter().map(|options| options.sample_len.unwrap_or(n_text_ctx / 2)).collect();
     let mut queue: VecDeque<_> = (0..seeds.len()).map(|request| (request, 0usize)).collect();
     let mut allocator = SlotAllocator::new(capacity);
-    let mut attempts: Vec<Option<ScheduledAttempt>> = (0..seeds.len()).map(|_| None).collect();
+    let mut attempts: Vec<Option<Attempt>> = (0..seeds.len()).map(|_| None).collect();
     let mut results: Vec<Option<DecodeResult>> = (0..seeds.len()).map(|_| None).collect();
     let mut stats = DecodeScheduleStats::default();
-    let mut graph_profile = GraphProfile::default();
     let mut rngs: Vec<_> =
         request_options.iter().enumerate().map(|(request, options)| sampling_rng(options, request)).collect();
 
@@ -834,260 +752,130 @@ pub(crate) fn run_fixed_slot_decode(
             queue.pop_front();
             let mut options = request_options[request].clone();
             options.strategy = strategy;
+            let seed = &seeds[request];
             let attempt = start_attempt(
                 strategy_index,
                 strategy,
                 rows,
-                &seeds[request],
+                seed,
                 tokenizer,
                 &options,
-                n_vocab,
                 &mut rngs[request],
+                sample_lens[request],
             )?;
-            let (ops, bytes) = scheduler_seed_copy_accounting(
-                attempt.reserved_rows.len(),
-                seeds[request].self_cache_bytes,
-                seeds[request].cross_cache_bytes,
-            );
-            let (_, wall) = timed_d2d(profile, &seeds[request].self_k_cache, || {
-                seed_attempt_rows(step_jit, &attempt.reserved_rows, request, &seeds[request], n_text_ctx)
+            let fence = step_jit.self_k_cache_mut()?.clone();
+            let bytes = attempt.width() * seed.self_k.size() * 2 + seed.cross_k.size() * 2;
+            copies.d2d("scheduler_seeding", attempt.width() * 2 + 2, bytes, &fence, || -> Result<()> {
+                seed_attempt_rows(step_jit, &attempt.reserved_rows, request, seed, n_text_ctx)
             })?;
-            if profile {
-                stats.copies.d2d("scheduler_seeding", ops, bytes, wall);
-            }
             attempts[request] = Some(attempt);
             stats.attempts += 1;
             stats.fallback_attempts += usize::from(strategy_index > 0);
         }
 
-        let active_requests: Vec<_> =
+        let active_requests: Vec<usize> =
             attempts.iter().enumerate().filter_map(|(request, attempt)| attempt.as_ref().map(|_| request)).collect();
         if active_requests.is_empty() {
             return Err(decode_err("fixed-slot scheduler made no progress"));
         }
 
-        // Attempts that finish from prefill (EOT or zero budget) need no graph dispatch.
-        let mut dispatch = false;
-        let control_started = begin_host_copy(profile, step_jit.token_mut()?)?;
-        let mut control_ops = 0usize;
-        let mut control_bytes = 0usize;
+        // Controls: the token each live row decodes and its position, one
+        // host write per buffer. Attempts done from the prompt alone need none.
+        let mut tokens = Vec::new();
+        let mut positions = Vec::new();
         for &request in &active_requests {
             let attempt = attempts[request].as_ref().expect("active attempt");
-            let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
-            if attempt.is_done(sample_len, tokenizer.eot()) {
+            if attempt.is_done(sample_lens[request]) {
                 continue;
             }
-            let seed = &seeds[request].metadata;
-            match &attempt.kind {
-                AttemptKind::Single(single) => {
-                    let row = attempt.reserved_rows[0];
-                    write_token_row(step_jit, row, single.next_token)?;
-                    write_pos_emb_row(
-                        step_jit,
-                        row,
-                        seed.pos_embedding
-                            .get(attempt.pos * seed.n_state..(attempt.pos + 1) * seed.n_state)
-                            .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
-                    )?;
-                    write_self_key_len_row(step_jit, row, attempt.pos)?;
-                    control_ops = control_ops.saturating_add(3);
-                    control_bytes = control_bytes.saturating_add(
-                        std::mem::size_of::<i32>()
-                            + seed.n_state * std::mem::size_of::<f32>()
-                            + std::mem::size_of::<i32>(),
-                    );
-                }
-                AttemptKind::Beam(beam) => {
-                    for (hypothesis, &row) in beam.active.iter().zip(&beam.rows) {
-                        write_token_row(
-                            step_jit,
-                            row,
-                            *hypothesis.tokens.last().ok_or_else(|| decode_err("empty beam"))?,
-                        )?;
-                        write_pos_emb_row(
-                            step_jit,
-                            row,
-                            seed.pos_embedding
-                                .get(attempt.pos * seed.n_state..(attempt.pos + 1) * seed.n_state)
-                                .ok_or_else(|| decode_err("position embedding is out of bounds"))?,
-                        )?;
-                        write_self_key_len_row(step_jit, row, attempt.pos)?;
-                        control_ops = control_ops.saturating_add(3);
-                        control_bytes = control_bytes.saturating_add(
-                            std::mem::size_of::<i32>()
-                                + seed.n_state * std::mem::size_of::<f32>()
-                                + std::mem::size_of::<i32>(),
-                        );
-                    }
-                }
+            let pos = i32::try_from(attempt.pos).map_err(|_| decode_err("decoder position exceeds i32"))?;
+            for (hypothesis, &row) in attempt.active.iter().zip(&attempt.rows) {
+                tokens.push((row, *hypothesis.tokens.last().expect("hypotheses start from the prompt") as i32));
+                positions.push((row, pos));
             }
-            dispatch = true;
         }
 
-        if dispatch {
-            if let Some(started) = control_started {
-                stats.copies.h2d("decoder_controls", control_ops, control_bytes, started.elapsed());
-            }
+        if !tokens.is_empty() {
+            let fence = step_jit.token_mut()?.clone();
+            copies.h2d("decoder_controls", 2, tokens.len() * 2 * size_of::<i32>(), &fence, || -> Result<()> {
+                write_rows(step_jit.token_mut()?, &tokens)?;
+                write_rows(step_jit.self_key_lens_mut()?, &positions)
+            })?;
             stats.dispatches += 1;
             stats.capacity_row_steps += capacity;
             stats.reserved_row_steps += allocator.reserved();
-            stats.active_row_steps += active_requests
-                .iter()
-                .map(|&request| match &attempts[request].as_ref().expect("active attempt").kind {
-                    AttemptKind::Single(_) => 1,
-                    AttemptKind::Beam(beam) => beam.active.len(),
-                })
-                .sum::<usize>();
-            if profile {
-                let graph_started = std::time::Instant::now();
-                let kernels = step_jit.execute_profiled_static()?;
-                step_jit.logits()?.synchronize()?;
-                graph_profile.record(graph_started.elapsed(), kernels);
-            } else {
-                step_jit.execute()?;
-            }
+            stats.active_row_steps += tokens.len();
+            graph.execute(
+                step_jit,
+                |jit| -> Result<()> { Ok(jit.execute()?) },
+                |jit| {
+                    let kernels = jit.execute_profiled_static()?;
+                    jit.logits()?.synchronize()?;
+                    Ok(kernels)
+                },
+            )?;
+
             for &request in &active_requests {
                 let attempt = attempts[request].as_mut().expect("active attempt");
-                let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
-                if attempt.is_done(sample_len, tokenizer.eot()) {
+                if attempt.is_done(sample_lens[request]) {
                     continue;
                 }
-                let decode_seed = &seeds[request];
-                let seed = &decode_seed.metadata;
-                let per_pos_bytes = decode_seed.per_pos_bytes;
-                let row_stride_bytes = n_text_ctx
-                    .checked_mul(per_pos_bytes)
-                    .ok_or_else(|| decode_err("self cache row stride overflow"))?;
+                let seed = &seeds[request];
+                let (pos, per_pos_bytes) = (attempt.pos, seed.per_pos_bytes);
+                let row_stride = n_text_ctx * per_pos_bytes;
                 let mut options = request_options[request].clone();
                 options.strategy = attempt.strategy;
-                match &mut attempt.kind {
-                    AttemptKind::Single(single) => {
-                        let row = attempt.reserved_rows[0];
-                        let fence = step_jit.new_self_k()?.clone();
-                        let (_, wall) = timed_d2d(profile, &fence, || {
-                            append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)
-                        })?;
-                        if profile {
-                            let (ops, bytes) = cache_append_copy_accounting(1, per_pos_bytes);
-                            stats.copies.d2d("cache_append", ops, bytes, wall);
-                        }
-                        let started = begin_host_copy(profile, step_jit.logits()?)?;
-                        let mut logits = read_logits_row(step_jit, row, n_vocab)?;
-                        if let Some(started) = started {
-                            stats.copies.d2h(
-                                "decoder_logits",
-                                1,
-                                n_vocab * std::mem::size_of::<f32>(),
-                                started.elapsed(),
-                            );
-                        }
-                        let all_tokens: Vec<_> =
-                            seed.initial_tokens.iter().copied().chain(single.tokens.iter().copied()).collect();
-                        apply_logit_filters(
-                            &mut logits,
-                            tokenizer,
-                            &options,
-                            &all_tokens,
-                            seed.sample_begin,
-                            attempt.pos + 1 - seed.init_len,
-                            &seed.suppress_tokens,
-                        );
-                        single.next_token =
-                            pick_token_with_rng(&logits, attempt.strategy.temperature(), &mut rngs[request]);
-                        let logprob = log_softmax(&logits, single.next_token as usize);
-                        single.sum_logprob += logprob;
-                        if single.next_token != tokenizer.eot() {
-                            single.tokens.push(single.next_token);
-                            single.token_probs.push(logprob.exp());
-                        }
-                    }
-                    AttemptKind::Beam(beam) => {
-                        let append_rows = beam.rows.clone();
-                        let fence = step_jit.new_self_k()?.clone();
-                        let (_, wall) = timed_d2d(profile, &fence, || {
-                            for &row in &append_rows {
-                                append_row_cache(step_jit, row, attempt.pos, per_pos_bytes, row_stride_bytes)?;
-                            }
-                            Ok(())
-                        })?;
-                        if profile {
-                            let (ops, bytes) = cache_append_copy_accounting(append_rows.len(), per_pos_bytes);
-                            stats.copies.d2d("cache_append", ops, bytes, wall);
-                        }
-                        let size = attempt.reserved_rows.len();
-                        let mut candidates = Vec::new();
-                        for (parent_index, (hypothesis, &row)) in beam.active.iter().zip(&beam.rows).enumerate() {
-                            let started = begin_host_copy(profile, step_jit.logits()?)?;
-                            let mut logits = read_logits_row(step_jit, row, n_vocab)?;
-                            if let Some(started) = started {
-                                stats.copies.d2h(
-                                    "decoder_logits",
-                                    1,
-                                    n_vocab * std::mem::size_of::<f32>(),
-                                    started.elapsed(),
-                                );
-                            }
-                            apply_logit_filters(
-                                &mut logits,
-                                tokenizer,
-                                &options,
-                                &hypothesis.tokens,
-                                seed.sample_begin,
-                                attempt.pos + 1 - seed.init_len,
-                                &seed.suppress_tokens,
-                            );
-                            for (token, logprob) in top_k_logprobs(&logits, size + 1) {
-                                candidates.push(BeamCandidate {
-                                    parent_index,
-                                    parent_logical_id: hypothesis.logical_id,
-                                    parent_row: row,
-                                    token_id: token as u32,
-                                    token_logprob: logprob,
-                                    sum_logprob: hypothesis.sum_logprob + logprob,
-                                });
-                            }
-                        }
-                        let (active, newly_finished, survivors) = select_beam_candidates(
-                            &beam.active,
-                            candidates,
-                            size,
-                            tokenizer.eot(),
-                            size - beam.finished.len(),
-                            &mut beam.next_logical_id,
-                        );
-                        beam.finished.extend(newly_finished);
-                        let assignment = plan_beam_rows(&attempt.reserved_rows, &survivors).map_err(decode_err)?;
-                        let fence = step_jit.self_k_cache_mut()?.clone();
-                        let (_, wall) = timed_d2d(profile, &fence, || {
-                            clone_cache_prefix(
-                                step_jit,
-                                &assignment.copies,
-                                attempt.pos + 1,
-                                per_pos_bytes,
-                                row_stride_bytes,
-                            )
-                        })?;
-                        stats.cache_clone_ops += assignment.copies.len();
-                        let (clone_ops, clone_bytes) =
-                            beam_clone_copy_accounting(assignment.copies.len(), attempt.pos + 1, per_pos_bytes);
-                        stats.cache_clone_bytes = stats.cache_clone_bytes.saturating_add(clone_bytes);
-                        if profile {
-                            stats.copies.d2d("beam_clone", clone_ops, clone_bytes, wall);
-                        }
-                        beam.active = active;
-                        beam.rows = assignment.rows;
-                    }
+
+                let rows = attempt.rows.clone();
+                let fence = step_jit.new_self_k()?.clone();
+                copies.d2d(
+                    "cache_append",
+                    rows.len() * 2,
+                    rows.len() * per_pos_bytes * 2,
+                    &fence,
+                    || -> Result<()> {
+                        rows.iter().try_for_each(|&row| append_row_cache(step_jit, row, pos, per_pos_bytes, row_stride))
+                    },
+                )?;
+                let fence = step_jit.logits()?.clone();
+                let logits = copies.d2h(
+                    "decoder_logits",
+                    rows.len(),
+                    rows.len() * n_vocab * size_of::<f32>(),
+                    &fence,
+                    || read_logits_rows(step_jit, &rows, n_vocab),
+                )?;
+                let mut candidates = Vec::new();
+                for (parent_index, (&row, mut logits)) in rows.iter().zip(logits).enumerate() {
+                    attempt.candidates(
+                        parent_index,
+                        row,
+                        &mut logits,
+                        &seed.metadata,
+                        tokenizer,
+                        &options,
+                        &mut rngs[request],
+                        &mut candidates,
+                    );
                 }
+                let assignment = attempt.advance(candidates, eot)?;
                 attempt.pos += 1;
-                attempt.generated_tokens += 1;
+
+                let cloned = assignment.copies.len();
+                let clone_bytes = cloned * attempt.pos * per_pos_bytes * 2;
+                let fence = step_jit.self_k_cache_mut()?.clone();
+                copies.d2d("beam_clone", cloned * 2, clone_bytes, &fence, || -> Result<()> {
+                    clone_cache_prefix(step_jit, &assignment.copies, attempt.pos, per_pos_bytes, row_stride)
+                })?;
+                stats.cache_clone_ops += cloned;
+                stats.cache_clone_bytes += clone_bytes;
             }
         }
 
         for request in active_requests {
-            let sample_len = request_options[request].sample_len.unwrap_or(n_text_ctx / 2);
             let done = attempts[request]
                 .as_ref()
-                .is_some_and(|attempt| attempt.is_done(sample_len, tokenizer.eot()) || attempt.pos >= n_text_ctx);
+                .is_some_and(|attempt| attempt.is_done(sample_lens[request]) || attempt.pos >= n_text_ctx);
             if !done {
                 continue;
             }
@@ -1095,14 +883,10 @@ pub(crate) fn run_fixed_slot_decode(
             let strategy_index = attempt.strategy_index;
             let mut options = request_options[request].clone();
             options.strategy = attempt.strategy;
-            options.fallback = None;
             let result = finish_attempt(attempt, &seeds[request], tokenizer, &options)?;
             allocator.release(request);
             let retry = strategies[request].get(strategy_index + 1).is_some()
-                && request_options[request]
-                    .fallback
-                    .as_ref()
-                    .is_some_and(|fallback| check_fallback(&result, fallback, &request_options[request]));
+                && check_fallback(&result, &request_options[request]);
             if retry {
                 queue.push_back((request, strategy_index + 1));
             } else {
@@ -1111,61 +895,21 @@ pub(crate) fn run_fixed_slot_decode(
         }
     }
 
-    Ok((collect_ordered(results).map_err(decode_err)?, stats, graph_profile))
+    Ok((collect_ordered(results).map_err(decode_err)?, stats))
 }
 
 // ─── Batched JIT buffer row helpers ─────────────────────────────────────────
-//
-// The batched step JIT owns max_lanes-sized buffers; each lane writes/reads
-// its row. These wrap the per-row slicing so the main loop stays readable.
 
-fn write_token_row(jit: &mut WhisperDecoderStepJit, row: usize, token: u32) -> Result<()> {
-    let buf = jit.token_mut()?;
+/// Write one `T` per `(row, value)` into a `[rows]` buffer of `T`.
+fn write_rows<T: bytemuck::Pod>(buf: &mut Buffer, rows: &[(usize, T)]) -> Result<()> {
     let dst = buf.as_host_bytes_mut()?;
-    // token is [max_lanes, 1] i32; row stride = 4 bytes
-    let off = row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("token row offset overflow"))?;
-    let tok = [token as i32];
-    let bytes: &[u8] = bytemuck::cast_slice(&tok);
-    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("token row is out of bounds"))?;
-    target.copy_from_slice(bytes);
-    Ok(())
-}
-
-fn write_pos_emb_row(jit: &mut WhisperDecoderStepJit, row: usize, emb: &[f32]) -> Result<()> {
-    let buf = jit.pos_emb_mut()?;
-    let dst = buf.as_host_bytes_mut()?;
-    // pos_emb is [max_lanes, 1, n_state] f32
-    let row_bytes =
-        emb.len().checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| decode_err("position row stride overflow"))?;
-    let off = row.checked_mul(row_bytes).ok_or_else(|| decode_err("position row offset overflow"))?;
-    let bytes: &[u8] = bytemuck::cast_slice(emb);
-    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("position row is out of bounds"))?;
-    target.copy_from_slice(bytes);
-    Ok(())
-}
-
-/// Point one decoder row at the cross-attention cache row it should read.
-fn write_cross_cache_row(jit: &mut WhisperDecoderStepJit, row: usize, owner: usize) -> Result<()> {
-    let buf = jit.cross_cache_map_mut()?;
-    let dst = buf.as_host_bytes_mut()?;
-    let off = row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("cross map row offset overflow"))?;
-    let owner = i32::try_from(owner).map_err(|_| decode_err("cross cache row exceeds i32"))?;
-    let bytes: &[u8] = bytemuck::bytes_of(&owner);
-    let target = dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("cross map row is out of bounds"))?;
-    target.copy_from_slice(bytes);
-    Ok(())
-}
-
-fn write_self_key_len_row(jit: &mut WhisperDecoderStepJit, row: usize, pos: usize) -> Result<()> {
-    let buf = jit.self_key_lens_mut()?;
-    let dst = buf.as_host_bytes_mut()?;
-    let off =
-        row.checked_mul(std::mem::size_of::<i32>()).ok_or_else(|| decode_err("self key length row offset overflow"))?;
-    let len = i32::try_from(pos).map_err(|_| decode_err("decoder position exceeds i32"))?;
-    let bytes: &[u8] = bytemuck::bytes_of(&len);
-    let target =
-        dst.get_mut(off..off + bytes.len()).ok_or_else(|| decode_err("self key length row is out of bounds"))?;
-    target.copy_from_slice(bytes);
+    for &(row, value) in rows {
+        let bytes = bytemuck::bytes_of(&value);
+        let offset = row * bytes.len();
+        dst.get_mut(offset..offset + bytes.len())
+            .ok_or_else(|| decode_err("decoder row is out of bounds"))?
+            .copy_from_slice(bytes);
+    }
     Ok(())
 }
 
@@ -1176,36 +920,29 @@ pub(crate) fn copy_device_cache_row(
     row_stride_bytes: usize,
     data: &Buffer,
 ) -> Result<()> {
-    // A raw region copy, so what matters is that the two agree -- self caches are
-    // f32 and cross caches narrower, and neither may be seeded from the other.
+    // A raw region copy, so the two must agree on the element type.
     if buf.dtype() != data.dtype() {
         return Err(decode_err("cache seed and destination row have different dtypes"));
     }
     if !std::ptr::eq(buf.allocator(), data.allocator()) {
         return Err(decode_err("cache seed and decoder row use different allocators"));
     }
-    let off = row.checked_mul(row_stride_bytes).ok_or_else(|| decode_err("cache row offset overflow"))?;
-    let end = off.checked_add(data.size()).ok_or_else(|| decode_err("cache seed end overflow"))?;
-    if end > buf.size() || data.size() > row_stride_bytes {
+    let off = row * row_stride_bytes;
+    if off + data.size() > buf.size() || data.size() > row_stride_bytes {
         return Err(decode_err("cache seed row is out of bounds"));
     }
     Ok(buf.copy_region_from(off, data, 0, data.size())?)
 }
 
-/// Read one lane's logits row `[n_vocab]` from the batched JIT output.
-/// Copy one logits row to the host over the copy engine.
-///
-/// The buffer is device-resident — managed memory on CUDA — so reading it
-/// through the host-visible mapping faults the pages across one at a time, at
-/// a measured 0.32 GB/s. Copying the row's byte range moves the same data as a
-/// single bulk transfer instead.
-fn read_logits_row(jit: &WhisperDecoderStepJit, row: usize, n_vocab: usize) -> Result<Vec<f32>> {
-    let bytes = n_vocab * std::mem::size_of::<f32>();
-    // A row past the end overruns the allocation, which `view` rejects.
-    let row_view = jit.logits()?.view(row * bytes, bytes)?;
-    let mut logits = vec![0f32; n_vocab];
-    row_view.copyout_prefix(bytemuck::cast_slice_mut(&mut logits))?;
-    Ok(logits)
+/// The logits rows of `rows`, fetched as one copy spanning the lowest to the
+/// highest: an attempt's rows are adjacent, so that is the same bytes as one
+/// transfer per row without the per-transfer latency.
+fn read_logits_rows(jit: &WhisperDecoderStepJit, rows: &[usize], n_vocab: usize) -> Result<Vec<Vec<f32>>> {
+    let (Some(&first), Some(&last)) = (rows.iter().min(), rows.iter().max()) else {
+        return Ok(Vec::new());
+    };
+    let span = read_f32(jit.logits()?, first * n_vocab, (last + 1 - first) * n_vocab)?;
+    Ok(rows.iter().map(|&row| span[(row - first) * n_vocab..(row + 1 - first) * n_vocab].to_vec()).collect())
 }
 
 // ─── Cached beam search ─────────────────────────────────────────────────────
@@ -1356,94 +1093,11 @@ pub(crate) fn finalize_beam_hypotheses(
         }
         finished.push(hypothesis);
     }
-    finished.sort_by(|a, b| {
-        let a_score = a.sum_logprob / a.tokens.len().saturating_sub(sample_begin + 1).max(1) as f32;
-        let b_score = b.sum_logprob / b.tokens.len().saturating_sub(sample_begin + 1).max(1) as f32;
-        b_score.total_cmp(&a_score).then_with(|| a.logical_id.cmp(&b.logical_id))
-    });
+    let score = |hypothesis: &BeamHypothesis| {
+        hypothesis.sum_logprob / hypothesis.tokens.len().saturating_sub(sample_begin + 1).max(1) as f32
+    };
+    finished.sort_by(|a, b| score(b).total_cmp(&score(a)).then_with(|| a.logical_id.cmp(&b.logical_id)));
     finished.into_iter().next()
-}
-
-pub(crate) struct PrefillMetadata {
-    pub(crate) initial_tokens: Vec<u32>,
-    pub(crate) sample_begin: usize,
-    pub(crate) init_len: usize,
-    pub(crate) suppress_tokens: Vec<i32>,
-    pub(crate) prefill_logits: Vec<f32>,
-    pub(crate) no_speech_prob: f32,
-    pub(crate) pos_embedding: Vec<f32>,
-    pub(crate) n_state: usize,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_prefill(
-    prefill_jit: &mut WhisperPrefillJit,
-    tokenizer: &WhisperTokenizer,
-    options: &DecodeOptions,
-    n_vocab: usize,
-    pos_embedding: &[f32],
-    n_state: usize,
-    mut copies: Option<&mut CopyProfile>,
-    graph_profile: Option<&mut GraphProfile>,
-) -> Result<PrefillMetadata> {
-    // Build initial tokens
-    let mut initial_tokens = vec![tokenizer.sot()];
-    if tokenizer.multilingual {
-        let lang = options.language.as_ref().ok_or_else(|| decode_err("language required"))?;
-        let lang_tok = tokenizer.language_token_for(lang).unwrap_or_else(|| tokenizer.sot());
-        let task_tok = match options.task {
-            WhisperTask::Transcribe => tokenizer.transcribe(),
-            WhisperTask::Translate => tokenizer.translate(),
-        };
-        initial_tokens.extend([lang_tok, task_tok]);
-    }
-    let sample_begin = initial_tokens.len();
-    let init_len = initial_tokens.len();
-    let suppress_tokens = get_suppress_tokens(tokenizer, options);
-
-    // Write tokens to prefill JIT buffer
-    {
-        let token_data: Vec<i32> = initial_tokens.iter().map(|&t| t as i32).collect();
-        let buf = prefill_jit.tokens_mut()?;
-        let started = begin_host_copy(copies.is_some(), buf)?;
-        let data = bytemuck::cast_slice(&token_data);
-        write_buf(buf, data)?;
-        if let (Some(copies), Some(started)) = (copies.as_deref_mut(), started) {
-            copies.h2d("prefill_tokens", 1, data.len(), started.elapsed());
-        }
-    }
-
-    // Execute prefill JIT (plan manages all buffers, no realize)
-    if let Some(graph_profile) = graph_profile {
-        let graph_started = std::time::Instant::now();
-        let kernels = prefill_jit.execute_profiled_static()?;
-        prefill_jit.logits()?.synchronize()?;
-        graph_profile.record(graph_started.elapsed(), kernels);
-    } else {
-        prefill_jit.execute()?;
-    }
-
-    // Read logits from output 0
-    let started = begin_host_copy(copies.is_some(), prefill_jit.logits()?)?;
-    let prefill_logits = prefill_jit.logits_to_vec::<f32>()?;
-    if let (Some(copies), Some(started)) = (copies, started) {
-        copies.d2h("prefill_logits", 1, prefill_logits.len() * std::mem::size_of::<f32>(), started.elapsed());
-    }
-    let no_speech_prob = tokenizer
-        .no_speech()
-        .map(|ns| softmax_prob(&prefill_logits[..n_vocab.min(prefill_logits.len())], ns as usize))
-        .unwrap_or(f32::NAN);
-
-    Ok(PrefillMetadata {
-        initial_tokens,
-        sample_begin,
-        init_len,
-        suppress_tokens,
-        prefill_logits,
-        no_speech_prob,
-        pos_embedding: pos_embedding.to_vec(),
-        n_state,
-    })
 }
 
 // ─── Result helpers ─────────────────────────────────────────────────────────
@@ -1459,23 +1113,14 @@ fn execute_prefill(
 /// Ported from the OpenAI reference (`transcribe.py:339-367`). When no
 /// consecutive timestamp pairs are found, returns a single segment spanning
 /// the whole token stream.
-pub fn split_into_segments(
-    tokens: &[u32],
-    tokenizer: &WhisperTokenizer,
-    window_duration: f32,
-) -> Vec<svod_arch::pipelines::audio::Segment> {
+pub fn split_into_segments(tokens: &[u32], tokenizer: &WhisperTokenizer, window_duration: f32) -> Vec<Segment> {
     let ts_begin = tokenizer.timestamp_begin();
     let is_ts = |t: u32| t >= ts_begin;
 
     // Find indices where two adjacent tokens are both timestamps — these are
     // segment boundaries (the closing ts of one segment + the opening ts of the
     // next, shared).
-    let mut boundaries: Vec<usize> = Vec::new();
-    for i in 1..tokens.len() {
-        if is_ts(tokens[i - 1]) && is_ts(tokens[i]) {
-            boundaries.push(i);
-        }
-    }
+    let boundaries: Vec<usize> = (1..tokens.len()).filter(|&i| is_ts(tokens[i - 1]) && is_ts(tokens[i])).collect();
 
     let mut segments = Vec::new();
     let terminal_timestamp = tokens.last().is_some_and(|&token| is_ts(token))
@@ -1520,6 +1165,22 @@ pub fn split_into_segments(
     segments
 }
 
+/// How far into the window the reference decoder moves its read head after
+/// this token stream: to the last completed timestamp pair when the stream
+/// ended mid-segment, otherwise past the whole window. A stream ending in a
+/// lone timestamp means nothing was spoken after it, and a stream without
+/// timestamp pairs is one segment covering the window.
+pub fn window_seek(tokens: &[u32], tokenizer: &WhisperTokenizer, window_duration: f32) -> f32 {
+    let ts_begin = tokenizer.timestamp_begin();
+    let is_ts = |t: u32| t >= ts_begin;
+    let lone_ending = tokens.len() >= 2 && !is_ts(tokens[tokens.len() - 2]) && is_ts(tokens[tokens.len() - 1]);
+    let last_pair = tokens.windows(2).rposition(|pair| is_ts(pair[0]) && is_ts(pair[1]));
+    match last_pair {
+        Some(index) if !lone_ending => token_to_seconds(tokens[index], ts_begin).clamp(0.0, window_duration),
+        _ => window_duration,
+    }
+}
+
 /// Decode one timestamp-bounded slice into a [`Segment`].
 fn segment_from_tokens(slice: &[u32], tokenizer: &WhisperTokenizer, ts_begin: u32, window_duration: f32) -> Segment {
     let extent = window_duration.max(0.0);
@@ -1541,7 +1202,7 @@ fn segment_from_tokens(slice: &[u32], tokenizer: &WhisperTokenizer, ts_begin: u3
 
 /// Convert a timestamp token id to seconds: `(id - timestamp_begin) / TOKENS_PER_SECOND`.
 fn token_to_seconds(token: u32, ts_begin: u32) -> f32 {
-    (token - ts_begin) as f32 / super::config::TOKENS_PER_SECOND
+    (token - ts_begin) as f32 / TOKENS_PER_SECOND
 }
 
 fn finish_decode(
@@ -1586,61 +1247,27 @@ fn sampling_rng(options: &DecodeOptions, request: usize) -> StdRng {
     StdRng::seed_from_u64(seed)
 }
 
-fn decode_err(msg: &str) -> Error {
+pub(crate) fn decode_err(msg: &str) -> Error {
     Error::Decode { msg: msg.into() }
-}
-
-// ─── JIT buffer helpers ─────────────────────────────────────────────────────
-
-fn write_uncached(jit: &mut WhisperDecoderJit, tokens: &[i32]) -> Result<()> {
-    let buf = jit.tokens_mut()?;
-    write_buf(buf, bytemuck::cast_slice(tokens))
-}
-
-fn read_uncached(jit: &WhisperDecoderJit, n_vocab: usize) -> Result<Vec<f32>> {
-    let buf = jit.output()?;
-    read_buf(buf, n_vocab)
-}
-
-/// Write data directly into the buffer's host-visible mapping.
-/// `as_host_bytes_mut` syncs pending GPU work before returning the slice.
-/// Subsequent `execute()` sees our writes (unified memory / BAR).
-fn write_buf(buf: &svod_device::Buffer, data: &[u8]) -> Result<()> {
-    let dst = buf.as_host_bytes_mut()?;
-    let n = data.len().min(dst.len());
-    dst[..n].copy_from_slice(&data[..n]);
-    Ok(())
-}
-
-/// Read data directly from the buffer's host-visible mapping.
-/// `as_host_bytes` syncs pending GPU work before returning the slice.
-fn read_buf(buf: &svod_device::Buffer, n: usize) -> Result<Vec<f32>> {
-    let src = buf.as_host_bytes()?;
-    let n = n.min(src.len() / std::mem::size_of::<f32>());
-    Ok(bytemuck::cast_slice(&src[..n * std::mem::size_of::<f32>()]).to_vec())
 }
 
 // ─── Logit filter helpers ───────────────────────────────────────────────────
 
+/// The tokens suppressed at every step: the caller's list, with `-1` standing
+/// for Whisper's non-speech set, plus the prompt specials.
 fn get_suppress_tokens(tokenizer: &WhisperTokenizer, options: &DecodeOptions) -> Vec<i32> {
     let mut tokens: Vec<i32> = options.suppress_tokens.clone().unwrap_or_default();
     if tokens.contains(&-1) {
         tokens.retain(|&t| t >= 0);
-        for &t in &tokenizer.non_speech_tokens() {
-            tokens.push(t as i32);
-        }
+        tokens.extend(tokenizer.non_speech_tokens().iter().map(|&t| t as i32));
     }
-    tokens.extend([
-        tokenizer.transcribe() as i32,
-        tokenizer.translate() as i32,
-        tokenizer.sot() as i32,
-        tokenizer.sot_prev() as i32,
-        tokenizer.sot_lm() as i32,
-    ]);
-    if let Some(ns) = tokenizer.no_speech() {
-        tokens.push(ns as i32);
-    }
-    tokens.sort();
+    tokens.extend(
+        [tokenizer.transcribe(), tokenizer.translate(), tokenizer.sot(), tokenizer.sot_prev(), tokenizer.sot_lm()]
+            .into_iter()
+            .chain(tokenizer.no_speech())
+            .map(|t| t as i32),
+    );
+    tokens.sort_unstable();
     tokens.dedup();
     tokens
 }
@@ -1654,33 +1281,21 @@ fn apply_logit_filters(
     step: usize,
     suppress_tokens: &[i32],
 ) {
-    let eot = tokenizer.eot() as usize;
+    let suppress = |logits: &mut [f32], token: usize| {
+        if let Some(logit) = logits.get_mut(token) {
+            *logit = f32::NEG_INFINITY;
+        }
+    };
     if options.suppress_blank && step == 0 {
-        for &t in &tokenizer.encode(" ") {
-            if (t as usize) < logits.len() {
-                logits[t as usize] = f32::NEG_INFINITY;
-            }
+        for &t in tokenizer.blank_tokens() {
+            suppress(logits, t as usize);
         }
-        if eot < logits.len() {
-            logits[eot] = f32::NEG_INFINITY;
-        }
+        suppress(logits, tokenizer.eot() as usize);
     }
     for &t in suppress_tokens {
-        if t >= 0 && (t as usize) < logits.len() {
-            logits[t as usize] = f32::NEG_INFINITY;
+        if let Ok(token) = usize::try_from(t) {
+            suppress(logits, token);
         }
-    }
-    let specials =
-        [tokenizer.transcribe(), tokenizer.translate(), tokenizer.sot(), tokenizer.sot_prev(), tokenizer.sot_lm()];
-    for &t in &specials {
-        if (t as usize) < logits.len() {
-            logits[t as usize] = f32::NEG_INFINITY;
-        }
-    }
-    if let Some(ns) = tokenizer.no_speech()
-        && (ns as usize) < logits.len()
-    {
-        logits[ns as usize] = f32::NEG_INFINITY;
     }
     apply_timestamp_rules(logits, tokenizer, tokens, sample_begin, options);
 }
@@ -1700,110 +1315,77 @@ fn apply_timestamp_rules(
     }
 
     let sampled = &tokens[sample_begin.min(tokens.len())..];
-    let last_was_ts = sampled.last().map(|&t| (t as usize) >= ts_begin).unwrap_or(false);
-    let penultimate_was_ts = sampled.len() < 2 || (sampled[sampled.len() - 2] as usize) >= ts_begin;
+    let is_ts = |t: &u32| (*t as usize) >= ts_begin;
+    let last_was_ts = sampled.last().is_some_and(is_ts);
+    let penultimate_was_ts = sampled.len() < 2 || is_ts(&sampled[sampled.len() - 2]);
 
     if last_was_ts {
         if penultimate_was_ts {
-            for t in &mut logits[ts_begin..] {
-                *t = f32::NEG_INFINITY;
-            }
+            logits[ts_begin..].fill(f32::NEG_INFINITY);
         } else {
-            for t in &mut logits[..eot] {
-                *t = f32::NEG_INFINITY;
-            }
+            logits[..eot].fill(f32::NEG_INFINITY);
         }
     }
 
-    let ts_tokens: Vec<u32> = sampled.iter().filter(|&&t| (t as usize) >= ts_begin).copied().collect();
-    if !ts_tokens.is_empty() {
-        let last_ts = if last_was_ts && !penultimate_was_ts {
-            ts_tokens.last().copied().unwrap_or(0) as usize
-        } else {
-            ts_tokens.last().copied().unwrap_or(0) as usize + 1
-        };
-        for (i, t) in logits[ts_begin..].iter_mut().enumerate() {
-            if ts_begin + i < last_ts {
-                *t = f32::NEG_INFINITY;
-            }
-        }
+    if let Some(&last_ts) = sampled.iter().rev().find(|t| is_ts(t)) {
+        // Timestamps never go backwards; after a closing timestamp the next
+        // opening one may repeat it.
+        let first_allowed = (last_ts as usize + usize::from(!(last_was_ts && !penultimate_was_ts))).min(logits.len());
+        logits[ts_begin..first_allowed].fill(f32::NEG_INFINITY);
     }
 
     if tokens.len() == sample_begin {
-        for t in &mut logits[..ts_begin] {
-            *t = f32::NEG_INFINITY;
-        }
+        logits[..ts_begin].fill(f32::NEG_INFINITY);
         if let Some(max_init) = options.max_initial_timestamp {
-            let last_allowed = ts_begin + (max_init / 0.02).round() as usize;
+            let last_allowed = ts_begin + (max_init * TOKENS_PER_SECOND).round() as usize;
             if last_allowed + 1 < logits.len() {
-                for t in &mut logits[last_allowed + 1..] {
-                    *t = f32::NEG_INFINITY;
-                }
+                logits[last_allowed + 1..].fill(f32::NEG_INFINITY);
             }
         }
     }
 
     let ts_logprob = logsumexp(&logits[ts_begin..]);
-    let text_max = logits[..ts_begin].iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let text_max = logits[..ts_begin].iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if ts_logprob > text_max {
-        for t in &mut logits[..eot] {
-            *t = f32::NEG_INFINITY;
-        }
+        logits[..eot].fill(f32::NEG_INFINITY);
     }
 }
 
 // ─── Math helpers ───────────────────────────────────────────────────────────
 
 fn argmax(arr: &[f32]) -> usize {
-    arr.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    arr.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0)
 }
 
 fn softmax_prob(logits: &[f32], idx: usize) -> f32 {
-    let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let sum: f32 = logits.iter().map(|&l| (l - max_val).exp()).sum();
-    if idx < logits.len() { (logits[idx] - max_val).exp() / sum.max(1e-10) } else { 0.0 }
+    logits.get(idx).map_or(0.0, |&logit| (logit - logsumexp(logits)).exp())
 }
 
-fn log_softmax(logits: &[f32], idx: usize) -> f32 {
-    let max_val = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let sum: f32 = logits.iter().map(|&l| (l - max_val).exp()).sum();
-    let logsum = sum.ln() + max_val;
-    if idx < logits.len() { logits[idx] - logsum } else { f32::NEG_INFINITY }
-}
-
+/// `len(text) / len(zlib(text))`, the reference's repetition measure; its
+/// framing overhead is part of the ratio, so the codec matters.
 fn compression_ratio_text(text: &str) -> f32 {
+    use std::io::Write;
     let raw = text.as_bytes();
     if raw.is_empty() {
         return 1.0;
     }
-    use std::io::Write;
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     let _ = encoder.write_all(raw);
-    let clen = encoder.finish().unwrap_or_default().len().max(1);
-    raw.len() as f32 / clen as f32
+    let compressed = encoder.finish().unwrap_or_default().len().max(1);
+    raw.len() as f32 / compressed as f32
 }
 
 /// Multinomial sampling from logits at temperature T. Matches the OpenAI
-/// reference's `Categorical(logits=logits/T).sample()` (`decoding.py:283`),
-/// which PyTorch implements as a numerically stable softmax (max-subtract
-/// before exp) followed by inverse-CDF sampling.
+/// reference's `Categorical(logits=logits/T).sample()` (`decoding.py:283`):
+/// a max-subtracted softmax followed by inverse-CDF sampling.
 fn sample_from_logits(logits: &[f32], temperature: f32, rng: &mut impl RngExt) -> u32 {
-    // Max-subtract for numerical stability: exp(x - m) avoids overflow on
-    // large positive logits. The max is a no-op for the sampling distribution
-    // (it's a constant shift that cancels in normalization).
-    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) / temperature;
-    let probs: Vec<f32> = logits.iter().map(|&l| ((l / temperature) - max_val).exp()).collect();
-    let sum: f32 = probs.iter().copied().sum();
-    let mut r = rng.random::<f32>() * sum;
-    for (i, &p) in probs.iter().enumerate() {
-        r -= p;
-        if r <= 0.0 {
-            return i as u32;
-        }
-    }
-    (probs.len() - 1) as u32
+    let (weights, sum) = scaled_exp(logits, temperature);
+    let mut remaining = rng.random::<f32>() * sum;
+    weights
+        .iter()
+        .position(|&weight| {
+            remaining -= weight;
+            remaining <= 0.0
+        })
+        .unwrap_or(weights.len().saturating_sub(1)) as u32
 }

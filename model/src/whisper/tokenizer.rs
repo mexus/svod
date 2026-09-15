@@ -129,29 +129,24 @@ pub struct WhisperTokenizer {
     pub multilingual: bool,
     /// Number of languages supported.
     pub num_languages: usize,
-    /// Configured language code (e.g. "en").
-    pub language: Option<String>,
-    /// Configured task: "transcribe" or "translate".
-    pub task: Option<String>,
+    /// Whisper's non-speech set, encoded once: the symbols, brackets and
+    /// music marks its decoding suppresses.
+    non_speech: Vec<u32>,
+    /// The encoding of a single space, suppressed as a first token.
+    blank: Vec<u32>,
 }
 
 impl WhisperTokenizer {
     /// Build a tokenizer from a `.tiktoken` rank file (base64-encoded BPE
     /// ranks, one per line: `<base64_token> <rank>`).
-    pub fn new(
-        tiktoken_data: &str,
-        multilingual: bool,
-        num_languages: usize,
-        language: Option<&str>,
-        task: Option<&str>,
-    ) -> Result<Self> {
+    pub fn new(tiktoken_data: &str, multilingual: bool, num_languages: usize) -> Result<Self> {
         // Parse the .tiktoken file into a rank map.
         let encoder: rustc_hash::FxHashMap<Vec<u8>, u32> = parse_tiktoken_ranks(tiktoken_data)?;
 
         let n_vocab_base = encoder.len();
 
         // Build Whisper special tokens with sequential IDs starting at n_vocab_base.
-        let specials = build_special_tokens(multilingual, num_languages);
+        let specials = build_special_tokens(num_languages);
         let mut special_tokens: rustc_hash::FxHashMap<String, u32> = rustc_hash::FxHashMap::default();
         for (i, s) in specials.iter().enumerate() {
             special_tokens.insert(s.clone(), (n_vocab_base + i) as u32);
@@ -164,14 +159,11 @@ impl WhisperTokenizer {
         // Convert special_tokens to std HashMap for our lookups
         let special_tokens: HashMap<String, u32> = special_tokens.into_iter().collect();
 
-        Ok(Self {
-            bpe,
-            special_tokens,
-            multilingual,
-            num_languages,
-            language: language.map(|s| s.to_string()),
-            task: task.map(|s| s.to_string()),
-        })
+        let mut tokenizer =
+            Self { bpe, special_tokens, multilingual, num_languages, non_speech: Vec::new(), blank: Vec::new() };
+        tokenizer.non_speech = tokenizer.encode_non_speech();
+        tokenizer.blank = tokenizer.encode(" ");
+        Ok(tokenizer)
     }
 
     // ─── Tokenizer loading helpers ────────────────────────────────────────────
@@ -184,14 +176,14 @@ impl WhisperTokenizer {
         } else {
             include_str!("assets/gpt2.tiktoken")
         };
-        Self::new(data, multilingual, num_languages, Some("en"), Some("transcribe"))
+        Self::new(data, multilingual, num_languages)
     }
 
     /// Load the tiktoken data from a local file.
     pub fn from_file(path: &std::path::Path, multilingual: bool, num_languages: usize) -> Result<Self> {
         let data =
             std::fs::read_to_string(path).map_err(|e| Error::Tokenizer { msg: format!("read tiktoken file: {e}") })?;
-        Self::new(&data, multilingual, num_languages, Some("en"), Some("transcribe"))
+        Self::new(&data, multilingual, num_languages)
     }
 
     // ─── Special token accessors ────────────────────────────────────────────
@@ -230,28 +222,6 @@ impl WhisperTokenizer {
 
     pub fn timestamp_begin(&self) -> u32 {
         self.special_tokens["<|0.00|>"]
-    }
-
-    /// SOT sequence: `[sot, language, task]`.
-    pub fn sot_sequence(&self) -> Vec<u32> {
-        let mut seq = vec![self.sot()];
-        if let Some(lang) = &self.language
-            && let Some(&tok) = self.special_tokens.get(&format!("<|{lang}|>"))
-        {
-            seq.push(tok);
-        }
-        if let Some(task) = &self.task {
-            let tok = if task == "transcribe" { self.transcribe() } else { self.translate() };
-            seq.push(tok);
-        }
-        seq
-    }
-
-    /// SOT sequence including `<|notimestamps|>`.
-    pub fn sot_sequence_including_notimestamps(&self) -> Vec<u32> {
-        let mut seq = self.sot_sequence();
-        seq.push(self.no_timestamps());
-        seq
     }
 
     /// All language token IDs.
@@ -295,7 +265,8 @@ impl WhisperTokenizer {
 
     /// Decode token IDs to text, filtering out special/timestamp tokens.
     pub fn decode(&self, token_ids: &[u32]) -> String {
-        let filtered: Vec<u32> = token_ids.iter().filter(|&&t| t < self.timestamp_begin()).copied().collect();
+        let timestamp_begin = self.timestamp_begin();
+        let filtered: Vec<u32> = token_ids.iter().filter(|&&t| t < timestamp_begin).copied().collect();
         self.bpe.decode(&filtered).unwrap_or_default()
     }
 
@@ -315,12 +286,6 @@ impl WhisperTokenizer {
             }
         }
         result
-    }
-
-    /// Split tokens into words and their constituent token lists.
-    /// Uses CoreBPE's `decode_bytes` for accurate per-token byte mapping.
-    pub fn split_to_word_tokens(&self, tokens: &[u32]) -> (Vec<String>, Vec<Vec<u32>>) {
-        self.split_to_word_tokens_for_language(tokens, self.language.as_deref())
     }
 
     /// OpenAI-compatible word grouping for a resolved language. Languages
@@ -374,7 +339,16 @@ impl WhisperTokenizer {
     }
 
     /// Non-speech tokens to suppress (matching whisper/tokenizer.py).
-    pub fn non_speech_tokens(&self) -> Vec<u32> {
+    pub fn non_speech_tokens(&self) -> &[u32] {
+        &self.non_speech
+    }
+
+    /// The encoding of a single space.
+    pub fn blank_tokens(&self) -> &[u32] {
+        &self.blank
+    }
+
+    fn encode_non_speech(&self) -> Vec<u32> {
         let symbols = "\"#()*+/:;<=>@[\\]^_`{|}~「」『』";
         let extras = [
             "<<",
@@ -471,7 +445,7 @@ fn parse_tiktoken_ranks(data: &str) -> Result<rustc_hash::FxHashMap<Vec<u8>, u32
     Ok(ranks)
 }
 
-fn build_special_tokens(_multilingual: bool, num_languages: usize) -> Vec<String> {
+fn build_special_tokens(num_languages: usize) -> Vec<String> {
     let mut specials = vec!["<|endoftext|>".to_string(), "<|startoftranscript|>".to_string()];
     for (code, _) in LANGUAGES.iter().take(num_languages) {
         specials.push(format!("<|{code}|>"));

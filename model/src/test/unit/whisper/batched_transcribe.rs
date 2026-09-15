@@ -5,24 +5,14 @@
 
 use svod_arch::pipelines::audio::Transcriber;
 
-use crate::whisper::transcribe::bounded_window_batches;
 use crate::whisper::{
     DecodeOptions, DecodeStrategy, ModelDimensions, N_TEXT_CTX, WhisperAlignedTranscriber, WhisperPlan, WhisperSize,
     WhisperTask, WhisperTokenizer,
 };
 
-#[test]
-fn long_form_windows_are_consumed_in_bounded_retention_batches() {
-    let windows: Vec<_> = (0..19).collect();
-    let batches: Vec<_> = bounded_window_batches(&windows, 8).map(|batch| batch.to_vec()).collect();
-
-    assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [8, 8, 3]);
-    assert_eq!(batches.concat(), windows);
-}
-
 /// Loads whisper-tiny + tokenizer from HuggingFace Hub and builds a
 /// transcriber with the same options soroka uses.
-fn tiny_transcriber(decoder_slots: usize) -> WhisperAlignedTranscriber {
+fn tiny_transcriber(encoder_batch: usize, decoder_slots: usize) -> WhisperAlignedTranscriber {
     let repo = "openai/whisper-tiny";
     let dims = ModelDimensions::for_size(WhisperSize::Tiny);
     let model = crate::whisper::Whisper::from_hub(repo, "main", dims).unwrap();
@@ -34,10 +24,11 @@ fn tiny_transcriber(decoder_slots: usize) -> WhisperAlignedTranscriber {
         task: WhisperTask::Transcribe,
         language: None,
         strategy: DecodeStrategy::Greedy,
-        fallback: None,
+        fallback_temperatures: Vec::new(),
         ..DecodeOptions::default()
     };
     let mut plan = WhisperPlan::for_model(&model.dims, WhisperSize::Tiny);
+    plan.encoder_batch = encoder_batch;
     plan.decoder_slots = decoder_slots;
     plan.alignment_batch = 1;
     WhisperAlignedTranscriber::new_with_plan(model, tokenizer, options, WhisperSize::Tiny, 480_000, plan).unwrap()
@@ -60,8 +51,11 @@ fn fake_windows() -> Vec<Vec<f32>> {
 #[test]
 #[ignore = "heavy: real whisper-tiny weights + JIT compile"]
 fn generalized_scheduler_runs_greedy_with_slot_refill() {
-    let mut refill = tiny_transcriber(1);
-    let mut concurrent = tiny_transcriber(2);
+    // `encoder_batch = 1` also walks the bounded-retention path: the two
+    // windows are consumed one encoder batch at a time, so a batch's cross-K/V
+    // snapshots are released before the next one is projected.
+    let mut refill = tiny_transcriber(1, 1);
+    let mut concurrent = tiny_transcriber(2, 2);
     refill.set_language(Some("en".to_string()));
     concurrent.set_language(Some("en".to_string()));
 
@@ -86,9 +80,16 @@ fn generalized_scheduler_runs_greedy_with_slot_refill() {
         active_steps < capped_steps,
         "fake-window greedy decode approached the per-window token cap instead of emitting EOT: {active_steps}/{capped_steps} aggregate steps"
     );
-    assert!(decode.meta["row_utilization"].parse::<f64>().unwrap() > 0.0);
-    assert!(profile.stage("cross_kv_projection").is_some());
+    // Utilization is no longer pre-divided: the stage reports the two sums.
+    let capacity_steps = decode.meta["capacity_row_steps"].parse::<usize>().unwrap();
+    assert!(capacity_steps >= active_steps, "more row-steps ran than the compiled slots could hold");
+    assert!(active_steps as f64 / capacity_steps as f64 > 0.0, "the scheduler reported no row utilization");
+    assert!(profile.stage("mel").is_some());
+    assert!(profile.stage("encoder").is_some());
+    // The cross-attention caches now come out of the prefill graph, so there is
+    // no separate cross-K/V projection stage to report.
     assert!(profile.stage("prefill").is_some());
+    assert!(profile.stage("cross_kv_projection").is_none());
     assert!(profile.stage("decoder_scheduler_total").is_some());
     assert!(profile.stage("alignment_graph").is_some());
     assert!(profile.stage("alignment_cpu_dtw").is_some());
@@ -106,7 +107,7 @@ fn generalized_scheduler_runs_beam_sizes_two_and_five() {
         let options = DecodeOptions {
             language: Some("en".to_string()),
             strategy: DecodeStrategy::Beam { size },
-            fallback: None,
+            fallback_temperatures: Vec::new(),
             sample_len: Some(4),
             ..DecodeOptions::default()
         };
@@ -151,7 +152,7 @@ fn seeded_sampling_is_independent_of_slot_geometry() {
     let options = DecodeOptions {
         language: Some("en".to_string()),
         strategy: DecodeStrategy::Sample { temperature: 0.8 },
-        fallback: None,
+        fallback_temperatures: Vec::new(),
         sampling_seed: Some(42),
         sample_len: Some(4),
         ..DecodeOptions::default()

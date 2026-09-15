@@ -16,6 +16,9 @@ fn tiny_dims() -> ModelDimensions {
     let mut dims = ModelDimensions::for_size(WhisperSize::Tiny);
     dims.n_text_ctx = 8;
     dims.n_vocab = 64;
+    // The step concatenates the passed cache with the K/V it just projected, so
+    // both live at `cache_dtype()`; f32 also buys the tolerances asserted below.
+    dims.dtype = DType::Float32;
     dims
 }
 
@@ -27,7 +30,6 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     let d_head = dims.n_text_state / dims.n_text_head;
     let layer_heads = dims.n_text_layer * dims.n_text_head;
     let token = Tensor::zeros(&[batch, 1], DType::Int32);
-    let pos_emb = Tensor::zeros(&[batch, 1, dims.n_text_state], DType::Float32);
     let self_k = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32);
     let self_v = Tensor::zeros(&[batch, dims.n_text_ctx, layer_heads, d_head], DType::Float32);
     let cross_k = Tensor::zeros(&[batch, n_audio_ctx, layer_heads, d_head], DType::Float32);
@@ -37,7 +39,7 @@ fn forward_step_fixed_batch_keeps_batch_concrete() {
     let cross_map = Tensor::from_slice((0..batch as i32).collect::<Vec<_>>());
 
     let (logits, new_k, new_v) =
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map).unwrap();
+        model.decode_step(&token, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map).unwrap();
     assert_eq!(logits.dim_const(0).unwrap(), batch);
     assert_eq!(new_k.dim_const(0).unwrap(), batch);
     assert_eq!(new_v.dim_const(0).unwrap(), batch);
@@ -56,7 +58,6 @@ fn shared_cross_cache_map_matches_a_replicated_cache() {
     let d_head = dims.n_text_state / dims.n_text_head;
     let layer_heads = dims.n_text_layer * dims.n_text_head;
     let token = Tensor::from_slice([1i32, 2]).try_reshape([batch, 1]).unwrap();
-    let pos_emb = Tensor::randn(&[batch, 1, dims.n_text_state]).unwrap();
     let self_k = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let self_v = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let key_lens = Tensor::from_slice([2i32, 5]);
@@ -69,7 +70,7 @@ fn shared_cross_cache_map_matches_a_replicated_cache() {
     };
 
     let step = |ck: &Tensor, cv: &Tensor, map: &[i32]| {
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, ck, cv, &key_lens, &Tensor::from_slice(map)).unwrap().0
+        model.decode_step(&token, &self_k, &self_v, ck, cv, &key_lens, &Tensor::from_slice(map)).unwrap().0
     };
     let shared = step(&cross_k, &cross_v, &[0, 0]);
     let replicated = step(&owner(&cross_k), &owner(&cross_v), &[0, 1]);
@@ -92,7 +93,6 @@ fn cross_cache_with_fewer_rows_than_lanes_matches_a_per_lane_cache() {
     let d_head = dims.n_text_state / dims.n_text_head;
     let layer_heads = dims.n_text_layer * dims.n_text_head;
     let token = Tensor::from_slice([1i32, 2]).try_reshape([batch, 1]).unwrap();
-    let pos_emb = Tensor::randn(&[batch, 1, dims.n_text_state]).unwrap();
     let self_k = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let self_v = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let key_lens = Tensor::from_slice([2i32, 5]);
@@ -102,7 +102,7 @@ fn cross_cache_with_fewer_rows_than_lanes_matches_a_per_lane_cache() {
     let twice = |cache: &Tensor| Tensor::cat(&[cache, cache], 0).unwrap();
 
     let step = |ck: &Tensor, cv: &Tensor, map: &[i32]| {
-        model.decode_step(&token, &pos_emb, &self_k, &self_v, ck, cv, &key_lens, &Tensor::from_slice(map)).unwrap().0
+        model.decode_step(&token, &self_k, &self_v, ck, cv, &key_lens, &Tensor::from_slice(map)).unwrap().0
     };
     let one_row = step(&narrow_k, &narrow_v, &[0, 0]);
     let two_rows = step(&twice(&narrow_k), &twice(&narrow_v), &[0, 1]);
@@ -143,12 +143,10 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
     // also exercises the partial kernel's ragged subgroup tile.
     dims.n_audio_ctx = 1500;
     dims.n_text_ctx = 7;
-    dims.dtype = DType::Float32;
     let model = Whisper::empty(dims.clone());
     let (batch, d_head) = (2, dims.n_text_state / dims.n_text_head);
     let layer_heads = dims.n_text_layer * dims.n_text_head;
     let token = Tensor::from_slice([1i32, 2]).try_reshape([batch, 1]).unwrap();
-    let pos_emb = Tensor::randn(&[batch, 1, dims.n_text_state]).unwrap();
     let self_k = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let self_v = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let cross_k = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
@@ -171,7 +169,7 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
             model
                 .decoder
                 .forward_step_with_attention_mode(
-                    &token, &pos_emb, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map, mode,
+                    &token, &self_k, &self_v, &cross_k, &cross_v, &key_lens, &cross_map, mode,
                 )
                 .unwrap()
                 .0

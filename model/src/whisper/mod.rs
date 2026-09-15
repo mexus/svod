@@ -39,18 +39,15 @@ pub use attention::MultiHeadAttention;
 pub use blocks::sinusoids;
 pub use config::{ModelDimensions, WhisperSize};
 pub use decode::{
-    DecodeOptions, DecodeResult, DecodeStrategy, FallbackPolicy, LanguageDetection, WhisperTask, detect_language,
-    split_into_segments,
+    DecodeOptions, DecodeResult, DecodeStrategy, LanguageDetection, WhisperTask, detect_language, split_into_segments,
+    window_seek,
 };
 pub use decoder::{DecoderBlock, TextDecoder};
-pub use dtw::{
-    WordTiming, dtw, find_alignment_path, find_alignment_path_selected, median_filter, path_to_word_timings,
-};
+pub use dtw::{WordTiming, dtw, find_alignment_path_selected, median_filter, path_to_word_timings};
 pub use encoder::{AudioEncoder, EncoderBlock};
 pub use error::{Error, Result};
 pub use jit::{
-    WhisperAlignmentJit, WhisperAlignmentModel, WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit,
-    WhisperEncoderJit, WhisperPrefillJit,
+    WhisperAlignmentJit, WhisperAlignmentModel, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit,
 };
 pub use mel::{WhisperMel, WhisperMelJit};
 pub use model::Whisper;
