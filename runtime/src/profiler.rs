@@ -862,7 +862,9 @@ impl RunProfile {
     /// to combine per-window profiles when transcribing a batch one window at
     /// a time.
     ///
-    /// Same-named stages SUM their `wall`. A model that pre-accumulates a
+    /// Same-named stages SUM their `wall`, and a metadata entry both sides hold
+    /// as a number sums too, so counters accumulate like wall does; any other
+    /// entry the incoming stage overwrites. A model that pre-accumulates a
     /// stage's `wall` to a whole-run total (rather than this window's slice)
     /// must therefore emit one profile for the run and not also rely on this
     /// per-window merge, or the total double-counts.
@@ -873,12 +875,24 @@ impl RunProfile {
                 Some(existing) => {
                     existing.wall += stage.wall;
                     existing.kernels.extend(stage.kernels);
-                    existing.meta.extend(stage.meta);
+                    for (key, value) in stage.meta {
+                        let summed = existing.meta.get(&key).and_then(|held| sum_numeric(held, &value));
+                        existing.meta.insert(key, summed.unwrap_or(value));
+                    }
                 }
                 None => self.stages.push(stage),
             }
         }
     }
+}
+
+/// The sum of two numeric metadata values in the wider of their two forms:
+/// integers stay integers, anything with a fraction prints with three places.
+fn sum_numeric(a: &str, b: &str) -> Option<String> {
+    if let (Ok(a), Ok(b)) = (a.parse::<i64>(), b.parse::<i64>()) {
+        return Some((a + b).to_string());
+    }
+    Some(format!("{:.3}", a.parse::<f64>().ok()? + b.parse::<f64>().ok()?))
 }
 
 /// One aggregated table row (kernels grouped by entry point).

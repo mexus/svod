@@ -151,6 +151,42 @@ fn merge_accumulates_same_named_stages_and_appends_new() {
     assert_eq!(enc.meta.get("chunks").map(String::as_str), Some("4"), "folded in");
 }
 
+/// Metadata both stages carry is summed in the wider of the two forms; a key
+/// only one side holds, or a value that is not a number, is kept as it was.
+#[test]
+fn merge_sums_numeric_metadata_and_keeps_the_rest() {
+    let stage = |pairs: &[(&str, &str)]| {
+        let mut stage = StageProfile::host("decode", Duration::from_millis(1));
+        stage.meta.extend(pairs.iter().map(|(key, value)| ((*key).to_string(), (*value).to_string())));
+        let mut profile = RunProfile::default();
+        profile.push(stage);
+        profile
+    };
+
+    let mut a = stage(&[
+        ("dispatches", "2"),
+        ("accumulated_wall_ms", "1.500"),
+        ("widened", "2"),
+        ("timing_semantics", "host wall"),
+        ("only_a", "7"),
+    ]);
+    a.merge(stage(&[
+        ("dispatches", "3"),
+        ("accumulated_wall_ms", "0.25"),
+        ("widened", "0.5"),
+        ("timing_semantics", "device wall"),
+        ("only_b", "9"),
+    ]));
+
+    let meta = &a.stage("decode").unwrap().meta;
+    assert_eq!(meta["dispatches"], "5", "integers stay integers");
+    assert_eq!(meta["accumulated_wall_ms"], "1.750", "floats print with three decimals");
+    assert_eq!(meta["widened"], "2.500", "a fractional side widens the whole sum");
+    assert_eq!(meta["timing_semantics"], "device wall", "a non-numeric value is still overwritten");
+    assert_eq!(meta["only_a"], "7", "a key only the left side holds is kept");
+    assert_eq!(meta["only_b"], "9", "a key only the right side holds is folded in");
+}
+
 fn resource(id: u64) -> TopologyResource {
     TopologyResource { id, owner: DeviceSpec::Cpu, start: 0, end: 64 }
 }
