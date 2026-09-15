@@ -103,7 +103,7 @@ impl AudioEncoder {
         let x = x.try_permute(&[0, 2, 1])?;
 
         // Add positional embedding [n_audio_ctx, D]
-        let x = x.try_add(&self.positional_embedding)?.cast(dtype);
+        let x = x.try_add(&self.positional_embedding)?.cast(dtype.clone());
 
         let (batch, sequence) = (x.dim_const(0)?, x.dim_const(1)?);
         let padded_sequence = encoder_padded_sequence_len(&x.device(), &x.dtype(), sequence);
@@ -125,11 +125,10 @@ impl AudioEncoder {
             x = x.narrow(1, 0usize, sequence)?;
         }
 
-        // Final LayerNorm + cast to fp32. The encoder output is consumed by the
-        // host (copyout_prefix into Vec<f32>) and fed to the prefill/step JITs
-        // which cast it back to the compute dtype. Keeping the output fp32 means
-        // the host read path works regardless of compute dtype.
-        Ok(scoped("ln_post", || self.ln_post.forward(&x))?.cast(DType::Float32))
+        // The features feed the decoder's cross projection, which runs in the
+        // compute dtype, so they stay in it: the final norm keeps its checkpoint
+        // precision and would otherwise widen the largest encoder output.
+        Ok(scoped("ln_post", || self.ln_post.forward(&x))?.cast(dtype))
     }
 }
 

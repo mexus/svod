@@ -154,7 +154,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Strategy::Beam => DecodeStrategy::Beam { size: args.beam_size },
             Strategy::Sample => DecodeStrategy::Sample { temperature: args.temperature },
         },
-        fallback: (!args.no_fallback).then(Default::default),
+        fallback_temperatures: if args.no_fallback {
+            Vec::new()
+        } else {
+            DecodeOptions::default().fallback_temperatures
+        },
         sampling_seed: args.sampling_seed,
         ..Default::default()
     };

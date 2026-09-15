@@ -1,50 +1,34 @@
 //! Prepared Whisper recognition and aligned-transcription stages.
 //!
-//! Each decode window runs through a concrete-capacity encoder, one reusable
-//! cross-K/V projection, token prefill, and fixed-slot cached decoding. The
-//! independent aligner replays finalized tokens through a teacher-forced graph
-//! and computes word timings on the host.
+//! Each decode window runs through a concrete-capacity encoder, a prefill that
+//! also projects the cross-attention caches, and fixed-slot cached decoding.
+//! The independent aligner replays finalized tokens through a teacher-forced
+//! graph and computes word timings on the host.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use snafu::Snafu;
-use svod_arch::pipelines::audio::{CoverageRepair, Transcriber, Transcript};
+use svod_arch::pipelines::audio::{Segment, Transcriber, Transcript, WindowAdvance};
+use svod_dtype::DType;
 use svod_runtime::{RunProfile, StageProfile};
 use svod_tensor::PrepareConfig;
 
 use crate::jit::InputSpec;
 
-use super::aligner::{AlignmentProfile, WhisperAligner, WhisperAlignmentInput};
-use super::config::{N_AUDIO_CTX, N_FRAMES, N_SAMPLES, N_TEXT_CTX, SAMPLE_RATE};
+use super::aligner::{WhisperAligner, WhisperAlignmentInput};
+use super::config::{N_AUDIO_CTX, N_FRAMES, N_SAMPLES, SAMPLE_RATE, WhisperSize};
 use super::decode::{
-    DecodeOptions, DecodeScheduleStats, attempt_strategies, detect_language_profile, prefill_decode_seed,
-    run_fixed_slot_decode, strategy_width,
+    DecodeOptions, DecodeResult, attempt_strategies, decode_err, detect_language_profile, prefill_decode_seed,
+    run_fixed_slot_decode, split_into_segments, strategy_width, window_seek,
 };
-use super::jit::{WhisperCrossKvJit, WhisperDecoderJit, WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
+use super::jit::{WhisperDecoderStepJit, WhisperEncoderJit, WhisperPrefillJit};
 use super::mel::{WhisperMel, WhisperMelJit};
 use super::model::Whisper;
 use super::plan::WhisperPlan;
-use super::profile::{CopyProfile, GraphProfile, begin_host_copy};
+use super::profile::{CopyProfile, GraphProfile};
 use super::tokenizer::WhisperTokenizer;
 
 pub use svod_arch::rnnt::Word;
-
-fn timed_d2d<T>(
-    enabled: bool,
-    fence: &svod_device::Buffer,
-    work: impl FnOnce() -> Result<T, TranscribeError>,
-) -> Result<(T, Duration), TranscribeError> {
-    if !enabled {
-        return work().map(|value| (value, Duration::ZERO));
-    }
-    // Exclude prior graph work, then wait for the complete async transfer group.
-    // This is synchronized host wall, not a hardware SDMA timestamp.
-    fence.synchronize()?;
-    let started = Instant::now();
-    let value = work()?;
-    fence.synchronize()?;
-    Ok((value, started.elapsed()))
-}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -54,7 +38,7 @@ pub enum TranscribeError {
         #[snafu(source(from(crate::jit::JitError, Box::new)))]
         source: Box<crate::jit::JitError>,
     },
-    #[snafu(display("{source}"))]
+    #[snafu(display("{source}"), context(false))]
     Model {
         #[snafu(source(from(super::error::Error, Box::new)))]
         source: Box<super::error::Error>,
@@ -71,6 +55,8 @@ pub enum TranscribeError {
     },
 }
 
+type Result<T> = std::result::Result<T, TranscribeError>;
+
 /// Prepared timestamp-enabled recognizer. It owns only recognition graphs;
 /// word alignment is a separate [`WhisperAligner`] stage.
 pub struct WhisperRecognizer {
@@ -82,14 +68,15 @@ pub struct WhisperRecognizer {
     /// mel and encoder graphs are per row and only the batch's rows are read.
     samples: Vec<f32>,
     encoder_jit: WhisperEncoderJit,
-    decoder_jit: WhisperDecoderJit,
-    cross_kv_jit: WhisperCrossKvJit,
+    /// Prompt plus one window of encoder features; also answers language
+    /// detection, since its first logits row depends on SOT alone.
     prefill_jit: WhisperPrefillJit,
     /// Concrete fixed-capacity step graph. Requests keep stable row ownership;
     /// inactive rows execute with ignored outputs.
-    batched_step_jit: WhisperDecoderStepJit,
+    step_jit: WhisperDecoderStepJit,
     tokenizer: WhisperTokenizer,
     options: DecodeOptions,
+    feature_dtype: DType,
     n_audio_state: usize,
     n_vocab: usize,
     n_text_ctx: usize,
@@ -97,14 +84,48 @@ pub struct WhisperRecognizer {
     /// Max concurrent decode lanes in the batched step JIT.
     max_lanes: usize,
     plan: WhisperPlan,
-    pos_embedding: Vec<f32>,
 }
 
 struct RecognizedWindow {
-    result: super::decode::DecodeResult,
+    result: DecodeResult,
     cross_k: svod_device::Buffer,
     cross_v: svod_device::Buffer,
     audio_samples: usize,
+    segments: Vec<Segment>,
+    consumed_sec: f32,
+}
+
+impl RecognizedWindow {
+    fn new(
+        result: DecodeResult,
+        (cross_k, cross_v): (svod_device::Buffer, svod_device::Buffer),
+        audio_samples: usize,
+        tokenizer: &WhisperTokenizer,
+    ) -> Self {
+        let window_sec = audio_samples as f32 / SAMPLE_RATE as f32;
+        let segments = split_into_segments(&result.tokens, tokenizer, window_sec);
+        let consumed_sec = window_seek(&result.tokens, tokenizer, window_sec);
+        Self { result, cross_k, cross_v, audio_samples, segments, consumed_sec }
+    }
+
+    fn transcript(&self, words: Vec<Word>) -> Transcript {
+        Transcript {
+            text: self.result.text.clone(),
+            words,
+            segments: self.segments.clone(),
+            language: self.result.language.clone(),
+            consumed_sec: Some(self.consumed_sec),
+        }
+    }
+}
+
+/// Fold one batch's stages and its copy stages into the run profile.
+fn fold_profile(run: &mut Option<RunProfile>, batch: Option<RunProfile>, copies: &CopyProfile) {
+    let (Some(run), Some(mut batch)) = (run.as_mut(), batch) else { return };
+    for stage in copies.stages() {
+        batch.push(stage);
+    }
+    run.merge(batch);
 }
 
 impl WhisperRecognizer {
@@ -113,7 +134,7 @@ impl WhisperRecognizer {
         tokenizer: WhisperTokenizer,
         options: DecodeOptions,
         max_chunk_samples: usize,
-    ) -> Result<Self, TranscribeError> {
+    ) -> Result<Self> {
         let plan = WhisperPlan::for_recognizer(&model.dims);
         Self::new_with_plan(model, tokenizer, options, max_chunk_samples, plan)
     }
@@ -124,122 +145,91 @@ impl WhisperRecognizer {
         options: DecodeOptions,
         max_chunk_samples: usize,
         plan: WhisperPlan,
-    ) -> Result<Self, TranscribeError> {
-        plan.validate().map_err(|message| TranscribeError::Model {
-            source: Box::new(super::error::Error::Decode { msg: message.to_string() }),
-        })?;
-        options.validate().map_err(|message| TranscribeError::Model {
-            source: Box::new(super::error::Error::Decode { msg: message.to_string() }),
-        })?;
+    ) -> Result<Self> {
+        plan.validate().map_err(decode_err)?;
+        options.validate()?;
         if attempt_strategies(&options).into_iter().any(|strategy| strategy_width(strategy) > plan.decoder_slots) {
-            return Err(TranscribeError::Model {
-                source: Box::new(super::error::Error::Decode {
-                    msg: "configured decode beam width exceeds decoder_slots".to_string(),
-                }),
-            });
+            return Err(decode_err("configured decode beam width exceeds decoder_slots").into());
         }
-        let n_mels = model.dims.n_mels;
-        let n_audio_state = model.dims.n_audio_state;
-        let n_vocab = model.dims.n_vocab;
-        let n_text_ctx = model.dims.n_text_ctx;
-        let n_text_head = model.dims.n_text_head;
         if max_chunk_samples > N_SAMPLES {
-            return Err(TranscribeError::Model {
-                source: Box::new(super::error::Error::Decode {
-                    msg: format!("Whisper decode windows are limited to {N_SAMPLES} samples, got {max_chunk_samples}"),
-                }),
-            });
+            let msg = format!("Whisper decode windows are limited to {N_SAMPLES} samples, got {max_chunk_samples}");
+            return Err(decode_err(&msg).into());
         }
-        let max_batch = plan.encoder_batch;
-
+        let dims = &model.dims;
+        let (n_mels, n_audio_state, n_vocab, n_text_ctx) =
+            (dims.n_mels, dims.n_audio_state, dims.n_vocab, dims.n_text_ctx);
+        let (layer_heads, d_head) = (dims.n_text_layer * dims.n_text_head, dims.n_text_state / dims.n_text_head);
+        let (feature_dtype, cache_dtype) = (dims.dtype.clone(), dims.cache_dtype());
+        let (max_batch, max_lanes) = (plan.encoder_batch, plan.decoder_slots);
         let prepare_config = PrepareConfig::from_env();
 
         let mut mel_jit = WhisperMelJit::new(WhisperMel::new(n_mels));
-        let samples_spec = InputSpec::f32(&[max_batch, N_SAMPLES]).device_local();
-        mel_jit.prepare_with_config(samples_spec, &PrepareConfig::device_local())?;
+        mel_jit.prepare_with_config(
+            InputSpec::f32(&[max_batch, N_SAMPLES]).device_local(),
+            &PrepareConfig::device_local(),
+        )?;
         let samples = vec![0.0f32; max_batch * N_SAMPLES];
 
         // Encoder JIT: [max_batch, n_mels, N_FRAMES], device-local on both
         // sides — the mel input is only ever written by an on-device copy
         // from the mel JIT's output.
         let mut encoder_jit = WhisperEncoderJit::new(model.clone());
-        let mel_spec = InputSpec::f32(&[max_batch, n_mels, N_FRAMES]).device_local();
-        encoder_jit.prepare_with_config(mel_spec, &PrepareConfig::device_local())?;
-
-        let n_text_state = model.dims.n_text_state;
-        let n_text_layer = model.dims.n_text_layer;
-        let d_head = n_text_state / n_text_head;
-        let cross_cache_spec = InputSpec::f32(&[1, N_AUDIO_CTX, n_text_layer * n_text_head, d_head]).device_local();
-
-        // Cache-consuming decoder used for language detection.
-        let mut decoder_jit = WhisperDecoderJit::new(model.clone());
-        let tokens_spec = InputSpec::i32(&[1, 1]);
-        decoder_jit.prepare_with_config(
-            cross_cache_spec.clone(),
-            cross_cache_spec.clone(),
-            tokens_spec,
-            &prepare_config,
-        )?;
-
-        // Cross-attention K/V projection is token-independent. Compile it once
-        // and execute it once per encoder window, before any fallback attempts.
-        let mut cross_kv_jit = WhisperCrossKvJit::new(model.clone());
-        cross_kv_jit.prepare_with_config(
-            InputSpec::f32(&[1, N_AUDIO_CTX, model.dims.n_text_state]),
+        encoder_jit.prepare_with_config(
+            InputSpec::f32(&[max_batch, n_mels, N_FRAMES]).device_local(),
             &PrepareConfig::device_local(),
         )?;
 
-        // Timestamp-enabled prefill has a structural, model-specific prefix:
-        // multilingual [SOT, language, task], English-only [SOT].
-        // Compiled once at construction, reused every window.
-        let init_len = if model.is_multilingual() { 3 } else { 1 };
+        // The prompt is structural: multilingual [SOT, language, task],
+        // English-only [SOT]. Compiled once at that length, reused every window.
+        let prompt_len = if model.is_multilingual() { 3 } else { 1 };
         let mut prefill_jit = WhisperPrefillJit::new(model.clone());
         prefill_jit.prepare_with_config(
-            InputSpec::i32(&[1, init_len]),
-            cross_cache_spec.clone(),
-            cross_cache_spec,
+            InputSpec::i32(&[1, prompt_len]),
+            InputSpec::new(&[1, N_AUDIO_CTX, n_audio_state], feature_dtype.clone()).device_local(),
             &prepare_config,
         )?;
 
-        let n_text_head_local = n_text_head;
-
         // Fixed concrete batch keeps tensor-core dimensions static and avoids
-        // cache movement when lanes finish.
-        let max_lanes = plan.decoder_slots;
-        let mut batched_step_jit = WhisperDecoderStepJit::new(model.clone());
-        batched_step_jit.prepare_with_config(
+        // cache movement when lanes finish. There is one cross cache per
+        // concurrently-decoded window, not per decoder row: every row of an
+        // attempt reads its owner's cache through `cross_cache_map`.
+        let cache = |rows: usize, positions: usize| {
+            InputSpec::new(&[rows, positions, layer_heads, d_head], cache_dtype.clone()).device_local()
+        };
+        let mut step_jit = WhisperDecoderStepJit::new(model);
+        step_jit.prepare_with_config(
             InputSpec::i32(&[max_lanes, 1]),
-            InputSpec::f32(&[max_lanes, 1, n_text_state]),
-            InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-            InputSpec::f32(&[max_lanes, N_TEXT_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-            InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
-            InputSpec::f32(&[max_lanes, N_AUDIO_CTX, n_text_layer * n_text_head_local, d_head]).device_local(),
+            cache(max_lanes, n_text_ctx),
+            cache(max_lanes, n_text_ctx),
+            cache(max_batch, N_AUDIO_CTX),
+            cache(max_batch, N_AUDIO_CTX),
+            InputSpec::i32(&[max_lanes]),
             InputSpec::i32(&[max_lanes]),
             &prepare_config,
         )?;
-
-        // Read positional embedding eagerly (static weight, reused every window).
-        // Cast to fp32 — the host decode math (pos_embedding slicing in decode.rs)
-        // operates on Vec<f32>, while the weight loads at dims.dtype (fp16).
-        let pos_embedding = model.decoder.positional_embedding.cast(svod_dtype::DType::Float32).to_vec::<f32>()?;
+        // The step graph runs every lane each dispatch, reserved or not, and
+        // the kernels index the cross cache and the positional embedding by
+        // these values without bounds checks, so every lane must hold a valid
+        // one from the start. Zero is always in range; seeding and stepping
+        // then overwrite the lanes in use.
+        step_jit.cross_cache_map_mut()?.as_host_bytes_mut()?.fill(0);
+        step_jit.self_key_lens_mut()?.as_host_bytes_mut()?.fill(0);
 
         Ok(Self {
             mel_jit,
             samples,
             encoder_jit,
-            decoder_jit,
-            cross_kv_jit,
             prefill_jit,
-            batched_step_jit,
+            step_jit,
             tokenizer,
             options,
+            feature_dtype,
             n_audio_state,
             n_vocab,
             n_text_ctx,
             max_batch,
             max_lanes,
             plan,
-            pos_embedding,
         })
     }
 
@@ -259,6 +249,153 @@ impl WhisperRecognizer {
     pub fn plan(&self) -> &WhisperPlan {
         &self.plan
     }
+
+    /// Recognize up to one encoder batch of windows.
+    fn recognize_windows(
+        &mut self,
+        windows: &[&[f32]],
+        profile: bool,
+    ) -> Result<(Vec<RecognizedWindow>, Option<RunProfile>, CopyProfile)> {
+        let b = windows.len();
+        let mut copies = CopyProfile::new(profile);
+        if b == 0 {
+            return Ok((Vec::new(), profile.then(RunProfile::default), copies));
+        }
+        if b > self.max_batch {
+            return Err(decode_err("more windows than the encoder batch").into());
+        }
+        let (mut encoder, mut language, mut prefill, mut steps) = (
+            GraphProfile::new(profile),
+            GraphProfile::new(profile),
+            GraphProfile::new(profile),
+            GraphProfile::new(profile),
+        );
+
+        // ── Mel: pad-or-trim the windows, upload them to the mel JIT's
+        // device-local input, run it, and copy its output across on-device.
+        let started = Instant::now();
+        for (row, window) in self.samples.chunks_mut(N_SAMPLES).zip(windows) {
+            WhisperMel::pad_or_trim_into(window, row);
+        }
+        let src: &[u8] = bytemuck::cast_slice(&self.samples[..b * N_SAMPLES]);
+        let fence = self.mel_jit.samples_mut()?.clone();
+        let mel_jit = &mut self.mel_jit;
+        copies.h2d("mel_input", 1, src.len(), &fence, || -> Result<()> {
+            Ok(mel_jit.samples_mut()?.copyin_at(0, src)?)
+        })?;
+        self.mel_jit.execute()?;
+        self.encoder_jit.mel_mut()?.copy_from(self.mel_jit.output()?)?;
+        let t_mel = started.elapsed();
+
+        // ── Encode: one dispatch for b windows ───────────────────────────
+        encoder.execute(
+            &mut self.encoder_jit,
+            |jit| -> Result<()> { Ok(jit.execute()?) },
+            |jit| {
+                let kernels = jit.execute_profiled_static()?;
+                jit.output()?.synchronize()?;
+                Ok(kernels)
+            },
+        )?;
+
+        // ── Prefill per window: its cross caches are projected from its slice
+        // of the encoder output, and its seed outlives every fallback attempt.
+        let feature_bytes = N_AUDIO_CTX * self.n_audio_state * self.feature_dtype.bytes();
+        let mut detected_language: Option<String> = None;
+        let mut seeds = Vec::with_capacity(b);
+        let mut decode_options = Vec::with_capacity(b);
+        for bi in 0..b {
+            let features = self.encoder_jit.output()?.clone();
+            let prefill_jit = &mut self.prefill_jit;
+            copies.d2d("prefill_features", 1, feature_bytes, &features, || -> Result<()> {
+                Ok(prefill_jit.audio_features_mut()?.copy_region_from(
+                    0,
+                    &features,
+                    bi * feature_bytes,
+                    feature_bytes,
+                )?)
+            })?;
+
+            let mut options = self.options.clone();
+            if !self.tokenizer.multilingual {
+                options.language = Some("en".into());
+            } else if options.language.is_none() {
+                // One recording is one language: the first window's answer
+                // serves the rest of this call.
+                if detected_language.is_none() {
+                    let detection = detect_language_profile(
+                        &mut self.prefill_jit,
+                        self.n_vocab,
+                        &self.tokenizer,
+                        &mut copies,
+                        &mut language,
+                    )?;
+                    detected_language = Some(detection.language);
+                }
+                options.language.clone_from(&detected_language);
+            }
+            seeds.push(prefill_decode_seed(
+                &mut self.prefill_jit,
+                &self.tokenizer,
+                &options,
+                self.n_text_ctx,
+                self.n_vocab,
+                &mut copies,
+                &mut prefill,
+            )?);
+            decode_options.push(options);
+        }
+
+        let started = Instant::now();
+        let (results, stats) = run_fixed_slot_decode(
+            &seeds,
+            &decode_options,
+            &mut self.step_jit,
+            self.max_lanes,
+            &self.tokenizer,
+            self.n_text_ctx,
+            self.n_vocab,
+            &mut copies,
+            &mut steps,
+        )?;
+        let t_scheduler = started.elapsed();
+
+        let recognized = results
+            .into_iter()
+            .zip(&decode_options)
+            .zip(seeds)
+            .zip(windows)
+            .map(|(((mut result, options), seed), window)| {
+                if result.should_skip(options) {
+                    result.clear_speech();
+                }
+                RecognizedWindow::new(result, seed.into_cross_kv(), window.len(), &self.tokenizer)
+            })
+            .collect();
+
+        let prof = if profile {
+            let mut p = RunProfile::default();
+            p.push(StageProfile::host("mel", t_mel));
+            p.push(encoder.stage("encoder"));
+            if language.executions != 0 {
+                p.push(language.stage("language_detection"));
+            }
+            p.push(prefill.stage("prefill"));
+            let mut step = steps.stage("decoder_step");
+            stats.annotate(&mut step);
+            p.push(step);
+            let mut scheduler = StageProfile::host("decoder_scheduler_total", t_scheduler);
+            scheduler.meta.insert(
+                "timing_semantics".into(),
+                "non-additive end-to-end control-loop wall including host work, decoder_step waits, and synchronized cache/control copies".into(),
+            );
+            p.push(scheduler);
+            Some(p)
+        } else {
+            None
+        };
+        Ok((recognized, prof, copies))
+    }
 }
 
 impl Transcriber for WhisperRecognizer {
@@ -269,46 +406,27 @@ impl Transcriber for WhisperRecognizer {
     }
 
     /// Whisper ends a window at its last emitted timestamp, which routinely
-    /// lands short of the window edge, so the pipeline re-decodes what it left.
-    fn coverage_repair(&self) -> Option<CoverageRepair> {
-        Some(CoverageRepair::default())
+    /// lands short of the window edge, so the next window starts there.
+    fn window_advance(&self) -> Option<WindowAdvance> {
+        Some(WindowAdvance::default())
     }
 
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
         profile: bool,
-    ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
+    ) -> Result<(Vec<Transcript>, Option<RunProfile>)> {
         let mut transcripts = Vec::with_capacity(windows.len());
-        let mut profile_result = profile.then(RunProfile::default);
+        let mut run = profile.then(RunProfile::default);
         // Recognized windows own device-resident cross K/V snapshots. Consume
         // them one encoder batch at a time instead of retaining one pair for
         // every window in a long recording.
-        for batch in bounded_window_batches(windows, self.max_batch) {
-            let (recognized, mut batch_profile, copies) = self.recognize_windows(batch, profile)?;
-            transcripts.extend(recognized.into_iter().map(|recognized| {
-                let segments = super::decode::split_into_segments(
-                    &recognized.result.tokens,
-                    &self.tokenizer,
-                    recognized.audio_samples as f32 / SAMPLE_RATE as f32,
-                );
-                Transcript {
-                    text: recognized.result.text,
-                    words: Vec::new(),
-                    segments,
-                    language: recognized.result.language,
-                }
-            }));
-            if let Some(batch_profile) = &mut batch_profile {
-                for stage in copies.stages() {
-                    batch_profile.push(stage);
-                }
-            }
-            if let (Some(profile_result), Some(batch_profile)) = (&mut profile_result, batch_profile) {
-                profile_result.merge(batch_profile);
-            }
+        for batch in windows.chunks(self.max_batch) {
+            let (recognized, batch_profile, copies) = self.recognize_windows(batch, profile)?;
+            transcripts.extend(recognized.iter().map(|window| window.transcript(Vec::new())));
+            fold_profile(&mut run, batch_profile, &copies);
         }
-        Ok((transcripts, profile_result))
+        Ok((transcripts, run))
     }
 }
 
@@ -325,9 +443,9 @@ impl WhisperAlignedTranscriber {
         model: Whisper,
         tokenizer: WhisperTokenizer,
         options: DecodeOptions,
-        size: super::config::WhisperSize,
+        size: WhisperSize,
         max_chunk_samples: usize,
-    ) -> Result<Self, TranscribeError> {
+    ) -> Result<Self> {
         let plan = WhisperPlan::for_model(&model.dims, size);
         Self::new_with_plan(model, tokenizer, options, size, max_chunk_samples, plan)
     }
@@ -336,15 +454,15 @@ impl WhisperAlignedTranscriber {
         model: Whisper,
         tokenizer: WhisperTokenizer,
         options: DecodeOptions,
-        size: super::config::WhisperSize,
+        size: WhisperSize,
         max_chunk_samples: usize,
         plan: WhisperPlan,
-    ) -> Result<Self, TranscribeError> {
-        plan.validate().map_err(|message| TranscribeError::Model {
-            source: Box::new(super::error::Error::Decode { msg: message.to_string() }),
-        })?;
-        let aligner = WhisperAligner::new(model.clone(), size, plan.alignment_batch)
-            .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
+    ) -> Result<Self> {
+        plan.validate().map_err(decode_err)?;
+        // The aligner replays what recognition emitted, so it is sized to the
+        // decode budget rather than to the whole text context.
+        let max_tokens = options.sample_len.unwrap_or(model.dims.n_text_ctx / 2);
+        let aligner = WhisperAligner::new(model.clone(), size, plan.alignment_batch, max_tokens)?;
         let recognizer = WhisperRecognizer::new_with_plan(model, tokenizer, options, max_chunk_samples, plan)?;
         Ok(Self { recognizer, aligner })
     }
@@ -355,47 +473,34 @@ impl WhisperAlignedTranscriber {
 
     fn align_recognized(
         &mut self,
-        recognized: Vec<RecognizedWindow>,
-        profile: bool,
+        recognized: &[RecognizedWindow],
         copies: &mut CopyProfile,
-    ) -> Result<(Vec<Transcript>, AlignmentProfile), TranscribeError> {
+        profile: &mut Option<RunProfile>,
+    ) -> Result<Vec<Transcript>> {
         let task = self.recognizer.options.task;
         let tokenizer = &self.recognizer.tokenizer;
         let mut transcripts = Vec::with_capacity(recognized.len());
-        let mut alignment_profile = AlignmentProfile::default();
         for chunk in recognized.chunks(self.recognizer.plan.alignment_batch) {
             let inputs: Vec<_> = chunk
                 .iter()
-                .map(|recognized| WhisperAlignmentInput {
-                    cross_k: &recognized.cross_k,
-                    cross_v: &recognized.cross_v,
-                    decoded_tokens: &recognized.result.tokens,
-                    token_probs: &recognized.result.token_probs,
-                    language: recognized.result.language.as_deref(),
+                .map(|window| WhisperAlignmentInput {
+                    cross_k: &window.cross_k,
+                    cross_v: &window.cross_v,
+                    decoded_tokens: &window.result.tokens,
+                    token_probs: &window.result.token_probs,
+                    language: window.result.language.as_deref(),
                     task,
-                    audio_samples: recognized.audio_samples,
+                    audio_samples: window.audio_samples,
                 })
                 .collect();
-            let (words, batch_profile) = self
-                .aligner
-                .align_batch_profiled(&inputs, tokenizer, profile.then_some(&mut *copies))
-                .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-            alignment_profile.merge(batch_profile);
-            for (recognized, words) in chunk.iter().zip(words) {
-                let segments = super::decode::split_into_segments(
-                    &recognized.result.tokens,
-                    tokenizer,
-                    recognized.audio_samples as f32 / SAMPLE_RATE as f32,
-                );
-                transcripts.push(Transcript {
-                    text: recognized.result.text.clone(),
-                    words,
-                    segments,
-                    language: recognized.result.language.clone(),
-                });
+            let (words, alignment) = self.aligner.align_batch_profiled(&inputs, tokenizer, copies)?;
+            if let Some(profile) = profile {
+                profile.push(alignment.graph.stage("alignment_graph"));
+                profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
             }
+            transcripts.extend(chunk.iter().zip(words).map(|(window, words)| window.transcript(words)));
         }
-        Ok((transcripts, alignment_profile))
+        Ok(transcripts)
     }
 }
 
@@ -407,245 +512,23 @@ impl Transcriber for WhisperAlignedTranscriber {
     }
 
     /// Whisper ends a window at its last emitted timestamp, which routinely
-    /// lands short of the window edge, so the pipeline re-decodes what it left.
-    fn coverage_repair(&self) -> Option<CoverageRepair> {
-        Some(CoverageRepair::default())
+    /// lands short of the window edge, so the next window starts there.
+    fn window_advance(&self) -> Option<WindowAdvance> {
+        Some(WindowAdvance::default())
     }
 
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
         profile: bool,
-    ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
+    ) -> Result<(Vec<Transcript>, Option<RunProfile>)> {
         let mut transcripts = Vec::with_capacity(windows.len());
-        let mut profile_result = profile.then(RunProfile::default);
-        for batch in bounded_window_batches(windows, self.recognizer.max_batch) {
+        let mut run = profile.then(RunProfile::default);
+        for batch in windows.chunks(self.recognizer.max_batch) {
             let (recognized, mut batch_profile, mut copies) = self.recognizer.recognize_windows(batch, profile)?;
-            let (batch_transcripts, alignment) = self.align_recognized(recognized, profile, &mut copies)?;
-            transcripts.extend(batch_transcripts);
-            if let Some(batch_profile) = &mut batch_profile {
-                batch_profile.push(alignment.graph.stage("alignment_graph"));
-                batch_profile.push(StageProfile::host("alignment_cpu_dtw", alignment.cpu_dtw_wall));
-                for stage in copies.stages() {
-                    batch_profile.push(stage);
-                }
-            }
-            if let (Some(profile_result), Some(batch_profile)) = (&mut profile_result, batch_profile) {
-                profile_result.merge(batch_profile);
-            }
+            transcripts.extend(self.align_recognized(&recognized, &mut copies, &mut batch_profile)?);
+            fold_profile(&mut run, batch_profile, &copies);
         }
-        Ok((transcripts, profile_result))
-    }
-}
-
-pub(crate) fn bounded_window_batches<T>(windows: &[T], batch_size: usize) -> impl Iterator<Item = &[T]> {
-    windows.chunks(batch_size.max(1))
-}
-
-impl WhisperRecognizer {
-    fn recognize_windows(
-        &mut self,
-        windows: &[&[f32]],
-        profile: bool,
-    ) -> Result<(Vec<RecognizedWindow>, Option<RunProfile>, CopyProfile), TranscribeError> {
-        if windows.is_empty() {
-            return Ok((Vec::new(), profile.then(RunProfile::default), CopyProfile::default()));
-        }
-
-        let d = self.n_audio_state;
-        let item_stride = N_AUDIO_CTX * d;
-        let max_batch = self.max_batch;
-        let n_vocab = self.n_vocab;
-        let n_text_ctx = self.n_text_ctx;
-
-        let mut recognized = Vec::with_capacity(windows.len());
-        let mut prof = profile.then(RunProfile::default);
-        let mut encoder_profile = GraphProfile::default();
-        let mut cross_kv_profile = GraphProfile::default();
-        let mut language_profile = GraphProfile::default();
-        let mut prefill_profile = GraphProfile::default();
-        let mut decoder_step_profile = GraphProfile::default();
-        let mut decode_stats = DecodeScheduleStats::default();
-        let mut copies = CopyProfile::default();
-        let (mut t_mel, mut t_decoder_scheduler) = (Duration::ZERO, Duration::ZERO);
-
-        for batch_start in (0..windows.len()).step_by(max_batch) {
-            let b = (windows.len() - batch_start).min(max_batch);
-
-            // ── Mel: pad-or-trim the windows, upload them to the mel JIT's
-            // device-local input, run it, and copy its output across on-device.
-            let t = Instant::now();
-            for (row, window) in self.samples.chunks_mut(N_SAMPLES).zip(&windows[batch_start..batch_start + b]) {
-                WhisperMel::pad_or_trim_into(window, row);
-            }
-            let src_bytes: &[u8] = bytemuck::cast_slice(&self.samples[..b * N_SAMPLES]);
-            let copy_started = begin_host_copy(profile, self.mel_jit.samples_mut()?)
-                .map_err(|source| TranscribeError::Model { source: Box::new(source) })?;
-            self.mel_jit.samples_mut()?.copyin_at(0, src_bytes)?;
-            if let Some(started) = copy_started {
-                copies.h2d("mel_input", 1, src_bytes.len(), started.elapsed());
-            }
-            self.mel_jit.execute()?;
-            self.encoder_jit.mel_mut()?.copy_from(self.mel_jit.output()?)?;
-            t_mel += t.elapsed();
-
-            // ── Encode: one dispatch for b windows ───────────────────────────
-            if profile {
-                let graph_started = Instant::now();
-                let kernels = self.encoder_jit.execute_profiled_static()?;
-                self.encoder_jit.output()?.synchronize()?;
-                encoder_profile.record(graph_started.elapsed(), kernels);
-            } else {
-                self.encoder_jit.execute()?;
-            }
-
-            let out_buf = self.encoder_jit.output()?;
-
-            let mut seeds = Vec::with_capacity(b);
-            let mut decode_options = Vec::with_capacity(b);
-
-            // Cross projection and token prefill remain per-window. Their
-            // immutable device-local seeds are retained until the shared
-            // scheduler accepts a primary or fallback attempt.
-            for bi in 0..b {
-                let base = bi * item_stride;
-
-                // Project encoder features once for all fallback prefills.
-                let (_, projection_wall) = timed_d2d(profile, out_buf, || {
-                    let buf = self.cross_kv_jit.audio_features_mut()?;
-                    buf.copy_region_from(
-                        0,
-                        out_buf,
-                        base * std::mem::size_of::<f32>(),
-                        item_stride * std::mem::size_of::<f32>(),
-                    )?;
-                    Ok(())
-                })?;
-                if profile {
-                    copies.d2d("projection_input", 1, item_stride * std::mem::size_of::<f32>(), projection_wall);
-                }
-                if profile {
-                    let graph_started = Instant::now();
-                    let kernels = self.cross_kv_jit.execute_profiled_static()?;
-                    self.cross_kv_jit.cross_k()?.synchronize()?;
-                    cross_kv_profile.record(graph_started.elapsed(), kernels);
-                } else {
-                    self.cross_kv_jit.execute()?;
-                }
-                let cross_k_fence = self.cross_kv_jit.cross_k()?.clone();
-                let mut fanout_bytes = 0usize;
-                let (_, fanout_wall) = timed_d2d(profile, &cross_k_fence, || {
-                    let src = self.cross_kv_jit.cross_k()?;
-                    fanout_bytes = fanout_bytes.saturating_add(src.size().saturating_mul(2));
-                    self.prefill_jit.prepared_cross_k_mut()?.copy_region_from(0, src, 0, src.size())?;
-                    self.decoder_jit.prepared_cross_k_mut()?.copy_region_from(0, src, 0, src.size())?;
-                    let src = self.cross_kv_jit.cross_v()?;
-                    fanout_bytes = fanout_bytes.saturating_add(src.size().saturating_mul(2));
-                    self.prefill_jit.prepared_cross_v_mut()?.copy_region_from(0, src, 0, src.size())?;
-                    self.decoder_jit.prepared_cross_v_mut()?.copy_region_from(0, src, 0, src.size())?;
-                    Ok(())
-                })?;
-                if profile {
-                    copies.d2d("cross_fanout", 4, fanout_bytes, fanout_wall);
-                }
-
-                let mut options = self.options.clone();
-                if !self.tokenizer.multilingual {
-                    options.language = Some("en".to_string());
-                } else if options.language.is_none() {
-                    let detection = detect_language_profile(
-                        &mut self.decoder_jit,
-                        n_vocab,
-                        &self.tokenizer,
-                        profile.then_some(&mut copies),
-                        profile.then_some(&mut language_profile),
-                    )
-                    .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-                    options.language = Some(detection.language);
-                }
-
-                let seed = prefill_decode_seed(
-                    &mut self.prefill_jit,
-                    &self.tokenizer,
-                    &options,
-                    n_text_ctx,
-                    n_vocab,
-                    &self.pos_embedding,
-                    self.n_audio_state,
-                    profile.then_some(&mut copies),
-                    profile.then_some(&mut prefill_profile),
-                )
-                .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-                seeds.push(seed);
-                decode_options.push(options);
-            }
-
-            let t = Instant::now();
-            let (results, batch_stats, batch_graph_profile) = run_fixed_slot_decode(
-                &seeds,
-                &decode_options,
-                &mut self.batched_step_jit,
-                self.max_lanes,
-                &self.tokenizer,
-                n_text_ctx,
-                n_vocab,
-                profile,
-            )
-            .map_err(|error| TranscribeError::Model { source: Box::new(error) })?;
-            decode_stats.merge(batch_stats);
-            decoder_step_profile.merge(batch_graph_profile);
-            t_decoder_scheduler += t.elapsed();
-
-            for (bi, ((mut result, options), seed)) in results.into_iter().zip(&decode_options).zip(seeds).enumerate() {
-                if result.should_skip(options) {
-                    result.clear_speech();
-                }
-                let (cross_k, cross_v) = seed.into_cross_kv();
-                recognized.push(RecognizedWindow {
-                    result,
-                    cross_k,
-                    cross_v,
-                    audio_samples: windows[batch_start + bi].len(),
-                });
-            }
-        }
-
-        if let Some(p) = &mut prof {
-            let encoder_executions = encoder_profile.executions;
-            p.push(StageProfile::host("mel", t_mel));
-            p.push(encoder_profile.stage("encoder"));
-            p.push(cross_kv_profile.stage("cross_kv_projection"));
-            if language_profile.executions != 0 {
-                p.push(language_profile.stage("language_detection"));
-            }
-            p.push(prefill_profile.stage("prefill"));
-            let mut decoder_step = decoder_step_profile.stage("decoder_step");
-            decoder_step.meta.insert("dispatches".into(), decode_stats.dispatches.to_string());
-            decoder_step.meta.insert("dispatch_semantics".into(), "logical decoder graph executions".into());
-            decoder_step.meta.insert("active_row_steps".into(), decode_stats.active_row_steps.to_string());
-            decoder_step.meta.insert("reserved_row_steps".into(), decode_stats.reserved_row_steps.to_string());
-            decoder_step.meta.insert("capacity_row_steps".into(), decode_stats.capacity_row_steps.to_string());
-            decoder_step.meta.insert("cache_clone_ops".into(), decode_stats.cache_clone_ops.to_string());
-            decoder_step.meta.insert("cache_clone_bytes".into(), decode_stats.cache_clone_bytes.to_string());
-            decoder_step.meta.insert("attempts".into(), decode_stats.attempts.to_string());
-            decoder_step.meta.insert("fallback_attempts".into(), decode_stats.fallback_attempts.to_string());
-            let utilization = if decode_stats.capacity_row_steps == 0 {
-                0.0
-            } else {
-                decode_stats.active_row_steps as f64 / decode_stats.capacity_row_steps as f64
-            };
-            decoder_step.meta.insert("row_utilization".into(), format!("{utilization:.4}"));
-            p.push(decoder_step);
-            let mut scheduler = StageProfile::host("decoder_scheduler_total", t_decoder_scheduler);
-            scheduler.meta.insert(
-                "timing_semantics".into(),
-                "non-additive end-to-end control-loop wall including host work, decoder_step waits, and synchronized cache/control copies".into(),
-            );
-            scheduler.meta.insert("batches".into(), encoder_executions.to_string());
-            p.push(scheduler);
-        }
-
-        copies.merge(decode_stats.copies.clone());
-        Ok((recognized, prof, copies))
+        Ok((transcripts, run))
     }
 }

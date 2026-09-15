@@ -51,6 +51,10 @@ pub struct Transcript {
     /// one, `None` otherwise. Populated by models that run language detection
     /// (Whisper); left empty by models that don't.
     pub language: Option<String>,
+    /// Seconds of the window the decode consumed, for a model that opts into
+    /// [`WindowAdvance`]: the read head advances by this. `None` falls back to
+    /// the end of the last segment.
+    pub consumed_sec: Option<f32>,
 }
 
 /// One speech region's final transcript. `start_sec`/`end_sec` reference the
@@ -96,31 +100,41 @@ pub struct RunOptions {
     pub profile: bool,
 }
 
-/// Re-decode the part of a window a model's decode never reached.
+/// Advance a model's decode window by what it actually decoded, not by a fixed
+/// stride.
 ///
-/// Whisper ends a window at the last timestamp it emitted, which can fall well
-/// inside the window; the reference implementation then advances its read head to
-/// that timestamp rather than by a whole window, so the remainder is decoded
-/// next. A splitter striding fixed windows never revisits it and those seconds go
-/// untranscribed — on LibriSpeech that single mechanism was the whole WER gap to
-/// the reference implementation.
+/// Whisper ends a window at the last timestamp it emitted, which routinely lands
+/// well inside it. The reference implementation therefore advances its read head
+/// to that timestamp (`seek += seek_delta`) and decodes the remainder next, so
+/// every sample is decoded exactly once. Striding a fixed window instead leaves
+/// the tail untranscribed; re-decoding a whole window to recover that tail
+/// transcribes the overlap twice, which costs about half as many windows again.
 ///
-/// Opting in via [`Transcriber::coverage_repair`] keeps the fixed stride, so each
-/// round still presents every window to the model at once and batches, and
-/// schedules only the audio a round actually left behind.
+/// Opting in via [`Transcriber::window_advance`] walks each region seek-style.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CoverageRepair {
-    /// A shortfall shorter than this (seconds) is left alone — trailing silence
-    /// rather than dropped speech.
+pub struct WindowAdvance {
+    /// A shortfall shorter than this (seconds) counts as covering the window —
+    /// trailing silence rather than dropped speech.
     pub min_gap_sec: f32,
-    /// Cap on repair rounds. Progress is required to schedule one at all, so this
-    /// only bounds pathological audio.
-    pub max_rounds: usize,
+    /// Floor on one advance, as a fraction of the window. A decode that reaches
+    /// almost nothing is a failed decode, not a reason to inch forward; without
+    /// a floor it would take a window per second of audio.
+    pub min_advance_fraction: f32,
 }
 
-impl Default for CoverageRepair {
+impl Default for WindowAdvance {
     fn default() -> Self {
-        Self { min_gap_sec: 1.0, max_rounds: 4 }
+        Self { min_gap_sec: 1.0, min_advance_fraction: 0.5 }
+    }
+}
+
+impl WindowAdvance {
+    /// Seconds to advance after a window of `window_sec` reached `covered_sec`.
+    fn advance_sec(&self, covered_sec: f32, window_sec: f32) -> f32 {
+        if covered_sec <= 0.0 || covered_sec >= window_sec - self.min_gap_sec {
+            return window_sec;
+        }
+        covered_sec.max(window_sec * self.min_advance_fraction).min(window_sec)
     }
 }
 
@@ -398,11 +412,11 @@ pub trait Transcriber {
         Ok((transcripts.pop().unwrap_or_default(), prof))
     }
 
-    /// Opt in to re-decoding the tail of a window this model stopped short of,
-    /// returning the policy. `None` (the default) takes every window's transcript
-    /// as covering its whole core. Models whose decode can end early — Whisper,
+    /// Opt in to advancing by what each window decoded rather than by the
+    /// splitter's stride. `None` (the default) takes every window's transcript as
+    /// covering its whole core. Models whose decode can end early — Whisper,
     /// which stops at its last emitted timestamp — return `Some`.
-    fn coverage_repair(&self) -> Option<CoverageRepair> {
+    fn window_advance(&self) -> Option<WindowAdvance> {
         None
     }
 
@@ -422,38 +436,63 @@ pub trait Transcriber {
             return Ok(Transcription::default());
         }
         let sample_rate = self.sample_rate() as f32;
-        let repair = self.coverage_repair();
+        let Some(advance) = self.window_advance() else {
+            return self.transcribe_windows_striding(waveform, chunks, opts);
+        };
 
-        // Each round hands the model every window it still owes at once, so a
-        // repair round batches exactly like the first pass.
-        let mut pending: Vec<AudioChunk> = chunks.to_vec();
-        let mut results: Vec<ChunkResult> = Vec::with_capacity(pending.len());
+        // Adjacent chunks tile one stretch of audio, so the read head carries
+        // across them: a splitter's boundary is where the *region* ends, not
+        // where a window must. A gap between chunks (a VAD's silence) ends one.
+        let mut results: Vec<ChunkResult> = Vec::with_capacity(chunks.len());
         let mut prof: Option<RunProfile> = None;
-        let mut round = 0usize;
-        while !pending.is_empty() {
-            let metas: Vec<ChunkGeom> =
-                pending.iter().map(|chunk| ChunkGeom::new(chunk, waveform.len(), sample_rate)).collect();
-            let windows: Vec<&[f32]> = metas.iter().map(|m| &waveform[m.decode_start..m.decode_end]).collect();
-            let (transcripts, round_profile) = self.transcribe_windows(&windows, opts.profile)?;
-            if let Some(stage) = round_profile {
-                prof.get_or_insert_with(RunProfile::default).merge(stage);
-            }
-            let repair = repair.filter(|policy| round < policy.max_rounds);
-            let mut next = Vec::new();
-            for ((transcript, meta), chunk) in transcripts.into_iter().zip(&metas).zip(&pending) {
-                if let Some(policy) = repair
-                    && let Some(tail) = meta.uncovered_tail(&transcript, chunk, waveform.len(), sample_rate, policy)
-                {
-                    next.push(tail);
+        for region in coalesce_regions(chunks, waveform.len()) {
+            let mut seek = region.start;
+            while seek < region.end {
+                let decode_end = seek.saturating_add(region.window_len).min(waveform.len());
+                let (mut transcripts, window_profile) =
+                    self.transcribe_windows(&[&waveform[seek..decode_end]], opts.profile)?;
+                if let Some(stage) = window_profile {
+                    prof.get_or_insert_with(RunProfile::default).merge(stage);
                 }
-                results.push(meta.finish(transcript, opts));
+                let transcript = transcripts.pop().unwrap_or_default();
+
+                let window_sec = (decode_end - seek) as f32 / sample_rate;
+                let covered =
+                    transcript.consumed_sec.unwrap_or_else(|| transcript.segments.last().map_or(0.0, |s| s.end));
+                let step = advance.advance_sec(covered, window_sec);
+                let step = (((step * sample_rate) as usize).max(1)).min(decode_end - seek);
+
+                // The core owns text up to the advance; anything the window
+                // decoded past it belongs to the window that starts there.
+                let core_end = seek.saturating_add(step).min(region.end);
+                let geom = ChunkGeom::new(
+                    &AudioChunk::with_decode(seek, core_end, seek, decode_end),
+                    waveform.len(),
+                    sample_rate,
+                );
+                results.push(geom.finish(transcript, opts));
+                seek = seek.saturating_add(step);
             }
-            pending = next;
-            round += 1;
         }
 
-        // Repair rounds append out of order; the joined text is the timeline.
-        results.sort_by(|a, b| a.start_sec.total_cmp(&b.start_sec));
+        let text = results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+        Ok(Transcription { text, chunks: results, profile: prof })
+    }
+
+    /// Decode every chunk once, at the splitter's own boundaries. The path for a
+    /// model whose windows always cover their core.
+    fn transcribe_windows_striding(
+        &mut self,
+        waveform: &[f32],
+        chunks: &[AudioChunk],
+        opts: RunOptions,
+    ) -> Result<Transcription, Self::Error> {
+        let sample_rate = self.sample_rate() as f32;
+        let metas: Vec<ChunkGeom> =
+            chunks.iter().map(|chunk| ChunkGeom::new(chunk, waveform.len(), sample_rate)).collect();
+        let windows: Vec<&[f32]> = metas.iter().map(|m| &waveform[m.decode_start..m.decode_end]).collect();
+        let (transcripts, prof) = self.transcribe_windows(&windows, opts.profile)?;
+        let results: Vec<ChunkResult> = transcripts.into_iter().zip(&metas).map(|(t, m)| m.finish(t, opts)).collect();
         let text = results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
         Ok(Transcription { text, chunks: results, profile: prof })
     }
@@ -467,6 +506,35 @@ pub trait Transcriber {
     ) -> Result<Transcription, Self::Error> {
         self.transcribe_chunks(waveform, chunks, RunOptions::default())
     }
+}
+
+/// One stretch of audio a read head walks, and the window length to walk it with.
+struct Region {
+    start: usize,
+    end: usize,
+    window_len: usize,
+}
+
+/// Merge chunks that touch into one region. A splitter striding fixed windows
+/// produces one region for the whole waveform; a VAD produces one per utterance.
+fn coalesce_regions(chunks: &[AudioChunk], waveform_len: usize) -> Vec<Region> {
+    let mut regions: Vec<Region> = Vec::new();
+    for chunk in chunks {
+        let start = chunk.start_sample.min(waveform_len);
+        let end = chunk.end_sample.min(waveform_len);
+        if end <= start {
+            continue;
+        }
+        let window_len = chunk.decode_len().max(end - start);
+        match regions.last_mut() {
+            Some(last) if last.end == start => {
+                last.end = end;
+                last.window_len = last.window_len.max(window_len);
+            }
+            _ => regions.push(Region { start, end, window_len }),
+        }
+    }
+    regions
 }
 
 /// Decode geometry for one chunk, derived from its [`AudioChunk`].
@@ -509,36 +577,6 @@ impl ChunkGeom {
             words: opts.words.then_some(words),
             segments: opts.segments.then_some(segments),
         }
-    }
-
-    /// The stretch of core this transcript never reached, as the next round's
-    /// chunk — or `None` when the window is covered.
-    ///
-    /// The last segment's end is where the decode stopped. Rescheduling requires
-    /// that the decode got somewhere: a window the model reads as silence emits
-    /// nothing, and retrying it would neither advance nor terminate. The retry
-    /// keeps this chunk's decode length so the model sees its usual context
-    /// rather than a sliver, while the core stops at the original core's end —
-    /// the audio past it already belongs to the next chunk.
-    fn uncovered_tail(
-        &self,
-        transcript: &Transcript,
-        chunk: &AudioChunk,
-        waveform_len: usize,
-        sample_rate: f32,
-        policy: CoverageRepair,
-    ) -> Option<AudioChunk> {
-        let covered = transcript.segments.last()?.end - self.core_offset_sec;
-        if covered <= 0.0 || self.core_duration() - covered < policy.min_gap_sec {
-            return None;
-        }
-        let start = chunk.start_sample.saturating_add((covered * sample_rate) as usize);
-        let end = chunk.end_sample.min(waveform_len);
-        if start >= end {
-            return None;
-        }
-        let decode_end = start.saturating_add(chunk.decode_len()).min(waveform_len).max(end);
-        Some(AudioChunk::with_decode(start, end, start, decode_end))
     }
 }
 

@@ -36,13 +36,39 @@ fn bench_sq_attention(c: &mut Criterion) {
 
         let splits: &[usize] = if mode == "cross" { &[1, 2, 4, 5, 10] } else { &[1] };
         for &split in splits {
-            let opts =
-                svod_tk::SqAttentionOpts { key_lens: lens.as_ref(), include_last: mode.starts_with("self"), split };
+            let opts = svod_tk::SqAttentionOpts {
+                key_lens: lens.as_ref(),
+                include_last: mode.starts_with("self"),
+                split,
+                cache_map: None,
+            };
             let tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
             let tk_plan = tk.prepare().expect("prepare tk");
             group.bench_with_input(BenchmarkId::new(format!("tk/{mode}/split_{split}"), n), &n, |bencher, _| {
                 bench_plan(bencher, &tk_plan)
             });
+        }
+
+        // Production never binds a per-layer cache: every layer's K/V live in one
+        // packed `[b, n, n_layer * h, d]` buffer, so one head's consecutive keys
+        // sit `n_layer * h * d` floats apart instead of `h * d`. Same math, same
+        // bytes touched, different stride -- the layout the benches above miss.
+        if mode == "cross" {
+            let h_total = 32 * h;
+            let kk = randn_f32(&[b, n, h_total, d]);
+            let vv = randn_f32(&[b, n, h_total, d]);
+            for &split in &[1usize, 4, 10] {
+                let opts = svod_tk::SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+                let tk = svod_tk::single_query_attention_packed(&q, &kk, &vv, 0, opts)
+                    .expect("packed sq attention")
+                    .expect("supported");
+                let plan = tk.prepare().expect("prepare packed");
+                group.bench_with_input(
+                    BenchmarkId::new(format!("tk/cross_packed/split_{split}"), n),
+                    &n,
+                    |bencher, _| bench_plan(bencher, &plan),
+                );
+            }
         }
 
         let perm = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]).expect("permute");

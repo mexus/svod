@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 
 use crate::pipelines::audio::{
-    Asr, ChunkResult, CoverageRepair, FixedLengthSplitter, RunOptions, RunProfile, Splitter, Transcriber, Transcript,
-    Vad, VadSplitter, crop_words_to_core, words_to_text,
+    Asr, ChunkResult, FixedLengthSplitter, RunOptions, RunProfile, Splitter, Transcriber, Transcript, Vad, VadSplitter,
+    WindowAdvance, crop_words_to_core, words_to_text,
 };
 use crate::rnnt::{Segment, Word};
 use crate::vad::{AudioChunk, ChunkerOpts};
@@ -307,128 +307,129 @@ fn assemble_sizes_transcriber_from_splitter_bound() {
     assert_eq!(seen.get(), 10);
 }
 
-// ─── Coverage repair ─────────────────────────────────────────────────────────
+// ─── Window advance ──────────────────────────────────────────────────────────
 
 fn segment(text: &str, start: f32, end: f32) -> Segment {
     Segment { text: text.to_string(), start, end }
 }
 
-/// Answers one preset round per `transcribe_windows` call and records the window
-/// lengths it was handed, so a test can drive and observe the repair loop.
+/// Answers one preset transcript per `transcribe_windows` call and records the
+/// window lengths it was handed, so a test can drive and observe the seek walk.
 /// 1 sample = 1 s.
-struct RoundsTranscriber {
-    rounds: std::collections::VecDeque<Vec<Transcript>>,
-    repair: Option<CoverageRepair>,
-    window_lens: Vec<Vec<usize>>,
+struct WalkTranscriber {
+    answers: std::collections::VecDeque<Transcript>,
+    advance: Option<WindowAdvance>,
+    window_lens: Vec<usize>,
 }
 
-impl RoundsTranscriber {
-    fn new(repair: Option<CoverageRepair>, rounds: Vec<Vec<Transcript>>) -> Self {
-        Self { rounds: rounds.into(), repair, window_lens: Vec::new() }
+impl WalkTranscriber {
+    fn new(advance: Option<WindowAdvance>, answers: Vec<Transcript>) -> Self {
+        Self { answers: answers.into(), advance, window_lens: Vec::new() }
     }
 }
 
-/// One window's worth of decoded text reaching `covered` seconds into it.
+/// One window's decoded text, reaching `covered` seconds into it.
 fn reached(text: &str, covered: f32) -> Transcript {
     Transcript { text: text.to_string(), segments: vec![segment(text, 0.0, covered)], ..Default::default() }
 }
 
-impl Transcriber for RoundsTranscriber {
+impl Transcriber for WalkTranscriber {
     type Error = Infallible;
     fn sample_rate(&self) -> u32 {
         1
     }
-    fn coverage_repair(&self) -> Option<CoverageRepair> {
-        self.repair
+    fn window_advance(&self) -> Option<WindowAdvance> {
+        self.advance
     }
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
         _profile: bool,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Infallible> {
-        self.window_lens.push(windows.iter().map(|w| w.len()).collect());
-        let round = self.rounds.pop_front().unwrap_or_default();
-        assert_eq!(round.len(), windows.len(), "preset round must match window count");
-        Ok((round, None))
+        self.window_lens.extend(windows.iter().map(|w| w.len()));
+        Ok((windows.iter().map(|_| self.answers.pop_front().unwrap_or_default()).collect(), None))
     }
 }
 
 #[test]
-fn a_window_the_decode_stopped_short_of_is_finished_by_the_next_round() {
+fn the_next_window_starts_where_the_last_decode_stopped() {
     let waveform = vec![0.0_f32; 60];
-    let chunks = vec![AudioChunk::new(0, 30)];
-    let mut t = RoundsTranscriber::new(
-        Some(CoverageRepair::default()),
-        vec![vec![reached("hello", 10.0)], vec![reached("world", 20.0)]],
+    // One fixed 30 s stride over 60 s: two chunks, one contiguous region.
+    let chunks = vec![AudioChunk::new(0, 30), AudioChunk::new(30, 60)];
+    let mut t = WalkTranscriber::new(
+        Some(WindowAdvance::default()),
+        vec![reached("a", 20.0), reached("b", 25.0), reached("c", 30.0)],
     );
     let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
 
-    assert_eq!(out.text, "hello world", "the remainder is decoded, not dropped");
-    assert_eq!(out.chunks.len(), 2);
-    assert_eq!(out.chunks[0].start_sec, 0.0);
-    assert_eq!(out.chunks[1].start_sec, 10.0, "the retry starts where the decode stopped");
-    // The retry keeps the first pass's window length, so the model still sees its
-    // usual context rather than the 20 s sliver the core needs.
-    assert_eq!(t.window_lens, vec![vec![30], vec![30]]);
+    // Advances 20 then 25, so windows open at 0, 20, 45 - never re-decoding
+    // ground the previous window already owned.
+    assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 20.0, 45.0]);
+    assert_eq!(out.text, "a b c");
+    // The last window is clipped by the waveform, not by the stride.
+    assert_eq!(t.window_lens, vec![30, 30, 15]);
+}
+
+/// A decode that consumed `consumed` seconds of its window while its segments
+/// stop at `segment_end` — the two disagree on purpose.
+fn consumed(text: &str, consumed: f32, segment_end: f32) -> Transcript {
+    Transcript { consumed_sec: Some(consumed), ..reached(text, segment_end) }
 }
 
 #[test]
-fn repair_rounds_batch_every_window_that_fell_short() {
-    let waveform = vec![0.0_f32; 90];
-    let chunks = vec![AudioChunk::new(0, 30), AudioChunk::new(30, 60), AudioChunk::new(60, 90)];
-    let mut t = RoundsTranscriber::new(
-        Some(CoverageRepair::default()),
-        vec![
-            // The middle window covers its core; the outer two stop early.
-            vec![reached("a", 10.0), reached("b", 30.0), reached("c", 5.0)],
-            vec![reached("a2", 20.0), reached("c2", 25.0)],
-        ],
+fn a_reported_consumption_outranks_the_last_segments_end() {
+    let waveform = vec![0.0_f32; 60];
+    let chunks = vec![AudioChunk::new(0, 30), AudioChunk::new(30, 60)];
+    // Segments that stop at 5 s would advance by the floor (half a window);
+    // the reported consumption walks 20 then 25 instead.
+    let mut t = WalkTranscriber::new(
+        Some(WindowAdvance::default()),
+        vec![consumed("a", 20.0, 5.0), consumed("b", 25.0, 5.0), consumed("c", 30.0, 5.0)],
     );
     let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
 
-    assert_eq!(t.window_lens.len(), 2, "one repair round, not one round per window");
-    assert_eq!(t.window_lens[1].len(), 2, "both short windows are retried together");
-    assert_eq!(out.text, "a a2 b c c2", "results are ordered by time, not by round");
+    assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 20.0, 45.0]);
+    assert_eq!(t.window_lens, vec![30, 30, 15]);
+    assert_eq!(out.text, "a b c");
 }
 
 #[test]
-fn a_decode_that_reaches_nothing_is_not_retried() {
+fn a_window_that_covers_itself_advances_a_whole_stride() {
     let waveform = vec![0.0_f32; 60];
-    let chunks = vec![AudioChunk::new(0, 30)];
-    // No segments at all (silence), then a segment that ends where it began.
-    for round in [Transcript::default(), reached("", 0.0)] {
-        let mut t = RoundsTranscriber::new(Some(CoverageRepair::default()), vec![vec![round]]);
-        t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
-        assert_eq!(t.window_lens.len(), 1, "retrying a window that advanced nowhere would not terminate");
-    }
-}
-
-#[test]
-fn a_shortfall_under_the_minimum_is_left_alone() {
-    let waveform = vec![0.0_f32; 60];
-    let chunks = vec![AudioChunk::new(0, 30)];
-    let mut t = RoundsTranscriber::new(Some(CoverageRepair::default()), vec![vec![reached("nearly", 29.5)]]);
-    t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
-    assert_eq!(t.window_lens.len(), 1, "half a second of trailing silence is not a dropped phrase");
-}
-
-#[test]
-fn repair_rounds_are_capped() {
-    let waveform = vec![0.0_f32; 60];
-    let chunks = vec![AudioChunk::new(0, 30)];
-    // Always one second short of wherever it starts, so only the cap ends this.
-    let rounds = vec![vec![reached("a", 1.0)]; 8];
-    let mut t = RoundsTranscriber::new(Some(CoverageRepair { min_gap_sec: 1.0, max_rounds: 3 }), rounds);
-    t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
-    assert_eq!(t.window_lens.len(), 4, "three repair rounds after the first pass");
-}
-
-#[test]
-fn without_the_opt_in_a_short_decode_is_taken_as_the_whole_window() {
-    let waveform = vec![0.0_f32; 60];
-    let chunks = vec![AudioChunk::new(0, 30)];
-    let mut t = RoundsTranscriber::new(None, vec![vec![reached("hello", 10.0)]]);
+    let chunks = vec![AudioChunk::new(0, 30), AudioChunk::new(30, 60)];
+    let mut t = WalkTranscriber::new(Some(WindowAdvance::default()), vec![reached("a", 29.5), reached("b", 30.0)]);
     let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
-    assert_eq!(t.window_lens.len(), 1);
-    assert_eq!(out.text, "hello");
+    assert_eq!(t.window_lens, vec![30, 30], "half a second short is trailing silence, not dropped speech");
+    assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 30.0]);
+}
+
+#[test]
+fn a_decode_that_reaches_almost_nothing_still_advances_half_a_window() {
+    let waveform = vec![0.0_f32; 60];
+    let chunks = vec![AudioChunk::new(0, 60)];
+    // Reaching 1 s of 60 would otherwise mean sixty windows for sixty seconds.
+    let mut t = WalkTranscriber::new(Some(WindowAdvance::default()), vec![reached("a", 1.0), reached("b", 30.0)]);
+    t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
+    assert_eq!(t.window_lens.len(), 2, "the advance floor bounds windows at twice the minimum");
+}
+
+#[test]
+fn a_gap_between_chunks_ends_a_region() {
+    let waveform = vec![0.0_f32; 100];
+    // A VAD's two utterances with silence between them: the read head must not
+    // walk from the first into the silence.
+    let chunks = vec![AudioChunk::new(0, 20), AudioChunk::new(60, 80)];
+    let mut t = WalkTranscriber::new(Some(WindowAdvance::default()), vec![reached("a", 20.0), reached("b", 20.0)]);
+    let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
+    assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 60.0]);
+}
+
+#[test]
+fn without_the_opt_in_chunks_are_decoded_at_the_splitters_boundaries() {
+    let waveform = vec![0.0_f32; 60];
+    let chunks = vec![AudioChunk::new(0, 30), AudioChunk::new(30, 60)];
+    let mut t = WalkTranscriber::new(None, vec![reached("a", 10.0), reached("b", 10.0)]);
+    let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
+    assert_eq!(t.window_lens, vec![30, 30], "one batched pass, no seek walk");
+    assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 30.0]);
 }
