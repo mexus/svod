@@ -205,8 +205,12 @@ fn a_local_load_outside_the_loop_scope_does_not_bar_it() {
     let stored = index_of(local.after(smallvec![gather]), fill.clone()).store(UOp::native_const(1.0f32));
     let result = add_implicit_barriers(stored.end(smallvec![fill]));
 
-    assert!(matches!(result.op(), Op::End(ops::End { computation, .. })
-        if matches!(computation.op(), Op::Store(..))), "{}", result.tree());
+    assert!(
+        matches!(result.op(), Op::End(ops::End { computation, .. })
+        if matches!(computation.op(), Op::Store(..))),
+        "{}",
+        result.tree()
+    );
 }
 
 /// A store in a different buffer's scope does not bar a reduce over another one:

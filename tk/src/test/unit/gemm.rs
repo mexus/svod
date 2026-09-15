@@ -11,7 +11,7 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::kernels::gemm::{
-    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GENERIC_TILES, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K,
+    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K, RDNA_TILES,
     gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
 };
 
@@ -79,10 +79,10 @@ fn select_cfg_crossover_follows_the_sm_count() {
     assert_eq!(GemmPolicy { compute_units: 8, ..cuda }.cfg(m, k, n), Some(NT_128X64));
 }
 
-/// The generic table (RDNA and every family without its own): the same shape
-/// rules (`M`/`N` by 64, `K` by the strip) served by its tiles (`0` wide, `1`
-/// the deep-strip fine tile, `2` the short-K fine tile), with the crossover
-/// against the family's 40 CUs.
+/// The RDNA table: the same shape rules (`M`/`N` by 64, `K` by the strip)
+/// served by its tiles (`0` wide, `1` the deep-strip fine tile, `2` the short-K
+/// fine tile), with the crossover against the family's 40 CUs; a family nobody
+/// measured declines every shape.
 #[test_case(4096, 1024, 6144, Some(0); "gate_up keeps the wide tile")]
 #[test_case(1024, 1024, 6144, Some(0); "gate_up small M")]
 #[test_case(4096, 3072, 1024, Some(0); "512 blocks take the wide tile")]
@@ -96,9 +96,10 @@ fn select_cfg_crossover_follows_the_sm_count() {
 fn rdna_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) {
     let policy = GemmPolicy::for_arch(RDNA);
     assert_eq!(policy.compute_units, 40);
-    assert_eq!(policy.cfg(m, k, n), want.map(|i| GENERIC_TILES[i]), "rdna cfg({m}, {k}, {n})");
+    assert_eq!(policy.cfg(m, k, n), want.map(|i| RDNA_TILES[i]), "rdna cfg({m}, {k}, {n})");
     let cdna = GemmPolicy::for_arch(GpuArch::Amd(svod_dtype::AmdArch::Gfx942));
-    assert_eq!(cdna.tiles, &GENERIC_TILES, "a family without a table of its own takes the generic one");
+    assert_eq!(cdna.cfg(m, k, n), None, "a family nobody measured declines");
+    assert_eq!(cdna.swiglu_pair_width(), None);
 }
 
 /// A rank-1 operand is a structured `Err`, not a panic — the shape preconditions
@@ -155,7 +156,7 @@ proptest! {
 /// invariant [`GemmPolicy::swiglu_pair_width`] exists to state, on every arch
 /// table.
 #[test_case(SM86, &CUDA_TILES; "cuda")]
-#[test_case(RDNA, &GENERIC_TILES; "rdna")]
+#[test_case(RDNA, &RDNA_TILES; "rdna")]
 fn swiglu_pair_width_is_common_to_every_tile(arch: GpuArch, table: &[GemmCfg]) {
     let policy = GemmPolicy::for_arch(arch);
     assert_eq!(policy.tiles, table);
@@ -489,7 +490,7 @@ fn staged_gemm_gfx1151_fences_each_strip_once() {
     use crate::kernels::gemm::build_gemm_nt;
 
     let (m, k, n) = (128usize, 128usize, 64usize);
-    let cfg = GENERIC_TILES[0];
+    let cfg = RDNA_TILES[0];
     let caps = crate::ArchCaps::for_amd(AmdArch::Gfx1151);
     let buffers: Vec<Arc<UOp>> =
         [m * n, m * k, n * k].into_iter().map(|size| UOp::new_buffer(DeviceSpec::Cpu, size, DType::BFloat16)).collect();

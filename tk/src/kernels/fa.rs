@@ -69,6 +69,9 @@ fn iconst(v: i64) -> Arc<UOp> {
 /// (RDNA3.5 WMMA, wave32), CUDA sm_80+ (`mma.sync`, warp32) and Apple7+
 /// (`simdgroup_matrix`, SIMD-group 32). The launcher gates
 /// against this list; generic launch infrastructure stays architecture-agnostic.
+/// gfx942 was validated on hardware before the vector LDS gathers and the single
+/// fenced K/V commit (PR #177) and has not been re-run since; its golden graph
+/// digests were re-baselined for those two changes without it.
 pub const FA_SUPPORTED_ARCHS: crate::ArchSet =
     crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
         .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
@@ -707,55 +710,75 @@ impl FaPolicy {
 
     /// The config for a `[b, n, h, d]` attention over `h_kv` key heads as measured
     /// on this device ([`crate::tune`]): every [`FA_TILES`] entry whose buffers fit
-    /// and whose block divides `n` is timed once on synthetic operands and the
-    /// fastest kept; the static [`Self::config`] choice where tuning is off or
-    /// nothing measured. The body form and masking are the policy's.
+    /// and whose block divides `n` is timed once on synthetic operands — with the
+    /// key mask when `masked` — and the fastest kept in `store`; the static
+    /// [`Self::config`] choice where only one fits or nothing measured. The body
+    /// form is the policy's. The launch entry consults [`crate::tune::enabled`]
+    /// before coming here.
     #[allow(clippy::too_many_arguments)]
     pub fn tuned(
         &self,
+        store: &crate::tune::TuneStore,
         spec: &svod_dtype::DeviceSpec,
         arch: svod_dtype::GpuArch,
         dtype: &DType,
         (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
         causal: bool,
+        masked: bool,
     ) -> Option<FaConfig> {
         let fits = |&(q_blk, kv_blk): &(usize, usize)| {
             self.shared_bytes((q_blk, kv_blk), d) <= self.shared_max && n.is_multiple_of(q_blk * NUM_WARPS)
         };
-        let candidates: Vec<(usize, usize)> = FA_TILES.into_iter().filter(fits).collect();
+        let candidates: Vec<FaConfig> = FA_TILES
+            .into_iter()
+            .filter(fits)
+            .map(|(q_blk, kv_blk)| FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
+            .collect();
         let fallback = || self.config(b, n, h, d, causal);
-        if candidates.len() < 2 || !crate::tune::enabled() {
+        if candidates.len() < 2 {
             return fallback();
         }
-        let shape = [b, n, h, h_kv, d, usize::from(causal), dtype.bytes()];
-        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &candidates);
-        let measure = |i: usize| {
-            let (q_blk, kv_blk) = candidates[i];
-            let cfg = FaConfig { q_blk, kv_blk, unroll: self.unroll, causal };
-            let caps = crate::ArchCaps::for_arch(arch);
-            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
-            let (q, k, v) = (operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?);
-            let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
-            let grid = [h as i64, (n / q_blk / NUM_WARPS) as i64, b as i64];
-            let dt = dtype.clone();
-            let launch = crate::launch::compile_kernel(
-                "flash_attention_tune",
-                grid,
-                (NUM_WARPS * caps.wave_size) as i64,
-                &mut [&mut o],
-                &[&q, &k, &v],
-                move |ker| {
-                    build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dt, false);
-                    ker.finish(1)
-                },
-            )
-            .ok()?;
-            crate::tune::min_dispatch_ns(&launch, 3)
+        let caps = crate::ArchCaps::for_arch(arch);
+        let block = (NUM_WARPS * caps.wave_size) as i64;
+        let grid = |cfg: &FaConfig| [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+        let build = move |ker: &Kernel, cfg: FaConfig| {
+            build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dtype.clone(), masked);
+            ker.finish(1)
         };
-        crate::tune::TuneStore::global()
-            .select(&key, candidates.len(), measure)
-            .map(|i| FaConfig { q_blk: candidates[i].0, kv_blk: candidates[i].1, unroll: self.unroll, causal })
-            .or_else(fallback)
+        let placeholders = || {
+            let mut bufs: Vec<Arc<UOp>> = [h, h, h_kv, h_kv]
+                .into_iter()
+                .map(|heads| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n * heads * d, dtype.clone()))
+                .collect();
+            if masked {
+                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b, DType::Int32));
+            }
+            bufs
+        };
+        let builds: Vec<u128> = candidates
+            .iter()
+            .map(|&cfg| {
+                let ker = Kernel::new("flash_attention", grid(&cfg), block, placeholders(), caps);
+                crate::kernel_fingerprint(&build(&ker, cfg)).digest
+            })
+            .collect();
+        let shape = [b, n, h, h_kv, d, usize::from(causal), usize::from(masked), dtype.bytes()];
+        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &builds);
+        let compile = |i: usize| {
+            let cfg = candidates[i];
+            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
+            let mut ins = vec![operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?];
+            if masked {
+                ins.push(Tensor::full(&[b], ConstValue::Int(n as i64), DType::Int32).to(spec.clone()));
+            }
+            let ins: Vec<&Tensor> = ins.iter().collect();
+            let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
+            crate::launch::compile_kernel("flash_attention_tune", grid(&cfg), block, &mut [&mut o], &ins, move |ker| {
+                build(ker, cfg)
+            })
+            .ok()
+        };
+        store.select(&key, candidates.len(), compile).map(|i| candidates[i]).or_else(fallback)
     }
 }
 
@@ -891,7 +914,15 @@ pub fn flash_attention_tuned(
         .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
     let kv_seq_match = kd[1] == n && vd[1] == n;
     let (tiling_device, build_device) = (q.device(), q.device());
-    let tiling_dtype = dtype.clone();
+    let (tiling_dtype, masked) = (dtype.clone(), opts.key_lens.is_some());
+    // The policy's config, measured on first use where tuning is on.
+    let chosen = move |policy: &FaPolicy, device: &svod_dtype::DeviceSpec, arch, dtype: &DType| {
+        if !crate::tune::enabled() {
+            return policy.config(b, n, h, d, opts.causal);
+        }
+        let store = crate::tune::TuneStore::global();
+        policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, masked)
+    };
 
     crate::launch_custom(
         &q.device(),
@@ -936,19 +967,16 @@ pub fn flash_attention_tuned(
         // does a KV length that differs from q's (this kernel is self-attention only).
         move |arch| {
             kv_seq_match
-                && policy(&tiling_device, arch)
-                    .tuned(&tiling_device, arch, &tiling_dtype, (b, n, h, h_kv, d), opts.causal)
+                && chosen(&policy(&tiling_device, arch), &tiling_device, arch, &tiling_dtype)
                     .is_some_and(|cfg| n.is_multiple_of(cfg.q_blk * NUM_WARPS))
         },
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = policy(&build_device, arch)
-                .tuned(&build_device, arch, &dtype, (b, n, h, h_kv, d), opts.causal)
+            let cfg = chosen(&policy(&build_device, arch), &build_device, arch, &dtype)
                 .expect("checked by the tiling predicate");
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
-            let masked = opts.key_lens.is_some();
             let build_dtype = dtype.clone();
             // ABI/global order is o, q, k, v, (lens) — `out` is global[0], inputs map to
             // global[1..] in order, so `key_lens` (the 5th global) goes last.

@@ -89,6 +89,15 @@ impl<T> Epilogue<T> {
             _ => n,
         }
     }
+
+    /// A small integer naming the variant (the tuning key's epilogue field).
+    pub const fn code(&self) -> usize {
+        match self {
+            Epilogue::Plain => 0,
+            Epilogue::Add(_) => 1,
+            Epilogue::SwiGlu { .. } => 2,
+        }
+    }
 }
 
 /// Block / wave geometry of one GEMM workgroup. A `warps_m × warps_n` wave grid
@@ -676,14 +685,14 @@ pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_12
 /// The CUDA sm_80+ tiles, widest first.
 pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
 
-/// The tiles of every family without a table of its own, measured on RDNA
-/// (gfx1151): the CUDA tiles on the register-staged pipeline without the L2
-/// swizzle (single-XCD parts; ±3% either way), and the fine tile on a 64-deep
-/// strip, which halves the barriers per K and wins once the grid is short
-/// (batch-1 down projection 12.3 vs 7.1 TFLOP/s). A 32-deep 64×64 tile keeps a
-/// `K` of 64 or 96 servable. 128×128 trailed by 10-15% and `k_step = 64` on the
-/// wide tile halved its throughput (48 KiB of LDS), so neither is a candidate.
-pub const GENERIC_TILES: [GemmCfg; 3] = [
+/// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles on the
+/// register-staged pipeline without the L2 swizzle (single-XCD parts; ±3%
+/// either way), and the fine tile on a 64-deep strip, which halves the barriers
+/// per K and wins once the grid is short (batch-1 down projection 12.3 vs 7.1
+/// TFLOP/s). A 32-deep 64×64 tile keeps a `K` of 64 or 96 servable. 128×128
+/// trailed by 10-15% and `k_step = 64` on the wide tile halved its throughput
+/// (48 KiB of LDS), so neither is a candidate.
+pub const RDNA_TILES: [GemmCfg; 3] = [
     GemmCfg { l2_swizzle: false, ..NT_128X64 },
     GemmCfg { l2_swizzle: false, k_step: 64, ..NT_64X64 },
     GemmCfg { l2_swizzle: false, ..NT_64X64 },
@@ -698,7 +707,8 @@ pub struct GemmPolicy {
     /// Compute units (SMs, CUs) on the device.
     pub compute_units: usize,
     /// The tiles to choose between: the widest first, then the finer ones in
-    /// preference order.
+    /// preference order; empty where no one has measured the family (the policy
+    /// then declines every shape rather than run another family's constants).
     pub tiles: &'static [GemmCfg],
     /// Blocks of the widest tile per compute unit below which a finer tile wins.
     /// On CUDA the blocks resident per SM (~116 registers and 24 KiB of shared
@@ -710,11 +720,14 @@ pub struct GemmPolicy {
 impl GemmPolicy {
     /// The family's tile table with its measured part's compute-unit count (an
     /// RTX 3060's 28 SMs, Strix Halo's 40 CUs); [`Self::for_device`] reads the
-    /// real count. A family without a table of its own takes the generic one.
+    /// real count. A family nobody measured declines.
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         match crate::arch::Family::of(arch) {
             crate::arch::Family::Cuda => Self { compute_units: 28, tiles: &CUDA_TILES, resident: 4 },
-            _ => Self { compute_units: 40, tiles: &GENERIC_TILES, resident: 8 },
+            crate::arch::Family::Rdna => Self { compute_units: 40, tiles: &RDNA_TILES, resident: 8 },
+            crate::arch::Family::Cdna | crate::arch::Family::Metal => {
+                Self { compute_units: 1, tiles: &[], resident: 1 }
+            }
         }
     }
 
@@ -746,49 +759,66 @@ impl GemmPolicy {
 
     /// The tile for an `m × k × n` NT GEMM under `epi` as measured on this device
     /// ([`crate::tune`]): every table tile that tiles the shape and carries the
-    /// epilogue is timed once on synthetic operands and the fastest kept; the
-    /// static [`Self::cfg`] choice where tuning is off or nothing measured.
+    /// epilogue is timed once, with that epilogue, on synthetic operands, and
+    /// the fastest kept in `store`; the static [`Self::cfg`] choice where only
+    /// one fits or nothing measured. The launch entry consults
+    /// [`crate::tune::enabled`] before coming here.
     pub fn tuned(
         &self,
+        store: &crate::tune::TuneStore,
         spec: &svod_dtype::DeviceSpec,
         arch: svod_dtype::GpuArch,
         dtype: &DType,
         (m, k, n): (usize, usize, usize),
         epi: Epilogue<()>,
     ) -> Option<GemmCfg> {
-        let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
+        let caps = crate::ArchCaps::for_arch(arch);
+        let frag = caps.frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
         let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, frag);
         let candidates: Vec<GemmCfg> = self.tiles.iter().copied().filter(fits).collect();
         let fallback = || self.cfg(m, k, n).filter(fits);
-        if candidates.len() < 2 || !crate::tune::enabled() {
+        if candidates.len() < 2 {
             return fallback();
         }
-        let key = crate::tune::TuneKey::new("gemm_nt", spec, arch, &[m, k, n, dtype.bytes()], &candidates);
-        let measure = |i: usize| {
+        let cols = epi.out_cols(n);
+        let build = move |ker: &Kernel, cfg: GemmCfg| {
+            build_gemm_nt(ker, (m, k, n), cfg, dtype.clone(), dtype.clone(), epi);
+            ker.finish(cfg.acc_m)
+        };
+        // The key covers the candidate kernels themselves: their graphs, built
+        // against placeholder buffers, fingerprinted in table order.
+        let placeholders = || {
+            let mut sizes = vec![m * cols, m * k, n * k];
+            if let Epilogue::Add(()) = epi {
+                sizes.push(m * cols);
+            }
+            sizes.into_iter().map(|size| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype.clone())).collect()
+        };
+        let builds: Vec<u128> = candidates
+            .iter()
+            .map(|&cfg| {
+                let ker =
+                    Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), placeholders(), caps);
+                crate::kernel_fingerprint(&build(&ker, cfg)).digest
+            })
+            .collect();
+        let shape = [m, k, n, dtype.bytes(), epi.code()];
+        let key = crate::tune::TuneKey::new("gemm_nt", spec, arch, &shape, &builds);
+        let compile = |i: usize| {
             let cfg = candidates[i];
-            let caps = crate::ArchCaps::for_arch(arch);
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
             let (x, w) = (operand(&[m, k])?, operand(&[n, k])?);
-            let mut y = Tensor::empty(&[m, n], dtype.clone()).to(spec.clone());
-            let dt = dtype.clone();
-            let launch = crate::launch::compile_kernel(
-                "gemm_nt_tune",
-                cfg.grid_dims(m, n),
-                cfg.threads(caps.wave_size),
-                &mut [&mut y],
-                &[&x, &w],
-                move |ker| {
-                    build_gemm_nt(ker, (m, k, n), cfg, dt.clone(), dt, Epilogue::Plain);
-                    ker.finish(cfg.acc_m)
-                },
-            )
-            .ok()?;
-            crate::tune::min_dispatch_ns(&launch, 3)
+            let mut ins = vec![x, w];
+            if let Epilogue::Add(()) = epi {
+                ins.push(operand(&[m, cols])?);
+            }
+            let ins: Vec<&Tensor> = ins.iter().collect();
+            let mut y = Tensor::empty(&[m, cols], dtype.clone()).to(spec.clone());
+            let (grid, block) = (cfg.grid_dims(m, n), cfg.threads(caps.wave_size));
+            crate::launch::compile_kernel("gemm_nt_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, cfg))
+                .ok()
         };
-        crate::tune::TuneStore::global()
-            .select(&key, candidates.len(), measure)
-            .map(|i| candidates[i])
-            .or_else(fallback)
+        store.select(&key, candidates.len(), compile).map(|i| candidates[i]).or_else(fallback)
     }
 
     /// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be
@@ -805,7 +835,9 @@ impl GemmPolicy {
 }
 
 /// [`GemmPolicy::swiglu_pair_width`] for the device behind `spec` — `None` off
-/// the supported arches, where the weight stays plainly stacked.
+/// the supported arches, where the weight stays plainly stacked. The row order
+/// is fixed when the weight is loaded, so a model loaded on the host and moved
+/// to a GPU afterwards keeps the plain stacking (and the separate SwiGLU pass).
 pub fn swiglu_pair_width(spec: &svod_dtype::DeviceSpec) -> Option<usize> {
     let arch = crate::target::resolve_supported_arch(spec, GEMM_NT_SUPPORTED_ARCHS).ok()?;
     GemmPolicy::for_arch(arch).swiglu_pair_width()
@@ -897,7 +929,12 @@ pub fn gemm_nt_with_epilogue(
 ) -> crate::LaunchResult<Option<Tensor>> {
     let (spec, dtype, kind) = (x.device(), x.uop().dtype(), epilogue.kind());
     build_gemm(x, w, epilogue, |arch, m, k, n| {
-        GemmPolicy::for_device(&spec, arch).tuned(&spec, arch, &dtype, (m, k, n), kind)
+        let policy = GemmPolicy::for_device(&spec, arch);
+        if !crate::tune::enabled() {
+            let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
+            return policy.cfg(m, k, n).filter(|c| c.carries(kind, frag.map(|f| f.base.cols)));
+        }
+        policy.tuned(crate::tune::TuneStore::global(), &spec, arch, &dtype, (m, k, n), kind)
     })
 }
 
@@ -1216,7 +1253,8 @@ pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
 /// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes) and CUDA sm_80+
 /// (`mma.sync.m16n8k16`, warp32 — the two-half `RT_16X16_MMA` fragment). The
 /// launcher gates against this; see [`crate::target::check_target`]. Validated on
-/// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere).
+/// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere) — gfx942 before the
+/// vector LDS gathers (PR #177), not re-run since.
 pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
     crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
         .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
