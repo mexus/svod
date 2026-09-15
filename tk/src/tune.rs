@@ -2,8 +2,9 @@
 //!
 //! A kernel's per-family table is a search space, not an answer: the first time
 //! a device meets a shape, every candidate that fits it is compiled and timed
-//! on synthetic operands of that shape — the clock lifted first
-//! ([`svod_runtime::benchmark::warm_clock`]), the candidates timed in turn over
+//! on synthetic operands of that shape — the clock lifted first, for as long as
+//! the kernel's time keeps falling ([`svod_runtime::benchmark::warm_clock`]; a
+//! device already under load pays a few dozen runs), the candidates timed in turn over
 //! several rounds ([`svod_runtime::benchmark::round_robin_min`]) so none is
 //! judged at a clock the others were not — and the winner is kept, in the
 //! store's memo and on disk so the next process starts tuned. Measurement is
@@ -168,7 +169,7 @@ impl TuneStore {
             let launches: Vec<Option<CompiledLaunch>> = (0..count).map(compile).collect();
             if let Some(first) = launches.iter().flatten().next() {
                 // SAFETY: the launch's buffers live in `first` for the whole loop.
-                warm_clock(CLOCK_WARMUP, || unsafe { first.dispatch(true) }.is_ok());
+                warm_clock(CLOCK_WARMUP, || first.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos));
             }
             let time = |i: usize| launches[i].as_ref()?.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos);
             round_robin_min(count, ROUNDS, time).into_iter().map(|t| t.map(|t| t.as_nanos() as u64)).collect()

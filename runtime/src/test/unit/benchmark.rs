@@ -127,24 +127,57 @@ fn benchmark_prefers_gpu_stamped_durations() {
     assert!(result.runs.iter().all(|run| *run == Duration::from_micros(7)), "{:?}", result.runs);
 }
 
-/// The clock warm-up runs back to back for the budget and stops early the
-/// moment a dispatch fails, so a broken kernel does not burn the budget.
+/// The clock warm-up stops the moment a dispatch fails, so a broken kernel does
+/// not burn the budget.
 #[test]
-fn warm_clock_runs_for_the_budget_and_stops_on_failure() {
-    let mut runs = 0;
-    warm_clock(Duration::from_millis(20), || {
-        runs += 1;
-        std::thread::sleep(Duration::from_millis(1));
-        true
-    });
-    assert!((5..=40).contains(&runs), "{runs} runs in 20 ms of 1 ms dispatches");
-
+fn warm_clock_stops_on_failure() {
     let mut runs = 0;
     warm_clock(Duration::from_secs(10), || {
         runs += 1;
-        runs < 3
+        (runs < 3).then_some(Duration::from_micros(1))
     });
     assert_eq!(runs, 3, "stops at the first failure");
+}
+
+/// A device whose kernel time keeps falling is run until the budget; one whose
+/// time has plateaued is released after the floor, and one that is warm from
+/// the start pays only the floor.
+#[test]
+fn warm_clock_runs_until_the_time_plateaus_or_the_budget_ends() {
+    // Still falling by 15% per window when the budget ends: runs out the
+    // budget, past the floor.
+    let mut runs = 0u32;
+    let start = Instant::now();
+    warm_clock(Duration::from_millis(100), || {
+        runs += 1;
+        std::thread::sleep(Duration::from_millis(1));
+        Some(Duration::from_secs_f64(0.01 * 0.85f64.powi(runs as i32 / 8)))
+    });
+    assert!(start.elapsed() >= Duration::from_millis(100), "a falling time runs out the budget");
+
+    // Cold for the first 32 runs, flat after: released after the floor, well
+    // before a 10 s budget, once two windows agree.
+    let mut runs = 0u64;
+    let start = Instant::now();
+    warm_clock(Duration::from_secs(10), || {
+        runs += 1;
+        std::thread::sleep(Duration::from_millis(1));
+        Some(Duration::from_micros(if runs <= 32 { 300 - 8 * runs } else { 40 }))
+    });
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(500), "{elapsed:?}");
+    assert!(runs >= 48, "at least the floor's runs and two flat windows: {runs}");
+
+    // Warm from the start: the floor, then out.
+    let mut runs = 0;
+    let start = Instant::now();
+    warm_clock(Duration::from_secs(10), || {
+        runs += 1;
+        std::thread::sleep(Duration::from_millis(1));
+        Some(Duration::from_micros(40))
+    });
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(300), "{elapsed:?}");
 }
 
 /// Candidates are timed in turn, round after round, each keeping its minimum;

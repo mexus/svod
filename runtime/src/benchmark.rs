@@ -57,11 +57,35 @@ impl Default for BenchmarkConfig {
 /// kernel times 3x apart cold.
 pub const CLOCK_WARMUP: Duration = Duration::from_millis(1500);
 
-/// Run `dispatch` back to back until `budget` of wall time has elapsed, or it
-/// reports failure. See [`BenchmarkConfig::warmup_budget`].
-pub fn warm_clock(budget: Duration, mut dispatch: impl FnMut() -> bool) {
+/// Dispatches per plateau check in [`warm_clock`].
+const WARM_WINDOW: usize = 8;
+/// The least a warm-up runs, so a plateau seen in the first window of a cold
+/// device (the clock has not started lifting yet) does not end it.
+const WARM_FLOOR: Duration = Duration::from_millis(50);
+
+/// Run `dispatch` back to back until the kernel's time stops falling — a cold
+/// device's clock lifts under load — or `budget` of wall time has elapsed, or a
+/// dispatch fails. `dispatch` returns one run's duration (`None` on failure).
+/// The time is checked one window of runs against the previous: once a window's
+/// minimum no longer beats the last by 5%, the clock is up. A device already
+/// under load plateaus in its first windows and pays only [`WARM_FLOOR`], so a
+/// tuner touching many shapes does not spend the budget on each. See
+/// [`BenchmarkConfig::warmup_budget`].
+pub fn warm_clock(budget: Duration, mut dispatch: impl FnMut() -> Option<Duration>) {
     let start = Instant::now();
-    while start.elapsed() < budget && dispatch() {}
+    let (mut previous, mut current, mut runs) = (Duration::MAX, Duration::MAX, 0usize);
+    while start.elapsed() < budget {
+        let Some(t) = dispatch() else { return };
+        current = current.min(t);
+        runs += 1;
+        if runs % WARM_WINDOW == 0 {
+            let lifted = current.as_secs_f64() >= previous.as_secs_f64() * 0.95;
+            if lifted && start.elapsed() >= WARM_FLOOR {
+                return;
+            }
+            (previous, current) = (current, Duration::MAX);
+        }
+    }
 }
 
 /// Each candidate's minimum over `rounds` rounds of timing every candidate in
@@ -134,7 +158,10 @@ pub unsafe fn benchmark_kernel(
 ) -> Result<BenchmarkResult> {
     // Warm-up (discarded): the clock budget, then the counted runs.
     if let Some(budget) = config.warmup_budget {
-        warm_clock(budget, || unsafe { kernel.execute(buffers, vals, global_size, local_size, true).is_ok() });
+        warm_clock(budget, || {
+            let start = Instant::now();
+            unsafe { kernel.execute(buffers, vals, global_size, local_size, true) }.ok().map(|_| start.elapsed())
+        });
     }
     for _ in 0..config.warmup_runs {
         // wait=true: benchmark needs each dispatch to complete before the next
