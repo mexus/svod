@@ -32,6 +32,13 @@ impl YoloScale {
     pub fn max_channels(self) -> usize {
         self.scaling().2
     }
+
+    /// Ultralytics' `parse_model` rewrites every `C3k2`'s `c3k` argument to
+    /// `true` for the M/L/X scales, so the shallow blocks the YAML marks
+    /// `False` still nest a `C3k` there instead of a plain bottleneck.
+    pub fn forces_c3k(self) -> bool {
+        matches!(self, YoloScale::Medium | YoloScale::Large | YoloScale::XLarge)
+    }
 }
 
 /// `ceil(value / divisor) * divisor` — Ultralytics `make_divisible`.

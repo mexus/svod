@@ -61,9 +61,9 @@ impl YoloBackboneP6 {
         Self {
             conv0: YoloConv::empty(3, c0, 3, 2, true),
             conv1: YoloConv::empty(c0, c1, 3, 2, true),
-            c3k2_2: C3k2::empty(c1, c2, d(2), true, 0.25, false, false),
+            c3k2_2: C3k2::empty(c1, c2, d(2), true, 0.25, scale.forces_c3k(), false),
             conv3: YoloConv::empty(c2, c2, 3, 2, true),
-            c3k2_4: C3k2::empty(c2, c3, d(2), true, 0.25, false, false),
+            c3k2_4: C3k2::empty(c2, c3, d(2), true, 0.25, scale.forces_c3k(), false),
             conv5: YoloConv::empty(c3, c3, 3, 2, true),
             c3k2_6: C3k2::empty(c3, c3, d(2), true, 0.5, true, false),
             conv7: YoloConv::empty(c3, c5, 3, 2, true),
