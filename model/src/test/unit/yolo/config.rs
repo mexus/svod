@@ -1,4 +1,4 @@
-use svod_tensor::nn::Module;
+use svod_tensor::nn::{Module, get_tensor};
 use test_case::test_case;
 
 use crate::yolo::{Yolo26Detect, YoloConfig, YoloScale, make_depth, make_divisible, scale_channels};
@@ -53,7 +53,7 @@ fn c3k_is_forced_for_medium_and_up(scale: YoloScale, expected: bool) {
 #[test_case(YoloScale::XLarge, [48, 96, 1, 1], [48, 96, 1, 1])]
 fn shallow_c3k2_blocks_follow_the_scale(scale: YoloScale, cv1: [usize; 4], cv2: [usize; 4]) {
     let sd = Yolo26Detect::with_zero_weights(YoloConfig::new(scale, 80)).state_dict("");
-    let dims = |key: &str| sd.get(key).unwrap_or_else(|| panic!("missing {key}")).dims().expect("dims");
+    let dims = |key: &str| get_tensor(&sd, key).expect("state-dict key").dims().expect("dims");
 
     assert_eq!(dims("2.m.0.cv1.conv.weight"), cv1);
     assert_eq!(dims("2.m.0.cv2.conv.weight"), cv2);
