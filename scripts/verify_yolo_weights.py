@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -51,9 +52,15 @@ def sha256(path: Path) -> str:
 
 
 def fetch_hub(repo_id: str) -> Path:
-    """Download `model.safetensors` into the working directory."""
+    """Download `model.safetensors` into a throwaway temp directory.
+
+    Not the working directory: a CWD-local download would litter 236 MB
+    wherever the script runs from -- or clobber `data/yolo/`'s pristine
+    local conversion when run from there, silently disarming the
+    tensor-for-tensor comparison below.
+    """
     url = f"https://huggingface.co/{repo_id}/resolve/main/model.safetensors"
-    dst = Path("model.safetensors")
+    dst = Path(tempfile.mkdtemp(prefix="svod-yolo-")) / "model.safetensors"
     print(f"downloading {url} ...")
     with urllib.request.urlopen(url, timeout=600) as src, dst.open("wb") as out:
         while chunk := src.read(1 << 20):

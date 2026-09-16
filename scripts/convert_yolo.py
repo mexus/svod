@@ -16,7 +16,7 @@ HuggingFace repo `parity.rs` names, which lets the test fetch weights without
 PyTorch. Publishing an update means uploading the regenerated
 `data/yolo/model.safetensors` and checking it first:
 
-  pip install ultralytics safetensors torch pillow
+  pip install ultralytics==8.4.153 safetensors torch pillow
   python scripts/convert_yolo.py
   python scripts/verify_yolo_weights.py data/yolo/model.safetensors
   # upload data/yolo/model.safetensors to the Hub repo, then re-verify via --hub
@@ -81,16 +81,17 @@ def checkpoint() -> Path:
 def raw_predictions(net: torch.nn.Module, images: torch.Tensor) -> torch.Tensor:
     """The decoded `[B, 4 + nc, A]` tensor, before top-k selection.
 
-    YOLO26's head is end-to-end, so calling the model returns
-    `(postprocessed, aux)` where `postprocessed` is `[B, max_det, 6]` -- boxes
-    already selected and paired with a score and a class. `Yolo26Detect::forward`
-    stops earlier than that, so take the branches `aux` carries and decode them
-    the way it does.
+    YOLO26's head is end-to-end, so calling the model returns `(y, aux)`: the
+    raw `one2many`/`one2one` branches in `aux`, and the head's own decode of
+    one branch in `y`. `Yolo26Detect::forward` stops earlier than that, so
+    take the `one2one` branch `aux` carries and decode it the way it does.
 
     The head's own `_inference` is deliberately not used: it decodes through
-    `decode_bboxes(xywh=not end2end, ...)`, and `end2end` is a property that
-    reads `False` on an unfused model, so it yields centre/width/height while
-    svod yields corners. Decoding explicitly keeps both sides on xyxy.
+    `decode_bboxes(...)`, which passes `xywh and not end2end and not xyxy`
+    down to `dist2bbox` -- and `end2end` is a property that reads `False` on
+    an unfused model (`xyxy` is `False` by default), so it yields
+    centre/width/height while svod yields corners. Decoding explicitly with
+    `xywh=False` keeps both sides on xyxy.
     """
     with torch.no_grad():
         out = net(images)
