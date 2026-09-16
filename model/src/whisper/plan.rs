@@ -34,6 +34,13 @@ impl WhisperPlan {
         plan
     }
 
+    /// Capacities for a driver that hands over one window at a time, as the
+    /// ASR pipeline does for a transcriber that advances by what it decoded:
+    /// the encoder and aligner at batch 1, the decoder slots kept for the beam.
+    pub fn sequential(dims: &ModelDimensions, size: WhisperSize) -> Self {
+        Self { encoder_batch: 1, alignment_batch: 1, ..Self::for_model(dims, size) }
+    }
+
     /// Validate that every compiled capacity is nonzero.
     pub fn validate(&self) -> std::result::Result<(), &'static str> {
         if self.encoder_batch == 0 {

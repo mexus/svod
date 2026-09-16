@@ -81,7 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let window = CHUNK_LENGTH * SAMPLE_RATE;
-    let plan = WhisperPlan::for_model(&model.dims, size);
+    // The fixed-length splitter under `Asr` hands over one window at a time.
+    let plan = WhisperPlan::sequential(&model.dims, size);
     let transcriber = WhisperAlignedTranscriber::new_with_plan(model, tokenizer, options, size, window, plan)?;
     let mut asr = Asr::new(FixedLengthSplitter::new(window, SAMPLE_RATE), transcriber);
 
