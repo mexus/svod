@@ -57,12 +57,13 @@ const SUBGROUP: usize = 8;
 /// The partial kernel is one wave per `(row, head, split)` streaming its chunk
 /// of keys, a latency-bound loop; the device needs enough of those waves in
 /// flight to reach its bandwidth, and each split costs a merge pass and a
-/// launch, so a chunk should not get too short.
+/// launch, so a chunk should not get too short. The budget is the device's own
+/// count of resident waves; the floor is a kernel property, in loop trips.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqPolicy {
     pub compute_units: usize,
     /// Waves per compute unit the split aims to keep in flight; `0` keeps one
-    /// split, for a family nobody has measured.
+    /// split, for a device that does not report its budget.
     pub waves_per_cu: usize,
     /// Fewest keys a split may hold.
     pub min_chunk: usize,
@@ -75,32 +76,35 @@ pub struct SqPolicy {
 /// around the policy's target.
 const SQ_CANDIDATES: usize = 4;
 
+/// Fewest loop trips a split may leave a wave. Below it the merge pass and the
+/// extra launch outweigh the parallelism: on whisper large-v3's cross
+/// attention (b=5, h=20, n=1500, f16 cache) on a wave32 RDNA part every split
+/// leaving 60 keys or more sat within 5% of the best, while on a wave32 Ampere
+/// part the splits between 2 and 10 did.
+const MIN_TRIPS: usize = 15;
+
 impl SqPolicy {
-    /// RDNA (measured on whisper large-v3 cross attention, b=5, h=20, n=1500,
-    /// f16 cache, 40 CUs): 32 waves per CU with chunks of at least 60 keys —
-    /// splits 10 to 25 all sit within 5% of each other at ~46 µs, split 1 at
-    /// 316 µs and split 4 at 125. CDNA, CUDA and Metal are unmeasured and keep
-    /// one split.
-    pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
+    /// A policy for `arch` that aims `compute_units * waves_per_cu` waves at
+    /// the device; `waves_per_cu == 0` keeps one split.
+    pub fn with_budget(arch: svod_dtype::GpuArch, compute_units: usize, waves_per_cu: usize) -> Self {
         let keys_per_trip = ArchCaps::for_arch(arch).wave_size / SUBGROUP;
-        match crate::arch::Family::of(arch) {
-            crate::arch::Family::Rdna => Self { compute_units: 40, waves_per_cu: 32, min_chunk: 60, keys_per_trip },
-            _ => Self { compute_units: 1, waves_per_cu: 0, min_chunk: 1, keys_per_trip },
-        }
+        Self { compute_units, waves_per_cu, min_chunk: MIN_TRIPS * keys_per_trip, keys_per_trip }
     }
 
-    /// [`Self::for_arch`] with the compute units of the device behind `spec`.
+    /// The policy of the device behind `spec`: its compute units and the waves
+    /// each keeps resident ([`crate::target::resident_waves_per_cu`]); one
+    /// split when the backend reports neither.
     pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Self {
-        let mut policy = Self::for_arch(arch);
-        if let Some(compute_units) = crate::target::compute_units(spec) {
-            policy.compute_units = compute_units;
-        }
-        policy
+        let budget = crate::target::compute_units(spec).zip(crate::target::resident_waves_per_cu(spec));
+        let (compute_units, waves_per_cu) = budget.unwrap_or((1, 0));
+        Self::with_budget(arch, compute_units, waves_per_cu)
     }
 
-    /// The divisors of `n` that leave every chunk at least `min_chunk` keys,
-    /// nearest the wave budget first, a chunk with a partial tail counting as a
-    /// little further off. Empty when the policy keeps one split.
+    /// The divisors of `n` above one that leave every chunk at least
+    /// `min_chunk` keys, nearest the wave budget first, a chunk with a partial
+    /// tail counting as a little further off. Empty when the policy keeps one
+    /// split, or when no split qualifies: the unsplit kernel is the fallback,
+    /// never a candidate.
     pub fn candidates(&self, b: usize, h: usize, n: usize) -> Vec<usize> {
         if self.waves_per_cu == 0 || b * h == 0 {
             return Vec::new();
@@ -108,7 +112,7 @@ impl SqPolicy {
         let target = (self.compute_units * self.waves_per_cu).div_ceil(b * h);
         let distance =
             |s: usize| s.abs_diff(target) + usize::from(!(n / s).is_multiple_of(self.keys_per_trip)) * target / 4;
-        let mut splits: Vec<usize> = (1..=n).filter(|s| n.is_multiple_of(*s) && n / s >= self.min_chunk).collect();
+        let mut splits: Vec<usize> = (2..=n).filter(|s| n.is_multiple_of(*s) && n / s >= self.min_chunk).collect();
         splits.sort_by_key(|&s| distance(s));
         splits.truncate(SQ_CANDIDATES);
         splits

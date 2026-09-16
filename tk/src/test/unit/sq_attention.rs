@@ -496,22 +496,24 @@ fn undivisible_head_dim_declines_instead_of_erroring() {
 // ─── Split policy ────────────────────────────────────────────────────────────
 
 /// The policy aims the split at the wave budget over divisors that keep a
-/// chunk, preferring chunks with no partial tail; a family nobody measured
-/// keeps one split, and so does a key range too short to chunk.
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 5, 20, 1500, 15, &[5, 10, 12, 15]; "whisper large cross attention on rdna")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 1, 6, 1500, 25, &[3, 5, 15, 25]; "tiny heads want more splits")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 5, 20, 64, 1, &[1]; "a short key range stays whole")]
-#[test_case(GpuArch::Amd(AmdArch::Gfx942), 5, 20, 1500, 1, &[]; "cdna is unmeasured and keeps one split")]
-#[test_case(SM_86, 5, 20, 1500, 1, &[]; "cuda is unmeasured and keeps one split")]
+/// chunk, preferring chunks with no partial tail; a device that reports no
+/// budget keeps one split, and so does a key range too short to chunk.
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 5, 20, 1500, 15, &[5, 10, 12, 15]; "whisper large cross attention on a 40-cu rdna part")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 1, 6, 1500, 25, &[3, 5, 15, 25]; "tiny heads want more splits")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 5, 20, 64, 1, &[]; "a short key range stays whole")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx942), (304, 32), 5, 20, 1500, 12, &[5, 6, 10, 12]; "a 304-cu wave64 part is capped by its 120-key floor")]
+#[test_case(SM_86, (28, 16), 5, 20, 1500, 5, &[3, 4, 5, 6]; "whisper large cross attention on a 28-sm ampere part")]
+#[test_case(SM_86, (28, 0), 5, 20, 1500, 1, &[]; "no budget keeps one split")]
 fn sq_policy_splits_toward_the_wave_budget(
     arch: GpuArch,
+    (compute_units, waves_per_cu): (usize, usize),
     b: usize,
     h: usize,
     n: usize,
     split: usize,
     candidates: &[usize],
 ) {
-    let policy = crate::SqPolicy::for_arch(arch);
+    let policy = crate::SqPolicy::with_budget(arch, compute_units, waves_per_cu);
     assert_eq!(policy.split(b, h, n), split);
     let mut sorted = policy.candidates(b, h, n);
     sorted.sort_unstable();
@@ -520,12 +522,15 @@ fn sq_policy_splits_toward_the_wave_budget(
     assert_eq!(sorted, expected);
 }
 
-/// Every candidate the policy hands the tuner is a legal split of `n`.
-#[test]
-fn sq_policy_candidates_divide_the_keys() {
-    let policy = crate::SqPolicy::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
+/// Every candidate the policy hands the tuner is a legal split of `n` that
+/// leaves each wave its floor of loop trips, on either wave size.
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151); "wave32")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx942); "wave64")]
+fn sq_policy_candidates_divide_the_keys(arch: GpuArch) {
+    let policy = crate::SqPolicy::with_budget(arch, 40, 32);
     for n in [448, 1500, 1536, 3000] {
         for split in policy.candidates(5, 20, n) {
+            assert!(split > 1, "n {n} split {split}");
             assert_eq!(n % split, 0, "n {n} split {split}");
             assert!(n / split >= policy.min_chunk, "n {n} split {split}");
         }
@@ -561,4 +566,23 @@ fn sq_policy_split_matches_a_single_split() {
     let (whole, policy) = (run(Some(1)), run(None));
     let max_abs = whole.iter().zip(&policy).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
     assert!(max_abs < 1e-4, "policy split max abs error {max_abs}");
+}
+
+/// The device policy carries the device's own counts, not the family's
+/// reference device. `SVOD_DEVICE={AMD,CUDA}:0 cargo test -p svod-tk --lib sq_policy_reads -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn sq_policy_reads_the_device_budget_gpu() {
+    if !supported_device() {
+        return;
+    }
+    let spec = svod_tensor::Tensor::empty(&[1], DType::Float32).device();
+    let arch = crate::target::resolve_arch(&spec).expect("a GPU arch");
+    let policy = crate::SqPolicy::for_device(&spec, arch);
+    eprintln!("{policy:?}");
+    if policy.waves_per_cu == 0 {
+        return;
+    }
+    assert_eq!(Some(policy.compute_units), crate::target::compute_units(&spec));
+    assert_eq!(Some(policy.waves_per_cu), crate::target::resident_waves_per_cu(&spec));
 }
