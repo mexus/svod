@@ -2,10 +2,18 @@ use svod_dtype::DType;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{BatchNorm2d, Conv2d, ConvTranspose2d, Layer, Module};
 
-use crate::blocks::{batchnorm2d, conv2d, conv2d_grouped};
+use crate::blocks::{batchnorm2d_with_eps, conv2d, conv2d_grouped};
 use crate::init::fan_in_uniform;
 
 use crate::yolo::error::Result;
+
+/// Ultralytics' `initialize_weights` rewrites every BatchNorm's epsilon to
+/// 1e-3, so YOLO checkpoints are not normalized with PyTorch's 1e-5 default.
+pub const YOLO_BN_EPS: f64 = 1e-3;
+
+fn bn(channels: usize) -> BatchNorm2d {
+    batchnorm2d_with_eps(channels, YOLO_BN_EPS)
+}
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
@@ -47,13 +55,13 @@ pub struct YoloConv {
 
 impl YoloConv {
     pub fn empty(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, act: bool) -> Self {
-        Self { conv: conv2d(out_ch, in_ch, kernel, stride, kernel / 2), bn: batchnorm2d(out_ch), act }
+        Self { conv: conv2d(out_ch, in_ch, kernel, stride, kernel / 2), bn: bn(out_ch), act }
     }
 
     /// Depthwise variant: `groups = gcd(in_ch, out_ch)`.
     pub fn empty_dw(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, act: bool) -> Self {
         let groups = gcd(in_ch, out_ch);
-        Self { conv: conv2d_grouped(out_ch, in_ch, kernel, stride, kernel / 2, groups), bn: batchnorm2d(out_ch), act }
+        Self { conv: conv2d_grouped(out_ch, in_ch, kernel, stride, kernel / 2, groups), bn: bn(out_ch), act }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
