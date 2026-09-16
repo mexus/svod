@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 use svod_ir::uop::{reaching, reaching_each};
-use svod_ir::{AxisId, AxisType, BinaryOp, Op, TernaryOp, UOp};
+use svod_ir::{AxisId, AxisType, BinaryOp, Op, RendererDevice, TernaryOp, UOp};
 
 use crate::optimizer::config::{HeuristicsConfig, TcOpt};
-use crate::optimizer::renderer::{TcTilePolicy, TensorCore};
+use crate::optimizer::error::OptError;
+use crate::optimizer::renderer::{Renderer, TcTilePolicy, TensorCore};
 use crate::optimizer::tc::matmul_operands;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 use svod_ir::ops;
@@ -787,29 +788,67 @@ fn find_axis_by_axis_id(scheduler: &Scheduler, axis_id: AxisId) -> Option<usize>
     })
 }
 
-/// Matvec fast-path.
+/// The matvec fast path's tiling on one device: `block` rows per workgroup,
+/// `lanes` threads splitting each row's reduce, `rows` accumulated per thread,
+/// and the reduce `unroll` behind the lanes (`0`: none).
 ///
-/// Applies `GROUP` on the reduce axis and `LOCAL`/`UPCAST` on one global output
-/// axis when the index structure matches matrix-vector style access.
+/// The AMD targets put one wave on each row group, so a row's reduce is one
+/// coalesced sweep with the lanes unrolled to the vector access width; the
+/// other targets keep tinygrad's 8x4x4 split. Each of the config's matvec
+/// fields overrides its default.
+struct MatvecTile {
+    block: usize,
+    lanes: usize,
+    rows: usize,
+    unroll: usize,
+}
+
+impl MatvecTile {
+    fn resolve(config: &HeuristicsConfig, renderer: &Renderer, elem_bytes: usize) -> Self {
+        let amd = matches!(
+            renderer.device,
+            RendererDevice::AmdRdna3 | RendererDevice::AmdRdna4 | RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4
+        );
+        let (lanes, rows, unroll) =
+            if amd { (renderer.wave_size(), 1, renderer.access_bytes() / elem_bytes.max(1)) } else { (8, 4, 0) };
+        Self {
+            block: config.matvec_blocksize.unwrap_or(4),
+            lanes: config.threads_per_row.unwrap_or(lanes),
+            rows: config.rows_per_thread.unwrap_or(rows),
+            unroll,
+        }
+    }
+}
+
+/// The physical axis whose range carries `axis_id`, after opts have moved it.
+fn axis_of(scheduler: &Scheduler, axis_id: &AxisId) -> Option<usize> {
+    find_axis_by_axis_id(scheduler, axis_id.clone())
+}
+
+fn axis_id_of(scheduler: &Scheduler, axis: usize) -> Option<AxisId> {
+    match scheduler.rngs().get(axis)?.op() {
+        Op::Range(ops::Range { axis_id, .. }) => Some(axis_id.clone()),
+        _ => None,
+    }
+}
+
+/// Matvec fast path: `y[.., n] = sum_k x[.., k] * w[n, k]` with a contiguous
+/// reduce in the first operand.
+///
+/// Output axes that only one operand indexes and that fit an upcast — a skinny
+/// batch of rows through the same weights, a decoder step's tokens — are upcast
+/// so each thread reads a weight row once for all of them. The reduce is then
+/// split across `lanes` threads (GROUP), one row axis takes `block` rows per
+/// workgroup (LOCAL, padded to the tile when that stays cheap) and `rows` per
+/// thread (UPCAST), and the reduce left to each lane is unrolled to the vector
+/// access width. GROUP precedes UNROLL: an unrolled reduce range no longer
+/// belongs to its REDUCE.
 pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use tracing::debug;
 
-    let block_size = config.matvec_blocksize;
-    let threads_per_row = config.threads_per_row;
-    let rows_per_thread = config.rows_per_thread;
-
-    if !scheduler.renderer().has_local
-        || !scheduler.renderer().has_shared
-        || !config.matvec_enabled
-        || (block_size <= 1 && threads_per_row <= 1 && rows_per_thread <= 1)
-    {
+    if !scheduler.renderer().has_local || !scheduler.renderer().has_shared || !config.matvec_enabled {
         return false;
     }
-
-    if block_size == 0 || threads_per_row == 0 || rows_per_thread == 0 {
-        return false;
-    }
-
     let Some(reduceop) = scheduler.reduceop() else {
         return false;
     };
@@ -822,93 +861,132 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
     let (left, right) = (left.unwrap_cast(), right.unwrap_cast());
     let (idx0_src, idx1_src) = match (left.op(), right.op()) {
         (Op::Index(ops::Index { indices: i0, .. }), Op::Index(ops::Index { indices: i1, .. })) => {
-            let Some(i0) = i0.first() else {
-                return false;
-            };
-            let Some(i1) = i1.first() else {
-                return false;
-            };
-            (i0.get_idx(), i1.get_idx())
+            match (i0.first(), i1.first()) {
+                (Some(i0), Some(i1)) => (i0.get_idx(), i1.get_idx()),
+                _ => return false,
+            }
         }
         _ => return false,
     };
+    let tile = MatvecTile::resolve(config, scheduler.renderer(), left.dtype().bytes());
+    if tile.block == 0 || tile.lanes == 0 || tile.rows == 0 || (tile.block <= 1 && tile.lanes <= 1 && tile.rows <= 1) {
+        return false;
+    }
 
-    let Some(first_reduce_rng) = scheduler.ranges_of(&[AxisType::Reduce]).first().cloned() else {
+    // The reduce the lanes split: a top-level ADD term of the first operand's
+    // index, i.e. contiguous there.
+    let reduce_ranges = scheduler.ranges_of(&[AxisType::Reduce]);
+    let idx0_terms = idx0_src.split_uop(BinaryOp::Add);
+    let Some(reduce_logical) =
+        reduce_ranges.iter().position(|rng| idx0_terms.iter().any(|term| Arc::ptr_eq(term, rng)))
+    else {
         return false;
     };
-
-    // 1) idx0 must contain the first reduce range as a top-level ADD term.
-    // 2) idx1 must include all ranges used by idx0.
-    let idx0_has_first_reduce = idx0_src.split_uop(BinaryOp::Add).iter().any(|u| Arc::ptr_eq(u, &first_reduce_rng));
-    if !idx0_has_first_reduce {
-        return false;
-    }
-
-    let idx1_ranges = idx1_src.ranges();
-    if !idx0_src.ranges().iter().all(|r| idx1_ranges.iter().any(|cand| Arc::ptr_eq(cand, r))) {
-        return false;
-    }
-
-    if !matches!(first_reduce_rng.op(), Op::Range(ops::Range { end, .. }) if end.divides(threads_per_row as i64).is_some())
+    if !matches!(reduce_ranges[reduce_logical].op(), Op::Range(ops::Range { end, .. }) if end.divides(tile.lanes as i64).is_some())
     {
         return false;
     }
 
-    let Some(row_tile) = block_size.checked_mul(rows_per_thread) else {
-        return false;
-    };
-    if row_tile == 0 {
+    // Output axes only one operand indexes: small ones are upcast, one of the
+    // rest is the row axis.
+    let (ranges0, ranges1) = (idx0_src.ranges(), idx1_src.ranges());
+    let exclusive =
+        |rng: &Arc<UOp>| ranges0.iter().any(|r| Arc::ptr_eq(r, rng)) != ranges1.iter().any(|r| Arc::ptr_eq(r, rng));
+    let full_shape = scheduler.full_shape();
+    let upcast_max = scheduler.renderer().upcast_max;
+    let (mut small, mut candidates) = (Vec::new(), Vec::new());
+    for axis in scheduler.axes_of(&[AxisType::Global]) {
+        let extent = usize::try_from(full_shape[axis]).unwrap_or(0);
+        if extent > 1 && extent <= upcast_max && exclusive(&scheduler.rngs()[axis]) {
+            small.push((axis, extent));
+        } else {
+            candidates.push(axis);
+        }
+    }
+    // A second large exclusive axis makes this a matrix product, whose rows
+    // would each re-read the weights: not this path.
+    if candidates.iter().filter(|&&axis| exclusive(&scheduler.rngs()[axis])).count() > 1 {
         return false;
     }
+    if candidates.is_empty() {
+        // Nothing left for the rows: the smallest exclusive axis is them.
+        candidates.extend(small.pop().map(|(axis, _)| axis));
+    }
+    let Some(small_ids) = small
+        .iter()
+        .map(|&(axis, extent)| axis_id_of(scheduler, axis).map(|id| (id, extent)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
 
-    let full_shape = scheduler.full_shape();
-    for global_idx in scheduler.axes_of(&[AxisType::Global]) {
-        let Some(&global_dim) = full_shape.get(global_idx) else {
-            continue;
-        };
-        if global_dim <= 0 {
+    let row_tile = tile.block * tile.rows;
+    for row_axis in candidates {
+        let Some(&extent) = full_shape.get(row_axis) else { continue };
+        let Ok(extent) = usize::try_from(extent) else { continue };
+        if extent == 0 {
             continue;
         }
         // An axis the row tile does not divide is padded to it when that stays cheap.
-        let global_dim = global_dim as usize;
-        let padto = !global_dim.is_multiple_of(row_tile);
-        if padto && padded_extent(global_dim, row_tile).is_none() {
+        let padto = !extent.is_multiple_of(row_tile);
+        if padto && padded_extent(extent, row_tile).is_none() {
             continue;
         }
+        let Some(row_id) = axis_id_of(scheduler, row_axis) else { continue };
 
         let mut trial = scheduler.clone();
-        if padto && apply_opt(&mut trial, &Opt::padto(global_idx, row_tile), true).is_err() {
+        let applied = (|| -> Result<(), OptError> {
+            if padto {
+                apply_opt(&mut trial, &Opt::padto(row_axis, row_tile), true)?;
+            }
+            for (id, extent) in &small_ids {
+                let axis = axis_of(&trial, id).ok_or(OptError::MissingAxisParameter)?;
+                apply_opt(&mut trial, &Opt::upcast(axis, *extent), true)?;
+            }
+            if tile.lanes > 1 {
+                apply_opt(&mut trial, &Opt::group(reduce_logical, tile.lanes), true)?;
+            }
+            if tile.block > 1 {
+                let axis = axis_of(&trial, &row_id).ok_or(OptError::MissingAxisParameter)?;
+                apply_opt(&mut trial, &Opt::local(axis, tile.block), true)?;
+            }
+            if tile.rows > 1 {
+                let axis = axis_of(&trial, &row_id).ok_or(OptError::MissingAxisParameter)?;
+                apply_opt(&mut trial, &Opt::upcast(axis, tile.rows), true)?;
+            }
+            Ok(())
+        })();
+        if applied.is_err() {
             continue;
         }
 
-        // GROUP is best-effort in this fast path.
-        if threads_per_row > 1 {
-            let _ = apply_opt(&mut trial, &Opt::group(0, threads_per_row), true);
-        }
-
-        let mut current_axis = global_idx;
-        let axis_id = trial.rngs().get(current_axis).and_then(|rng| {
-            if let Op::Range(ops::Range { axis_id, .. }) = rng.op() { Some(axis_id.clone()) } else { None }
-        });
-
-        if block_size > 1 {
-            if apply_opt(&mut trial, &Opt::local(current_axis, block_size), true).is_err() {
-                continue;
-            }
-            if let Some(axis_id) = axis_id {
-                if let Some(updated_axis) = find_axis_by_axis_id(&trial, axis_id) {
-                    current_axis = updated_axis;
-                } else if rows_per_thread > 1 {
-                    continue;
+        // The reduce each lane still walks, unrolled to the access width or the
+        // widest power of two below it that divides evenly. Best effort: the
+        // tile stands without it.
+        if tile.unroll > 1 {
+            let unrollable = trial.unrollable_dims();
+            let residual: Vec<usize> = unrollable
+                .iter()
+                .enumerate()
+                .filter(|(_, axis)| {
+                    matches!(trial.rngs()[**axis].op(), Op::Range(ops::Range { axis_type: AxisType::Reduce, .. }))
+                })
+                .map(|(logical, _)| logical)
+                .collect();
+            if let [logical] = residual[..]
+                && let Op::Range(ops::Range { end, .. }) = trial.rngs()[unrollable[logical]].op()
+            {
+                let mut unroll = tile.unroll;
+                while unroll > 1 && end.divides(unroll as i64).is_none() {
+                    unroll /= 2;
+                }
+                if unroll > 1 {
+                    let _ = apply_opt(&mut trial, &Opt::unroll(logical, unroll), true);
                 }
             }
         }
 
-        if rows_per_thread > 1 && apply_opt(&mut trial, &Opt::upcast(current_axis, rows_per_thread), true).is_err() {
-            continue;
-        }
-
-        debug!(global_idx, block_size, threads_per_row, rows_per_thread, "apply_matvec_fast_path: applied");
+        debug!(row_axis, ?small, tile.block, tile.lanes, tile.rows, tile.unroll, "apply_matvec_fast_path: applied");
         *scheduler = trial;
         return true;
     }

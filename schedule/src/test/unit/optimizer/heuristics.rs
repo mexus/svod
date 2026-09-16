@@ -737,3 +737,41 @@ fn hand_coded_optimizations_runs_the_elementwise_ladder_in_order() {
     hand_coded_optimizations(&mut scheduler, &HeuristicsConfig::default());
     assert_eq!(scheduler.applied_opts, vec![Opt::upcast(0, 4), Opt::local(0, 32)]);
 }
+
+/// A skinny batch of rows through one weight (a decoder step's tokens) is
+/// upcast first, so each thread reads a weight row once for every token; the
+/// reduce split is a wave on AMD, unrolled to the 16-byte access, and tinygrad's
+/// 8x4x4 tile elsewhere.
+#[test_case(Renderer::amd_rdna3(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 8)]; "rdna keeps a wave per row group")]
+#[test_case(Renderer::amd_cdna3(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 64), Opt::local(0, 4), Opt::unroll(1, 4)]; "cdna keeps a wave per row group and its unroll divides the rest")]
+#[test_case(Renderer::amd_rdna3(), 5, DType::Float32, &[Opt::upcast(0, 5), Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 4)]; "the unroll follows the element width")]
+#[test_case(Renderer::amd_rdna3(), 1, DType::Float16, &[Opt::group(0, 32), Opt::local(0, 4), Opt::unroll(1, 8)]; "a single row has nothing to upcast")]
+#[test_case(Renderer::cuda(), 5, DType::Float16, &[Opt::upcast(0, 5), Opt::group(0, 8), Opt::local(0, 4), Opt::upcast(0, 4)]; "cuda keeps tinygrad's tile")]
+#[test_case(Renderer::amd_rdna3(), 64, DType::Float16, &[]; "rows past the upcast limit are not a skinny batch")]
+fn matvec_fast_path_upcasts_a_skinny_batch(renderer: Renderer, m: i64, stored: DType, expected: &[Opt]) {
+    let (applied, scheduler) = run(
+        matmul_accum(m, 1280, 1280, stored, DType::Float32),
+        renderer,
+        &HeuristicsConfig::default(),
+        apply_matvec_fast_path,
+    );
+    assert_eq!(applied, !expected.is_empty());
+    assert_eq!(scheduler.applied_opts, expected);
+}
+
+/// The config's matvec fields override the device tile, one at a time.
+#[test]
+fn matvec_config_overrides_the_device_tile() {
+    let config = HeuristicsConfig::builder().threads_per_row(16).rows_per_thread(2).matvec_blocksize(8).build();
+    let (applied, scheduler) = run(
+        matmul_accum(5, 1280, 1280, DType::Float16, DType::Float32),
+        Renderer::amd_rdna3(),
+        &config,
+        apply_matvec_fast_path,
+    );
+    assert!(applied);
+    assert_eq!(
+        scheduler.applied_opts,
+        &[Opt::upcast(0, 5), Opt::group(0, 16), Opt::local(0, 8), Opt::upcast(0, 2), Opt::unroll(1, 8)]
+    );
+}
