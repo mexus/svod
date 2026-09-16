@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use bon::bon;
 use snafu::{ResultExt, Snafu};
 use svod_arch::ctc::CtcDecoder;
+use svod_arch::pipelines::audio::RunOptions;
 use svod_arch::rnnt::{RnntDecoder, RnntOpts};
 use svod_runtime::{RunProfile, StageProfile};
 use svod_tensor::PrepareConfig;
@@ -350,7 +351,8 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
     /// batched encoder + per-head decode (CTC fused; RN-T deferred lane-wave)
     /// and the per-stage profile; the trait's `transcribe_chunks` default does
     /// the core-crop and stitch.
-    fn transcribe_windows(&mut self, windows: &[&[f32]], profile: bool) -> WindowDecode {
+    fn transcribe_windows(&mut self, windows: &[&[f32]], opts: RunOptions) -> WindowDecode {
+        let profile = opts.profile;
         use svod_arch::pipelines::audio::{Transcript, words_to_text};
 
         // No windows (silence-only audio): nothing to encode. Guards the
