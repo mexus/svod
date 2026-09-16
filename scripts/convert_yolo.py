@@ -1,27 +1,59 @@
 #!/usr/bin/env python3
-"""Generate golden test data for YOLO26n parity test.
+"""Generate the PyTorch fixtures for the YOLO26n parity test.
 
-Outputs golden.safetensors with:
-  - images:        [1, 3, 640, 640] f32 — a deterministic test image
-  - images_shape:  [4] i64 — shape of images
-  - output:        [1, 84, 2100] f32 — PyTorch inference output
+Writes to data/yolo/:
+  - model.safetensors    the checkpoint weights, fp32, PyTorch key names
+  - golden.safetensors
+      images        [1, 3, 640, 640] f32 -- the deterministic test image
+      images_shape  [4] i64
+      output        [1, 84, 8400] f32 -- what Yolo26Detect::forward returns
 
 Usage:
   pip install ultralytics safetensors torch
-  python scripts/convert_yolo.py  # writes to data/yolo/golden.safetensors
+  python scripts/convert_yolo.py  # writes both files to data/yolo/
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
 import torch
 from safetensors.torch import save_file
 
-WEIGHTS_URL_REPO = "ultralytics/yolo26n"
+ASSET = "yolo26n.pt"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data" / "yolo"
+SIDE = 640
+
+
+def deterministic_image() -> torch.Tensor:
+    """The gradient pattern the Rust example and the parity test both build."""
+    c = np.arange(3, dtype=np.int64)[:, None, None]
+    h = np.arange(SIDE, dtype=np.int64)[None, :, None]
+    w = np.arange(SIDE, dtype=np.int64)[None, None, :]
+    img = (c * 213 + h + w).astype(np.float32) / np.float32(SIDE + SIDE + 3 * 213)
+    return torch.from_numpy(img[None])
+
+
+def raw_predictions(net: torch.nn.Module, images: torch.Tensor) -> torch.Tensor:
+    """The decoded `[B, 4 + nc, A]` tensor, before top-k selection.
+
+    YOLO26's head is end-to-end, so calling the model returns
+    `(postprocessed, aux)` where `postprocessed` is `[B, max_det, 6]` -- boxes
+    already selected and paired with a score and a class. `Yolo26Detect::forward`
+    stops earlier than that, so comparing against it means re-running the head's
+    own inference step over the branch outputs `aux` carries.
+    """
+    with torch.no_grad():
+        out = net(images)
+    if not (isinstance(out, tuple) and isinstance(out[1], dict) and "one2one" in out[1]):
+        raise RuntimeError(
+            f"Expected an end-to-end head returning (preds, {{'one2one': ...}}), got {type(out)}. "
+            "Is this checkpoint really a YOLO26?"
+        )
+    detect = net.model[-1]
+    with torch.no_grad():
+        return detect._inference(out[1]["one2one"])
 
 
 def main() -> None:
@@ -29,45 +61,27 @@ def main() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load model
-    model = YOLO(f"{WEIGHTS_URL_REPO}.pt")
-    model.eval()
+    # Give Ultralytics an explicit path, otherwise it downloads the asset
+    # relative to the working directory and litters the repository root.
+    net = YOLO(str(OUTPUT_DIR / ASSET)).model.float().eval()
 
-    # Create deterministic input: gradient pattern normalized to [0, 1]
-    img = np.zeros((1, 3, 640, 640), dtype=np.float32)
-    for c in range(3):
-        for h in range(640):
-            for w in range(640):
-                img[0, c, h, w] = (h + w + c * 213) / (640 + 640 + 3 * 213)
+    weights = {k: v.contiguous() for k, v in net.state_dict().items() if v.is_floating_point()}
+    save_file(weights, str(OUTPUT_DIR / "model.safetensors"))
+    print(f"saved {len(weights)} tensors -> {OUTPUT_DIR / 'model.safetensors'}")
 
-    images_t = torch.from_numpy(img)
+    images = deterministic_image()
+    output = raw_predictions(net, images)
+    print(f"output shape: {tuple(output.shape)}")
 
-    # Run inference to get the raw model output (pre-NMS)
-    # Ultralytics YOLO.predict returns Results objects; we need the raw tensor.
-    # Use model.model directly (the nn.Module):
-    with torch.no_grad():
-        # YOLO export-mode forward returns [B, 4+nc, A]
-        output = model.model(images_t)
-
-    if isinstance(output, (list, tuple)):
-        output = output[0]
-
-    # Ensure output is [B, C, A]
-    if output.ndim == 3 and output.shape[0] != 1:
-        output = output.permute(0, 2, 1)  # [B, A, C] -> [B, C, A]
-
-    output_np = output.cpu().float().numpy()
-    print(f"output shape: {output_np.shape}")
-
-    # Save
-    golden = {
-        "images": images_t,
-        "images_shape": torch.tensor(list(images_t.shape), dtype=torch.int64),
-        "output": torch.from_numpy(output_np),
-    }
-    out_path = OUTPUT_DIR / "golden.safetensors"
-    save_file(golden, str(out_path))
-    print(f"saved {out_path}")
+    save_file(
+        {
+            "images": images,
+            "images_shape": torch.tensor(list(images.shape), dtype=torch.int64),
+            "output": output.contiguous(),
+        },
+        str(OUTPUT_DIR / "golden.safetensors"),
+    )
+    print(f"saved {OUTPUT_DIR / 'golden.safetensors'}")
 
 
 if __name__ == "__main__":
