@@ -32,7 +32,7 @@ use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
 use crate::launch::CompiledLaunch;
 
 /// Timed rounds over the candidates after the warm-up.
-const ROUNDS: usize = 3;
+pub(crate) const ROUNDS: usize = 3;
 
 /// What a measurement is keyed by: the device (arch and compute units), the
 /// kernel, its shape, and the candidate kernels themselves (their graph

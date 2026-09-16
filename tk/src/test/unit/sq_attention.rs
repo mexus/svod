@@ -277,7 +277,7 @@ fn sq_attention_broadcast_cache_matches_a_replicated_one() {
 
     for split in [1usize, 4] {
         let run = |k: &Tensor, v: &Tensor| {
-            let opts = SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+            let opts = SqAttentionOpts { key_lens: None, include_last: false, split: Some(split), cache_map: None };
             let out = crate::single_query_attention_packed(&q, k, v, head_offset, opts)
                 .expect("sq attention")
                 .expect("supported");
@@ -323,7 +323,7 @@ fn sq_attention_f16_cache_matches_f32_within_quantization() {
 
     for split in [1usize, 4] {
         let run = |k: &Tensor, v: &Tensor| {
-            let opts = SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+            let opts = SqAttentionOpts { key_lens: None, include_last: false, split: Some(split), cache_map: None };
             let out = crate::single_query_attention_packed(&q, k, v, head_offset, opts)
                 .expect("sq attention")
                 .expect("supported");
@@ -380,7 +380,7 @@ fn sq_attention_cache_map_reads_the_row_it_names() {
             &k,
             &v,
             head_offset,
-            SqAttentionOpts { cache_map: Some(&map), split, ..Default::default() },
+            SqAttentionOpts { cache_map: Some(&map), split: Some(split), ..Default::default() },
         )
         .expect("mapped")
         .expect("supported");
@@ -390,7 +390,7 @@ fn sq_attention_cache_map_reads_the_row_it_names() {
             &wide_k,
             &wide_v,
             head_offset,
-            SqAttentionOpts { split, ..Default::default() },
+            SqAttentionOpts { split: Some(split), ..Default::default() },
         )
         .expect("replicated")
         .expect("supported");
@@ -428,8 +428,12 @@ fn sq_attention_numerical_gpu() {
             if let Some(t) = &mut lens_t {
                 t.realize().expect("realize lens");
             }
-            let opts =
-                SqAttentionOpts { key_lens: lens_t.as_ref(), include_last: lens.is_some(), split, cache_map: None };
+            let opts = SqAttentionOpts {
+                key_lens: lens_t.as_ref(),
+                include_last: lens.is_some(),
+                split: Some(split),
+                cache_map: None,
+            };
             let got = crate::single_query_attention_packed(&q, &k, &v, head_offset, opts)
                 .expect("sq attention")
                 .expect("supported");
@@ -463,7 +467,7 @@ fn sq_attention_numerical_gpu() {
         &k,
         &v,
         head_offset,
-        SqAttentionOpts { split: 10, ..Default::default() },
+        SqAttentionOpts { split: Some(10), ..Default::default() },
     )
     .expect("production sq attention")
     .expect("production supported");
@@ -487,4 +491,74 @@ fn undivisible_head_dim_declines_instead_of_erroring() {
     let v = Tensor::zeros(&[b, n, h, d], DType::Float32);
     let out = crate::single_query_attention(&q, &k, &v, SqAttentionOpts::default()).expect("declines, not errors");
     assert!(out.is_none(), "head dim 4 divides no supported wave size (32/64); the launch must fall back");
+}
+
+// ─── Split policy ────────────────────────────────────────────────────────────
+
+/// The policy aims the split at the wave budget over divisors that keep a
+/// chunk, preferring chunks with no partial tail; a family nobody measured
+/// keeps one split, and so does a key range too short to chunk.
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 5, 20, 1500, 15, &[5, 10, 12, 15]; "whisper large cross attention on rdna")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 1, 6, 1500, 25, &[3, 5, 15, 25]; "tiny heads want more splits")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), 5, 20, 64, 1, &[1]; "a short key range stays whole")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx942), 5, 20, 1500, 1, &[]; "cdna is unmeasured and keeps one split")]
+#[test_case(SM_86, 5, 20, 1500, 1, &[]; "cuda is unmeasured and keeps one split")]
+fn sq_policy_splits_toward_the_wave_budget(
+    arch: GpuArch,
+    b: usize,
+    h: usize,
+    n: usize,
+    split: usize,
+    candidates: &[usize],
+) {
+    let policy = crate::SqPolicy::for_arch(arch);
+    assert_eq!(policy.split(b, h, n), split);
+    let mut sorted = policy.candidates(b, h, n);
+    sorted.sort_unstable();
+    let mut expected = candidates.to_vec();
+    expected.sort_unstable();
+    assert_eq!(sorted, expected);
+}
+
+/// Every candidate the policy hands the tuner is a legal split of `n`.
+#[test]
+fn sq_policy_candidates_divide_the_keys() {
+    let policy = crate::SqPolicy::for_arch(GpuArch::Amd(AmdArch::Gfx1151));
+    for n in [448, 1500, 1536, 3000] {
+        for split in policy.candidates(5, 20, n) {
+            assert_eq!(n % split, 0, "n {n} split {split}");
+            assert!(n / split >= policy.min_chunk, "n {n} split {split}");
+        }
+    }
+}
+
+/// The policy's split runs the two-kernel path and matches the single-kernel
+/// answer: the whisper geometry, one shared f16 cache addressed by a map.
+#[test]
+fn sq_policy_split_matches_a_single_split() {
+    if !supported_device() {
+        return;
+    }
+    let (b, n, h, d) = (5, 1500, 20, 64);
+    let device = Tensor::empty(&[1], DType::Float32).device();
+    let q = Tensor::randn(&[b, 1, h, d]).expect("q").to(device.clone());
+    let k = Tensor::randn(&[1, n, h, d]).expect("k").cast(DType::Float16).to(device.clone());
+    let v = Tensor::randn(&[1, n, h, d]).expect("v").cast(DType::Float16).to(device.clone());
+    let map = Tensor::zeros(&[b], DType::Int32).to(device);
+    let run = |split: Option<usize>| {
+        let out = crate::single_query_attention(
+            &q,
+            &k,
+            &v,
+            SqAttentionOpts { split, cache_map: Some(&map), ..Default::default() },
+        )
+        .expect("launch")
+        .expect("supported");
+        out.realize().expect("realize");
+        out.as_vec::<f32>().expect("vec")
+    };
+    crate::tune::set_enabled(false);
+    let (whole, policy) = (run(Some(1)), run(None));
+    let max_abs = whole.iter().zip(&policy).map(|(a, e)| (a - e).abs()).fold(0.0f32, f32::max);
+    assert!(max_abs < 1e-4, "policy split max abs error {max_abs}");
 }

@@ -39,7 +39,7 @@ fn bench_sq_attention(c: &mut Criterion) {
             let opts = svod_tk::SqAttentionOpts {
                 key_lens: lens.as_ref(),
                 include_last: mode.starts_with("self"),
-                split,
+                split: Some(split),
                 cache_map: None,
             };
             let tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
@@ -58,7 +58,12 @@ fn bench_sq_attention(c: &mut Criterion) {
             let kk = randn_f32(&[b, n, h_total, d]);
             let vv = randn_f32(&[b, n, h_total, d]);
             for &split in &[1usize, 4, 10] {
-                let opts = svod_tk::SqAttentionOpts { key_lens: None, include_last: false, split, cache_map: None };
+                let opts = svod_tk::SqAttentionOpts {
+                    key_lens: None,
+                    include_last: false,
+                    split: Some(split),
+                    cache_map: None,
+                };
                 let tk = svod_tk::single_query_attention_packed(&q, &kk, &vv, 0, opts)
                     .expect("packed sq attention")
                     .expect("supported");
