@@ -10,6 +10,10 @@
 //!
 //! # Use a specific scale:
 //! cargo run -p svod-model --release --example yolo_detect -- --hub --scale small
+//!
+//! # Run a local checkpoint (e.g. converted from an Ultralytics .pt):
+//! cargo run -p svod-model --release --example yolo_detect -- \
+//!     --weights model.safetensors --scale xlarge --classes 1
 //! ```
 
 use std::path::PathBuf;
@@ -68,6 +72,10 @@ struct Args {
     #[arg(long)]
     hf_id: Option<String>,
 
+    /// Local `model.safetensors` to load instead of downloading from the Hub.
+    #[arg(long)]
+    weights: Option<PathBuf>,
+
     /// Model scale.
     #[arg(long, value_enum, default_value_t = ScaleArg::Nano)]
     scale: ScaleArg,
@@ -124,6 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = if args.zero {
         eprintln!("using zero weights (no download)");
         Yolo26Detect::with_zero_weights(cfg)
+    } else if let Some(ref path) = args.weights {
+        eprintln!("loading weights from {} ...", path.display());
+        Yolo26Detect::from_safetensors(path, cfg)?
     } else if args.hub || args.hf_id.is_some() {
         let id = args.hf_id.as_deref().unwrap_or_else(|| args.scale.hub_id());
         eprintln!("downloading weights from {id} ...");
