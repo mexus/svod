@@ -814,6 +814,33 @@ fn prepared_plan_has_concrete_nonzero_capacities() {
     plan.validate().unwrap();
 }
 
+/// The sequential plan keeps the beam's decoder slots but compiles the
+/// encoder and aligner for the one window the ASR pipeline hands over.
+#[test]
+fn sequential_plan_encodes_and_aligns_one_window() {
+    let dims = ModelDimensions::for_size(WhisperSize::LargeV2);
+    let plan = WhisperPlan::sequential(&dims, WhisperSize::LargeV2);
+    assert_eq!((plan.encoder_batch, plan.alignment_batch), (1, 1));
+    assert_eq!(plan.decoder_slots, WhisperPlan::for_model(&dims, WhisperSize::LargeV2).decoder_slots);
+    plan.validate().unwrap();
+}
+
+/// The replay's rows come in whole tensor-core tiles: 224 text tokens after a
+/// multilingual prompt would be 229 rows, which the relaxed tensor-core level
+/// lowers to the scalar path; the context bounds the rounding.
+#[test_case(224, 3, 448, 240; "the default budget rounds up to a tile")]
+#[test_case(224, 1, 448, 240; "an english prompt lands in the same tile")]
+#[test_case(11, 3, 448, 16; "a short budget is one tile")]
+#[test_case(444, 3, 448, 448; "the context caps the rounding")]
+fn alignment_replay_rows_are_whole_tensor_core_tiles(
+    max_tokens: usize,
+    prompt_len: usize,
+    n_text_ctx: usize,
+    rows: usize,
+) {
+    assert_eq!(crate::whisper::aligner::replay_rows(max_tokens, prompt_len, n_text_ctx), rows);
+}
+
 #[test]
 fn default_decode_policy_is_explicit_openai_fallback() {
     let options = DecodeOptions::default();

@@ -14,7 +14,7 @@ use svod_dtype::{AmdArch, CudaArch, DType};
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
-use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at, load_off_gated};
+use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at};
 use crate::scaffold::GlSpec;
 use crate::{ArchCaps, ArchSet, Kernel};
 
@@ -24,16 +24,18 @@ pub const SQ_ATTENTION_SUPPORTED_ARCHS: ArchSet =
     ArchSet::amd(&[AmdArch::Gfx942, AmdArch::Gfx1151]).with_cuda_from(CudaArch::from_compute_capability(8, 0));
 
 /// Compile-time masking options for [`single_query_attention`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct SqAttentionOpts<'a> {
     /// Optional `[B]` i32 valid-key counts. Keys `0..key_lens[b]` are valid.
     pub key_lens: Option<&'a Tensor>,
     /// Also include key `N-1`. Required when `key_lens` is present; this is the
     /// Whisper self-cache layout where the current token occupies the final slot.
     pub include_last: bool,
-    /// Number of contiguous K/V chunks. Values above one are supported only for
-    /// unmasked attention when `N` is divisible by `split`.
-    pub split: usize,
+    /// Number of contiguous K/V chunks; `None` takes the device's
+    /// [`SqPolicy`] choice, measured on first use when tuning is on. Values
+    /// above one are supported only for unmasked attention when `N` is
+    /// divisible by `split`.
+    pub split: Option<usize>,
     /// Optional `[B]` i32 map from a query row to the K/V row it reads.
     ///
     /// Rows that decode the same audio share a cross-attention cache — beam
@@ -46,9 +48,200 @@ pub struct SqAttentionOpts<'a> {
     pub cache_map: Option<&'a Tensor>,
 }
 
-impl Default for SqAttentionOpts<'_> {
-    fn default() -> Self {
-        Self { key_lens: None, include_last: false, split: 1, cache_map: None }
+/// Lanes cooperating on one key's dot product; a wave scores `wave / SUBGROUP`
+/// keys per loop trip.
+const SUBGROUP: usize = 8;
+
+/// How the unmasked attention is split over K/V on one device.
+///
+/// The partial kernel is one wave per `(row, head, split)` streaming its chunk
+/// of keys, a latency-bound loop; the device needs enough of those waves in
+/// flight to reach its bandwidth, and each split costs a merge pass and a
+/// launch, so a chunk should not get too short. The budget is the device's own
+/// count of resident waves; the floor is a kernel property, in loop trips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqPolicy {
+    pub compute_units: usize,
+    /// Waves per compute unit the split aims to keep in flight; `0` keeps one
+    /// split, for a device that does not report its budget.
+    pub waves_per_cu: usize,
+    /// Fewest keys a split may hold.
+    pub min_chunk: usize,
+    /// Keys one wave scores per loop trip; a chunk that is a multiple of it
+    /// has no partial tail, which the ranking prefers.
+    pub keys_per_trip: usize,
+}
+
+/// The splits [`SqPolicy::tuned`] measures on first use: the nearest divisors
+/// around the policy's target.
+const SQ_CANDIDATES: usize = 4;
+
+/// Fewest loop trips a split may leave a wave. Below it the merge pass and the
+/// extra launch outweigh the parallelism: on whisper large-v3's cross
+/// attention (b=5, h=20, n=1500, f16 cache) on a wave32 RDNA part every split
+/// leaving 60 keys or more sat within 5% of the best, while on a wave32 Ampere
+/// part the splits between 2 and 10 did.
+const MIN_TRIPS: usize = 15;
+
+impl SqPolicy {
+    /// A policy for `arch` that aims `compute_units * waves_per_cu` waves at
+    /// the device; `waves_per_cu == 0` keeps one split.
+    pub fn with_budget(arch: svod_dtype::GpuArch, compute_units: usize, waves_per_cu: usize) -> Self {
+        let keys_per_trip = ArchCaps::for_arch(arch).wave_size / SUBGROUP;
+        Self { compute_units, waves_per_cu, min_chunk: MIN_TRIPS * keys_per_trip, keys_per_trip }
+    }
+
+    /// The policy of the device behind `spec`: its compute units and the waves
+    /// each keeps resident ([`crate::target::resident_waves_per_cu`]); one
+    /// split when the backend reports neither.
+    pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Self {
+        let budget = crate::target::compute_units(spec).zip(crate::target::resident_waves_per_cu(spec));
+        let (compute_units, waves_per_cu) = budget.unwrap_or((1, 0));
+        Self::with_budget(arch, compute_units, waves_per_cu)
+    }
+
+    /// The divisors of `n` above one that leave every chunk at least
+    /// `min_chunk` keys, nearest the wave budget first, a chunk with a partial
+    /// tail counting as a little further off. Empty when the policy keeps one
+    /// split, or when no split qualifies: the unsplit kernel is the fallback,
+    /// never a candidate.
+    pub fn candidates(&self, b: usize, h: usize, n: usize) -> Vec<usize> {
+        if self.waves_per_cu == 0 || b * h == 0 {
+            return Vec::new();
+        }
+        let target = (self.compute_units * self.waves_per_cu).div_ceil(b * h);
+        let distance =
+            |s: usize| s.abs_diff(target) + usize::from(!(n / s).is_multiple_of(self.keys_per_trip)) * target / 4;
+        let mut splits: Vec<usize> = (2..=n).filter(|s| n.is_multiple_of(*s) && n / s >= self.min_chunk).collect();
+        splits.sort_by_key(|&s| distance(s));
+        splits.truncate(SQ_CANDIDATES);
+        splits
+    }
+
+    /// The split for a `[b, h]` query set over `n` keys: the best-ranked
+    /// candidate, one when there is none.
+    pub fn split(&self, b: usize, h: usize, n: usize) -> usize {
+        self.candidates(b, h, n).first().copied().unwrap_or(1)
+    }
+
+    /// The split for the geometry as measured on this device ([`crate::tune`]):
+    /// every candidate's partial and merge pair is timed together on synthetic
+    /// operands and the fastest kept in `store`; [`Self::split`] where fewer
+    /// than two candidates exist or nothing measured. The launch entry consults
+    /// [`crate::tune::enabled`] before coming here.
+    pub(crate) fn tuned(
+        &self,
+        store: &crate::tune::TuneStore,
+        spec: &svod_dtype::DeviceSpec,
+        arch: svod_dtype::GpuArch,
+        geom: &SqGeom,
+        cache_map: bool,
+    ) -> usize {
+        use std::time::Duration;
+
+        use svod_runtime::benchmark::{CLOCK_WARMUP, round_robin_min, warm_clock};
+
+        let (b, n, h, d) = (geom.b, geom.n, geom.heads.count, geom.d);
+        let candidates = self.candidates(b, h, n);
+        let fallback = candidates.first().copied().unwrap_or(1);
+        if candidates.len() < 2 {
+            return fallback;
+        }
+        // The head offset only moves a constant in the index: every layer of a
+        // packed cache measures as one shape.
+        let geom = &SqGeom { heads: HeadSelection { offset: 0, ..geom.heads }, ..geom.clone() };
+        let caps = ArchCaps::for_arch(arch);
+        let block = caps.wave_size as i64;
+        let f32 = DType::Float32;
+        let placeholder = |shape: &[usize], dtype: &DType| {
+            UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, shape.iter().product(), dtype.clone())
+        };
+        let builds: Vec<u128> = candidates
+            .iter()
+            .map(|&splits| {
+                let mut bufs = vec![
+                    placeholder(&[b, splits, h, d], &f32),
+                    placeholder(&[b, splits, h, 2], &f32),
+                    placeholder(&[b, 1, h, d], &f32),
+                    placeholder(&[geom.kv_batch, n, geom.heads.total, d], &geom.kv),
+                    placeholder(&[geom.kv_batch, n, geom.heads.total, d], &geom.kv),
+                ];
+                if cache_map {
+                    bufs.push(placeholder(&[b], &DType::Int32));
+                }
+                let ker = Kernel::new("sq_attention_partial", [h as i64, b as i64, splits as i64], block, bufs, caps);
+                build_single_query_attention_partial(&ker, geom.clone(), splits, cache_map);
+                crate::kernel_fingerprint(&ker.finish(2)).digest
+            })
+            .collect();
+        let shape = [b, geom.kv_batch, n, h, geom.heads.total, d, geom.kv.bytes(), usize::from(cache_map)];
+        let key = crate::tune::TuneKey::new("sq_attention", spec, arch, &shape, &builds);
+        store
+            .select_with(&key, candidates.len(), || {
+                // The cache keeps its real strides but only the rows the kernel
+                // reads — a map of zeros names row 0 — and is filled on the
+                // device: timing does not depend on its values.
+                let rows = if cache_map { 1 } else { geom.kv_batch };
+                let cache = || {
+                    Tensor::full(&[rows, n, geom.heads.total, d], ConstValue::Float(0.5), geom.kv.clone())
+                        .to(spec.clone())
+                };
+                let compile = |splits: usize| -> Option<[crate::launch::CompiledLaunch; 2]> {
+                    let q = Tensor::randn(&[b, 1, h, d]).ok()?.to(spec.clone());
+                    let (k, v) = (cache(), cache());
+                    let map = cache_map.then(|| Tensor::zeros(&[b], DType::Int32).to(spec.clone()));
+                    let mut ins = vec![&q, &k, &v];
+                    ins.extend(map.as_ref());
+                    let mut numerator = Tensor::empty(&[b, splits, h, d], f32.clone()).to(spec.clone());
+                    let mut stats = Tensor::empty(&[b, splits, h, 2], f32.clone()).to(spec.clone());
+                    let geom = geom.clone();
+                    let partial = crate::launch::compile_kernel(
+                        "sq_attention_partial_tune",
+                        [h as i64, b as i64, splits as i64],
+                        block,
+                        &mut [&mut numerator, &mut stats],
+                        &ins,
+                        move |ker| {
+                            build_single_query_attention_partial(ker, geom, splits, cache_map);
+                            ker.finish(2)
+                        },
+                    )
+                    .ok()?;
+                    let mut out = Tensor::empty(&[b, 1, h, d], f32.clone()).to(spec.clone());
+                    let merge = crate::launch::compile_kernel(
+                        "sq_attention_merge_tune",
+                        [h as i64, b as i64, 1],
+                        block,
+                        &mut [&mut out],
+                        &[&numerator, &stats],
+                        move |ker| {
+                            build_single_query_attention_merge(ker, b, h, d, splits);
+                            ker.finish(1)
+                        },
+                    )
+                    .ok()?;
+                    Some([partial, merge])
+                };
+                let launches: Vec<Option<[crate::launch::CompiledLaunch; 2]>> =
+                    candidates.iter().map(|&splits| compile(splits)).collect();
+                // A candidate's time is its partial and merge together.
+                let pair_time = |pair: &[crate::launch::CompiledLaunch; 2]| {
+                    let mut total = 0;
+                    for launch in pair {
+                        total += launch.dispatch_gpu_ns().ok().flatten()?;
+                    }
+                    Some(Duration::from_nanos(total))
+                };
+                if let Some(first) = launches.iter().flatten().next() {
+                    warm_clock(CLOCK_WARMUP, || pair_time(first));
+                }
+                let time = |i: usize| pair_time(launches[i].as_ref()?);
+                round_robin_min(candidates.len(), crate::tune::ROUNDS, time)
+                    .into_iter()
+                    .map(|t| t.map(|t| t.as_nanos() as u64))
+                    .collect()
+            })
+            .map_or(fallback, |i| candidates[i])
     }
 }
 
@@ -81,10 +274,6 @@ fn kv_row_index(ker: &Kernel, b: usize, kv_batch: usize, cache_map: bool, batch:
 
 fn cidx(v: i64) -> Arc<UOp> {
     UOp::index_const(v)
-}
-
-fn kvc(dtype: &DType, v: f64) -> Arc<UOp> {
-    UOp::const_(dtype.clone(), ConstValue::Float(v))
 }
 
 fn f32c(v: f64) -> Arc<UOp> {
@@ -248,7 +437,6 @@ pub(crate) fn build_single_query_attention(
 /// or row 0 when `kv_batch` is 1.
 pub(crate) fn build_single_query_attention_partial(ker: &Kernel, geom: SqGeom, splits: usize, cache_map: bool) {
     let SqGeom { b, kv_batch, n, heads, d, kv: kv_dt } = geom;
-    const SUBGROUP: usize = 8;
     let wave = ker.caps.wave_size;
     Kernel::assert_divisible(d, wave, "single-query attention D");
     Kernel::assert_divisible(d, SUBGROUP, "split single-query attention D");
@@ -290,7 +478,7 @@ pub(crate) fn build_single_query_attention_partial(ker: &Kernel, geom: SqGeom, s
     let group = lane.floor_div(&cidx(SUBGROUP as i64));
     let mut init = Vec::with_capacity(dot_ept + ept + 2);
     for j in 0..dot_ept {
-        let dim = subgroup_lane.add(&cidx((j * SUBGROUP) as i64));
+        let dim = subgroup_lane.mul(&cidx(dot_ept as i64)).add(&cidx(j as i64)); // lane-contiguous: one 16-byte load per lane
         let qv = load_at(q.uop(), q.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
             .mul(&scale);
         init.push(flat_index(&q_reg, &[dot_ept], &[Idx::Const(j as i64)]).store(qv));
@@ -310,17 +498,24 @@ pub(crate) fn build_single_query_attention_partial(ker: &Kernel, geom: SqGeom, s
     let tile_offset = lp.index().mul(&cidx(groups as i64));
     let group_offset = tile_offset.add(&group);
     let valid = group_offset.lt(&cidx(chunk as i64));
-    let key = split.mul(&cidx(chunk as i64)).add(&group_offset);
+    // The tail key is clamped, not gated: a gated load renders as an exec-masked
+    // branch whose value is waited on immediately (`s_waitcnt vmcnt(0)` per load),
+    // which serializes every iteration of the loop — not just the tail's. Clamping
+    // keeps the loads unconditional; the tail's score is still masked to -inf, so
+    // its `beta` is zero and the row it re-read contributes nothing.
+    let safe_offset = UOp::try_where(valid.clone(), group_offset.clone(), cidx(chunk as i64 - 1)).expect("clamp key");
+    let key = split.mul(&cidx(chunk as i64)).add(&safe_offset);
     let q_loop = q_reg.after(smallvec![key.clone()]);
     let o_loop = o_reg.after(smallvec![key.clone()]);
     let max_loop = max_reg.after(smallvec![key.clone()]);
     let norm_loop = norm_reg.after(smallvec![key.clone()]);
     let mut dot = f32c(0.0);
     for j in 0..dot_ept {
-        let dim = subgroup_lane.add(&cidx((j * SUBGROUP) as i64));
+        let dim = subgroup_lane.mul(&cidx(dot_ept as i64)).add(&cidx(j as i64)); // lane-contiguous: one 16-byte load per lane
         let qv = load_at(&q_loop, &[dot_ept], &[Idx::Const(j as i64)]);
-        let k_off = flat_offset(k.shape(), &[kv_row.clone(), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)]);
-        let kv = load_off_gated(k.uop(), k_off, valid.clone(), kvc(&kv_dt, 0.0)).cast(f32.clone());
+        let kv =
+            load_at(k.uop(), k.shape(), &[kv_row.clone(), Idx::from(&key), Idx::from(&packed_head), Idx::from(dim)])
+                .cast(f32.clone());
         dot = dot.add(&qv.mul(&kv));
     }
     let score = warp.subgroup_reduce_scalar(dot, SUBGROUP, |a, p| a.add(p));
@@ -340,18 +535,20 @@ pub(crate) fn build_single_query_attention_partial(ker: &Kernel, geom: SqGeom, s
     let group_betas: Vec<_> = (0..groups).map(|g| warp.broadcast_scalar(&beta, (g * SUBGROUP) as i64)).collect();
     let mut output_stores = Vec::with_capacity(ept);
     for j in 0..ept {
-        let dim = lane.add(&cidx((j * wave) as i64));
+        let dim = lane.mul(&cidx(ept as i64)).add(&cidx(j as i64)); // lane-contiguous: one 16-byte load per lane
         let old_o = load_at(&o_loop, &[ept], &[Idx::Const(j as i64)]);
         let mut tile_o = f32c(0.0);
         for (g, group_beta) in group_betas.iter().enumerate() {
             let group_key_offset = tile_offset.add(&cidx(g as i64));
             let group_valid = group_key_offset.lt(&cidx(chunk as i64));
-            let group_key = split.mul(&cidx(chunk as i64)).add(&group_key_offset);
-            let v_off = flat_offset(
+            let safe = UOp::try_where(group_valid, group_key_offset, cidx(chunk as i64 - 1)).expect("clamp v key");
+            let group_key = split.mul(&cidx(chunk as i64)).add(&safe);
+            let vv = load_at(
+                v.uop(),
                 v.shape(),
                 &[kv_row.clone(), Idx::from(&group_key), Idx::from(&packed_head), Idx::from(dim.clone())],
-            );
-            let vv = load_off_gated(v.uop(), v_off, group_valid, kvc(&kv_dt, 0.0)).cast(f32.clone());
+            )
+            .cast(f32.clone());
             tile_o = tile_o.add(&vv.mul(group_beta));
         }
         output_stores.push(
@@ -367,7 +564,7 @@ pub(crate) fn build_single_query_attention_partial(ker: &Kernel, geom: SqGeom, s
     let final_norm = norm_reg.after(smallvec![ended]);
     let mut numerator_stores = Vec::with_capacity(ept);
     for j in 0..ept {
-        let dim = lane.add(&cidx((j * wave) as i64));
+        let dim = lane.mul(&cidx(ept as i64)).add(&cidx(j as i64)); // lane-contiguous: one 16-byte load per lane
         numerator_stores.push(
             flat_index(
                 numerator.uop(),
@@ -500,7 +697,6 @@ pub fn single_query_attention_packed(
     let dtype = q.uop().dtype();
     let masked = opts.key_lens.is_some();
     let has_map = opts.cache_map.is_some();
-    let splits = opts.split;
     let kv_dtype = k.uop().dtype();
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
 
@@ -583,15 +779,17 @@ pub fn single_query_attention_packed(
             multiple: 1usize
         }
     );
-    ensure!(
-        splits > 0 && (!masked || splits == 1) && (masked || n.is_multiple_of(splits)),
-        crate::launch::DimMultipleSnafu {
-            kernel: "single-query attention",
-            dim: "split (unmasked divisor of N; masked requires 1)",
-            value: splits,
-            multiple: 1usize
-        }
-    );
+    if let Some(splits) = opts.split {
+        ensure!(
+            splits > 0 && (!masked || splits == 1) && (masked || n.is_multiple_of(splits)),
+            crate::launch::DimMultipleSnafu {
+                kernel: "single-query attention",
+                dim: "split (unmasked divisor of N; masked requires 1)",
+                value: splits,
+                multiple: 1usize
+            }
+        );
+    }
     if let Some(map) = opts.cache_map {
         let md = crate::launch::concrete_dims(map, "single-query attention", "cache_map", 1)?;
         ensure!(
@@ -650,6 +848,21 @@ pub fn single_query_attention_packed(
         move |arch| {
             let caps = ArchCaps::for_arch(arch);
             let geom = SqGeom { b, kv_batch, n, heads, d, kv: kv_dtype.clone() };
+            // Masked attention has no split; otherwise the caller's, else the
+            // device policy's, measured when tuning is on.
+            let splits = match opts.split {
+                Some(splits) => splits,
+                None if masked => 1,
+                None => {
+                    let spec = q.device();
+                    let policy = SqPolicy::for_device(&spec, arch);
+                    if crate::tune::enabled() {
+                        policy.tuned(crate::tune::TuneStore::global(), &spec, arch, &geom, has_map)
+                    } else {
+                        policy.split(b, h, n)
+                    }
+                }
+            };
             if splits == 1 {
                 let out = Tensor::empty(&[b, 1, h, d], DType::Float32);
                 let mut inputs = vec![q, k, v];

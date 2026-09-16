@@ -408,10 +408,8 @@ impl TextDecoder {
         }
         let batch = token.dim_const(0)?;
         let self_key_count = self_k_cache.dim_const(1)? + 1;
-        let cross_key_count = cross_k.dim_const(1)?;
-        let cross_splits = attention
-            .cross_splits
-            .unwrap_or_else(|| if cross_key_count >= 1000 && cross_key_count.is_multiple_of(4) { 4 } else { 1 });
+        // The cross split is the device's unless the mode names one.
+        let cross_splits = attention.cross_splits;
         let act = |t: Tensor| t.cast(self.activation_dtype.clone());
         let heads = |t: Tensor| -> Result<Tensor> { Ok(t.try_reshape([batch, 1, n_head, d_head])?) };
 
@@ -444,7 +442,7 @@ impl TextDecoder {
                             svod_tk::SqAttentionOpts {
                                 key_lens: Some(self_key_lens),
                                 include_last: true,
-                                split: 1,
+                                split: None,
                                 cache_map: None,
                             },
                         )

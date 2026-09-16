@@ -158,6 +158,7 @@ pub mod attribute {
     pub const WARP_SIZE: i32 = 10;
     pub const MULTIPROCESSOR_COUNT: i32 = 16;
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
+    pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
     pub const COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     pub const COMPUTE_CAPABILITY_MINOR: i32 = 76;
     pub const MANAGED_MEMORY: i32 = 83;

@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use snafu::Snafu;
-use svod_arch::pipelines::audio::{Segment, Transcriber, Transcript, WindowAdvance};
+use svod_arch::pipelines::audio::{RunOptions, Segment, Transcriber, Transcript, WindowAdvance};
 use svod_dtype::DType;
 use svod_runtime::{RunProfile, StageProfile};
 use svod_tensor::PrepareConfig;
@@ -414,15 +414,15 @@ impl Transcriber for WhisperRecognizer {
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
-        profile: bool,
+        opts: RunOptions,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>)> {
         let mut transcripts = Vec::with_capacity(windows.len());
-        let mut run = profile.then(RunProfile::default);
+        let mut run = opts.profile.then(RunProfile::default);
         // Recognized windows own device-resident cross K/V snapshots. Consume
         // them one encoder batch at a time instead of retaining one pair for
         // every window in a long recording.
         for batch in windows.chunks(self.max_batch) {
-            let (recognized, batch_profile, copies) = self.recognize_windows(batch, profile)?;
+            let (recognized, batch_profile, copies) = self.recognize_windows(batch, opts.profile)?;
             transcripts.extend(recognized.iter().map(|window| window.transcript(Vec::new())));
             fold_profile(&mut run, batch_profile, &copies);
         }
@@ -430,9 +430,9 @@ impl Transcriber for WhisperRecognizer {
     }
 }
 
-/// Timestamp-enabled recognizer composed with the independent, fixed-shape
-/// word aligner. Every call returns DTW-aligned words; there is no feature flag
-/// that changes the prepared recognition graph.
+/// Recognizer composed with the independent, fixed-shape word aligner. A call
+/// asking for words (`RunOptions::words`) gets them DTW-aligned; one that does
+/// not skips the aligner. The prepared recognition graph is the same either way.
 pub struct WhisperAlignedTranscriber {
     recognizer: WhisperRecognizer,
     aligner: WhisperAligner,
@@ -520,13 +520,17 @@ impl Transcriber for WhisperAlignedTranscriber {
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
-        profile: bool,
+        opts: RunOptions,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>)> {
         let mut transcripts = Vec::with_capacity(windows.len());
-        let mut run = profile.then(RunProfile::default);
+        let mut run = opts.profile.then(RunProfile::default);
         for batch in windows.chunks(self.recognizer.max_batch) {
-            let (recognized, mut batch_profile, mut copies) = self.recognizer.recognize_windows(batch, profile)?;
-            transcripts.extend(self.align_recognized(&recognized, &mut copies, &mut batch_profile)?);
+            let (recognized, mut batch_profile, mut copies) = self.recognizer.recognize_windows(batch, opts.profile)?;
+            if opts.words {
+                transcripts.extend(self.align_recognized(&recognized, &mut copies, &mut batch_profile)?);
+            } else {
+                transcripts.extend(recognized.iter().map(|window| window.transcript(Vec::new())));
+            }
             fold_profile(&mut run, batch_profile, &copies);
         }
         Ok((transcripts, run))

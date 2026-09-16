@@ -104,7 +104,28 @@ pub fn compute_units(spec: &DeviceSpec) -> Option<usize> {
             (node.simd_per_cu > 0).then(|| (node.simd_count / node.simd_per_cu) as usize)
         }
         DeviceSpec::Cuda { device_id } => {
-            svod_device::registry::resolve_cuda_sm_count(*device_id).ok().map(|sms| sms as usize)
+            svod_device::registry::resolve_cuda_limits(*device_id).ok().map(|limits| limits.sm_count as usize)
+        }
+        DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
+    }
+}
+
+/// How many one-wave workgroups a compute unit of the device behind `spec`
+/// keeps resident, when the backend reports it: the wave slots of a CU's SIMDs
+/// on AMD, the resident-block cap of an SM on CUDA. What a latency-bound
+/// kernel's grid has to reach for the device to be busy.
+pub fn resident_waves_per_cu(spec: &DeviceSpec) -> Option<usize> {
+    match spec {
+        DeviceSpec::Amd { device_id } => {
+            let node = svod_device::amd::topology::enumerate().into_iter().nth(*device_id)?;
+            let waves = (node.simd_per_cu * node.max_waves_per_simd) as usize;
+            (waves > 0).then_some(waves)
+        }
+        DeviceSpec::Cuda { device_id } => {
+            let limits = svod_device::registry::resolve_cuda_limits(*device_id).ok()?;
+            let warps = limits.max_threads_per_sm.checked_div(limits.warp_size)?;
+            let waves = limits.max_blocks_per_sm.min(warps) as usize;
+            (waves > 0).then_some(waves)
         }
         DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
     }

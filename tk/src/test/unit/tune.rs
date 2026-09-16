@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use svod_dtype::{DType, DeviceSpec, GpuArch};
+use test_case::test_case;
 
 use crate::tune::{TuneKey, TuneStore};
 
@@ -129,5 +130,43 @@ fn gemm_first_use_measures_the_table_once_gpu() {
     assert_eq!(text.lines().count(), 1, "one line per shape: {text}");
     assert!(text.starts_with("gemm_nt|"), "{text}");
     assert_eq!(policy.tuned(&store, &spec, arch, &DType::BFloat16, (m, k, n), Epilogue::Plain), Some(cfg));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The attention split's first use measures the policy's candidates (each a
+/// partial + merge pair) once and records one line; the winner is a candidate.
+/// `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib tune::sq_attention_first_use -- --ignored`.
+#[test_case(1, 20, true; "one shared cache")]
+#[test_case(5, 640, true; "whisper large's packed cross cache")]
+#[test_case(5, 20, false; "a cache per row")]
+#[ignore]
+fn sq_attention_first_use_measures_the_splits_once_gpu(kv_batch: usize, h_total: usize, cache_map: bool) {
+    use crate::kernels::sq_attention::{HeadSelection, SQ_ATTENTION_SUPPORTED_ARCHS, SqGeom, SqPolicy};
+
+    if !super::device_supported(SQ_ATTENTION_SUPPORTED_ARCHS) {
+        eprintln!("skip sq_attention_first_use_measures_the_splits_once_gpu: no supported device / toolchain");
+        return;
+    }
+    let spec = svod_tensor::Tensor::empty(&[1], DType::Float32).device();
+    let arch = crate::target::resolve_arch(&spec).expect("a GPU arch");
+    let policy = SqPolicy::for_device(&spec, arch);
+    let (b, n, h, d) = (5, 1500, 20, 64);
+    let candidates = policy.candidates(b, h, n);
+    if candidates.len() < 2 {
+        eprintln!("skip sq_attention_first_use_measures_the_splits_once_gpu: the family keeps one split");
+        return;
+    }
+    let dir = scratch(&format!("sq-gpu-{kv_batch}-{h_total}-{cache_map}"));
+    let store = TuneStore::at(Some(dir.clone()));
+    let heads = HeadSelection { count: h, total: h_total, offset: h_total - h };
+    let geom = SqGeom { b, kv_batch, n, heads, d, kv: DType::Float16 };
+    let split = policy.tuned(&store, &spec, arch, &geom, cache_map);
+    assert!(candidates.contains(&split), "the winner {split} is a candidate of {candidates:?}");
+    let files: Vec<_> = std::fs::read_dir(&dir).expect("store dir").flatten().collect();
+    assert_eq!(files.len(), 1, "one file per device");
+    let text = std::fs::read_to_string(files[0].path()).expect("store file");
+    assert_eq!(text.lines().count(), 1, "one line per shape: {text}");
+    assert!(text.starts_with("sq_attention|"), "{text}");
+    assert_eq!(policy.tuned(&store, &spec, arch, &geom, cache_map), split);
     let _ = std::fs::remove_dir_all(dir);
 }

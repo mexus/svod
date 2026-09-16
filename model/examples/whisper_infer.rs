@@ -170,7 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window_samples = CHUNK_LENGTH * SAMPLE_RATE;
     let splitter = FixedLengthSplitter::new(window_samples, SAMPLE_RATE);
 
-    let mut plan = WhisperPlan::for_model(&model.dims, size);
+    // The fixed-length splitter under `Asr` hands over one window at a time.
+    let mut plan = WhisperPlan::sequential(&model.dims, size);
     if let Some(decoder_slots) = args.decoder_slots {
         plan.decoder_slots = decoder_slots;
     }
@@ -205,7 +206,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.profile {
         println!("\nRunning separate profiling pass (excluded from RTF)...");
-        let profiled = asr.transcribe(&waveform, RunOptions { profile: true, ..Default::default() })?;
+        let profiled =
+            asr.transcribe(&waveform, RunOptions { words: args.timestamps, profile: true, ..Default::default() })?;
         if let Some(profile) = &profiled.profile {
             println!("\n--- Profile ---\n{}", profile.render_table());
             for stage in &profile.stages {

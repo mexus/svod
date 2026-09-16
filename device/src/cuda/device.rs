@@ -81,6 +81,8 @@ pub struct CudaLimits {
     pub sm_count: u32,
     pub max_threads_per_block: u32,
     pub max_threads_per_sm: u32,
+    /// Blocks one SM keeps resident, whatever their size.
+    pub max_blocks_per_sm: u32,
     pub shared_per_block: u32,
     pub warp_size: u32,
     /// `cuMemAllocManaged` is usable and host access is coherent with running
@@ -284,6 +286,7 @@ impl CudaDevice {
             sm_count: attribute(attribute::MULTIPROCESSOR_COUNT)?,
             max_threads_per_block: attribute(attribute::MAX_THREADS_PER_BLOCK)?,
             max_threads_per_sm: attribute(attribute::MAX_THREADS_PER_MULTIPROCESSOR)?,
+            max_blocks_per_sm: attribute(attribute::MAX_BLOCKS_PER_MULTIPROCESSOR)?,
             shared_per_block: attribute(attribute::MAX_SHARED_MEMORY_PER_BLOCK)?,
             warp_size: attribute(attribute::WARP_SIZE)?,
             managed_memory: attribute(attribute::MANAGED_MEMORY)? == 1

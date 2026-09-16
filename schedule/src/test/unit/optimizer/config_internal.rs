@@ -76,8 +76,7 @@ fn test_heuristics_config_default_and_builder() {
     assert_eq!(config.tc_opt, TcOpt::Relaxed);
     assert_eq!(config.tc_select, TcSelect::Auto);
     assert!(config.matvec_enabled);
-    assert_eq!(config.matvec_blocksize, 4);
-    assert_eq!((config.threads_per_row, config.rows_per_thread), (8, 4));
+    assert_eq!((config.matvec_blocksize, config.threads_per_row, config.rows_per_thread), (None, None, None));
     assert_eq!((config.grouped_threshold, config.unroll_threshold), (256, 32));
     assert!(!config.disable_locals);
     assert_eq!(config.thread_count, thread_budget());
@@ -104,8 +103,8 @@ fn test_heuristics_config_default_and_builder() {
         (built.tc_enabled, built.tc_opt, built.tc_select),
         (TcUsage::Disabled, TcOpt::Padded, TcSelect::Index(2))
     );
-    assert_eq!((built.matvec_enabled, built.matvec_blocksize), (false, 16));
-    assert_eq!((built.threads_per_row, built.rows_per_thread), (16, 2));
+    assert_eq!((built.matvec_enabled, built.matvec_blocksize), (false, Some(16)));
+    assert_eq!((built.threads_per_row, built.rows_per_thread), (Some(16), Some(2)));
     assert_eq!((built.grouped_threshold, built.unroll_threshold), (128, 8));
     assert_eq!((built.disable_locals, built.thread_count), (true, 3));
     assert_eq!((built.k_vectorize, built.output_upcast, built.debug_level), (true, false, 2));
@@ -217,7 +216,7 @@ fn assert_from_env(case: &str) {
                 (config.tc_enabled, config.tc_opt, config.tc_select),
                 (TcUsage::Disabled, TcOpt::Padded, TcSelect::Index(3))
             );
-            assert_eq!((config.matvec_enabled, config.matvec_blocksize), (false, 5));
+            assert_eq!((config.matvec_enabled, config.matvec_blocksize), (false, Some(5)));
             assert_eq!((config.k_vectorize, config.output_upcast, config.disable_locals), (true, false, true));
         }
         "tc_edges" => {
