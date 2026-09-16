@@ -23,7 +23,7 @@ use svod_ir::test::property::generators::*;
 fn z3_proves_equivalent(original: &Arc<UOp>, rewritten: &Arc<UOp>) -> Result<bool, TestCaseError> {
     match verify_equivalence(original, rewritten) {
         Ok(()) => Ok(true),
-        Err(CounterExample::ConversionFailed { .. } | CounterExample::Timeout) => Ok(false),
+        Err(CounterExample::ConversionFailed { .. } | CounterExample::Unknown { .. }) => Ok(false),
         Err(CounterExample::Found { .. }) => Err(TestCaseError::fail(format!(
             "Z3 found a counterexample:\noriginal:  {}\nrewritten: {}",
             original.tree(),

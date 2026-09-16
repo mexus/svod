@@ -19,15 +19,16 @@ type Case = fn(&TestVars) -> (Arc<UOp>, Option<Arc<UOp>>);
 /// written with *every* divisor symbolic; [`TestVars`] carries only one such operand.
 ///
 /// The ranges are small on purpose: nested division by two symbolic divisors is nonlinear,
-/// and the solver's time on it grows sharply with the bounds — [1, 4] over a 40-element
-/// numerator proves the same theorem in a fraction of a second.
+/// and the solver's time on it is a cliff — [1, 4] over a 16-element numerator proves the
+/// theorem in 30 ms; over 40 it took 2 s here, 10 s on the 4-core CI runner, and once the
+/// solver gave up.
 fn divisor(name: &str) -> Arc<UOp> {
     UOp::var(name, DType::Int32, 1, 4)
 }
 
 /// The numerator of the chained-division row, kept inside the divisors' reach.
 fn chain_numerator() -> Arc<UOp> {
-    UOp::var("chain_x", DType::Int32, 0, 40)
+    UOp::var("chain_x", DType::Int32, 0, 16)
 }
 
 /// Rows are closures rather than keys into a string dispatch, so the compiler type-checks
