@@ -93,7 +93,14 @@ impl WhisperAligner {
         let cache_spec =
             InputSpec::new(&[batch_size, N_AUDIO_CTX, layer_heads, d_head], cache_dtype.clone()).device_local();
         let mut jit = WhisperAlignmentJit::new(WhisperAlignmentModel::new(model, heads.clone()));
-        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, text_ctx]))?;
+        // The attention output is read back with one copyout; see the
+        // recogniser's `prepare_config` for why the host mapping is avoided.
+        jit.prepare_with_config(
+            cache_spec.clone(),
+            cache_spec,
+            InputSpec::i32(&[batch_size, text_ctx]),
+            &svod_tensor::PrepareConfig::device_local(),
+        )?;
         Ok(Self { jit, n_heads: heads.len(), batch_size, text_ctx, cache_dtype, cache_bytes })
     }
 
