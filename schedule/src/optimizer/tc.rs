@@ -294,6 +294,20 @@ pub fn get_reduce_axes_count(tc: &TensorCore) -> usize {
 // APPLICATION
 // ============================================================================
 
+const NO_COMPATIBLE_TC: &str = "no compatible tensor core found";
+
+/// Largest padded tail a tensor-core tile may add at `tc_opt = 2`, as a
+/// percentage of the axis. Wide enough for a sequence that misses the tile by
+/// a few rows (1500 -> 1504, 15 -> 16), too tight for a beam-width M to pay
+/// for a full tile (5 -> 16), where a memory-bound kernel is the right answer.
+/// `tc_opt = 3` keeps only PADTO's own limit.
+const TC_PAD_BUDGET_PERCENT: usize = 25;
+
+fn within_pad_budget(size: usize, tile: usize) -> bool {
+    let padded = size.div_ceil(tile) * tile;
+    (padded - size) * 100 <= size * TC_PAD_BUDGET_PERCENT
+}
+
 fn apply_axis_choice_impl(
     scheduler: &mut Scheduler,
     pattern: &MatmulPattern,
@@ -303,7 +317,7 @@ fn apply_axis_choice_impl(
     axis_choice: usize,
 ) -> Result<[Arc<UOp>; 3], OptError> {
     let tc_selection = select_tensor_core(pattern, &scheduler.ren, tc_select, axis_choice)?
-        .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no compatible tensor core found" }.build())?;
+        .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: NO_COMPATIBLE_TC }.build())?;
 
     // Record which TC was actually picked; beam's `validate_limits` reads
     // this to compute the correct `tc_up` divisor when the renderer offers
@@ -328,6 +342,18 @@ fn apply_axis_choice_impl(
             match get_range_size(axis) {
                 Some(size) => {
                     if !(size as usize).is_multiple_of(tc_dim) {
+                        // Padded rows are not free: they stream the same weights
+                        // and multiply the MACs. A 5-row M on a 16-row core is
+                        // 3.2x the work of a memory-bound GEMV, and BEAM times
+                        // it as a win only because the tile it displaces is
+                        // worse still.
+                        if tc_opt == 2 && !within_pad_budget(size as usize, tc_dim) {
+                            return ValidationFailedSnafu {
+                                op: "TC",
+                                reason: "padding to the tensor-core tile would add too much work",
+                            }
+                            .fail();
+                        }
                         let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, axis)).ok_or_else(|| {
                             ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.build()
                         })?;
@@ -602,8 +628,8 @@ pub fn apply_with_axis_choice(
     if use_tensor_cores == 0 || use_tensor_cores > 2 {
         return ValidationFailedSnafu { op: "TC", reason: "use_tensor_cores must be 1 or 2" }.fail();
     }
-    if tc_opt > 2 {
-        return ValidationFailedSnafu { op: "TC", reason: "tc_opt must be 0, 1, or 2" }.fail();
+    if tc_opt > 3 {
+        return ValidationFailedSnafu { op: "TC", reason: "tc_opt must be 0, 1, 2, or 3" }.fail();
     }
     if tc_select < -1 {
         return ValidationFailedSnafu { op: "TC", reason: "tc_select must be >= -1" }.fail();
@@ -663,7 +689,12 @@ pub fn apply_with_axis_choice(
                         "tensor core axis choice rejected"
                     );
                     failures.push((choice, reason));
-                    last_err = Some(err);
+                    // Every core but the matching one reports a dtype mismatch,
+                    // which says nothing about why the matching core declined.
+                    // Keep the first substantive rejection instead of the last.
+                    if last_err.is_none() || reason != NO_COMPATIBLE_TC {
+                        last_err = Some(err);
+                    }
                 }
             }
         }
@@ -674,7 +705,7 @@ pub fn apply_with_axis_choice(
     if let Some(err) = last_err {
         Err(err)
     } else {
-        ValidationFailedSnafu { op: "TC", reason: "no compatible tensor core found" }.fail()
+        ValidationFailedSnafu { op: "TC", reason: NO_COMPATIBLE_TC }.fail()
     }
 }
 

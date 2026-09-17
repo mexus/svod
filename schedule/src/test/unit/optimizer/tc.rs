@@ -273,10 +273,12 @@ fn apply_in_shape_only_mode_splits_the_axes_without_a_wmma() {
     assert_eq!(extents(AxisType::Reduce), vec![16 / core.dims.2 as i64]);
 }
 
-/// `tc_opt = 2` pads each non-divisible dimension to the core's tile.
-#[test_case(15, 16, 16, 2; "one padded axis")]
-#[test_case(17, 17, 17, 6; "every axis padded")]
-fn apply_pads_non_divisible_dimensions(m: i64, n: i64, k: i64, masks: usize) {
+/// `tc_opt = 2` pads each non-divisible dimension to the core's tile, as long
+/// as the tail stays inside the padding budget.
+#[test_case(15, 16, 16, 2, 2; "one padded axis")]
+#[test_case(30, 30, 30, 2, 6; "every axis padded")]
+#[test_case(5, 16, 16, 3, 2; "unbounded padding tiles a beam width of five")]
+fn apply_pads_non_divisible_dimensions(m: i64, n: i64, k: i64, tc_opt: usize, masks: usize) {
     let mut scheduler = Scheduler::new(matmul_accum(m, n, k, DType::Float16, DType::Float32), Renderer::cuda());
 
     assert_eq!(
@@ -284,16 +286,20 @@ fn apply_pads_non_divisible_dimensions(m: i64, n: i64, k: i64, masks: usize) {
         0,
         "an unpadded kernel has no mask"
     );
-    apply_with_axis_choice(&mut scheduler, 0, 2, 1, None).expect("tc_opt = 2 should pad");
+    apply_with_axis_choice(&mut scheduler, 0, tc_opt, 1, None).expect("padding levels should pad");
     assert_eq!(count(scheduler.ast(), |node| matches!(node.op(), Op::Ternary(svod_ir::TernaryOp::Where, ..))), masks);
     assert!(has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
 }
 
 /// A non-divisible dimension needs `tc_opt = 2`: without it the apply fails
-/// with the divisibility reason, and padding that would multiply the work by
-/// four or more is refused by PADTO instead.
+/// with the divisibility reason, and a tail beyond the padding budget is
+/// refused before PADTO ever runs: a beam-width M padded to a whole tile
+/// multiplies a memory-bound GEMV's work for nothing.
 #[test_case(15, 16, 16, 1, "dimension not divisible by tensor core size", "TC"; "15 is not divisible by 16")]
-#[test_case(4, 16, 16, 2, "padding would add more than 4x work", "PADTO"; "4 -> 16 is a 4x work increase")]
+#[test_case(4, 16, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "4 -> 16 is a 4x work increase")]
+#[test_case(5, 16, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "a beam width of 5 never pays for a 16-row tile")]
+#[test_case(16, 12, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "12 -> 16 is a third more work")]
+#[test_case(4, 16, 16, 3, "padding would add more than 4x work", "PADTO"; "unbounded padding keeps only the 4x limit")]
 fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize, reason: &str, op: &str) {
     let mut scheduler = Scheduler::new(matmul_accum(m, n, k, DType::Float16, DType::Float32), Renderer::cuda());
     let error = apply_with_axis_choice(&mut scheduler, 0, tc_opt, 1, None).expect_err("not divisible");
@@ -303,6 +309,18 @@ fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize
         "{error:?}"
     );
     assert!(!has_op(scheduler.ast(), |op| matches!(op, Op::Wmma(..))));
+}
+
+/// Automatic core selection trials every core; the cores whose dtypes cannot
+/// match an f16 matmul must not drown out why the one eligible core declined.
+#[test]
+fn auto_selection_reports_the_eligible_cores_rejection() {
+    let mut scheduler = Scheduler::new(matmul_accum(15, 16, 16, DType::Float16, DType::Float32), Renderer::amd_rdna4());
+    let error = apply_with_axis_choice(&mut scheduler, -1, 1, 1, None).expect_err("15 rows never tile at 16");
+    assert!(
+        matches!(error, OptError::ValidationFailed { op: "TC", reason: "dimension not divisible by tensor core size" }),
+        "{error:?}"
+    );
 }
 
 /// Symbolic extents never take the tensor core: PADTO cannot pad an unknown
@@ -330,7 +348,7 @@ fn apply_rejects_a_symbolic_dimension(divisible: bool, tc_opt: usize, reason: &s
 #[test_case(-2, 1, 1, None, "tc_select must be >= -1"; "tc_select below the auto sentinel")]
 #[test_case(-1, 1, 0, None, "use_tensor_cores must be 1 or 2"; "tensor cores switched off entirely")]
 #[test_case(-1, 1, 3, None, "use_tensor_cores must be 1 or 2"; "only 1 and 2 are accepted")]
-#[test_case(-1, 3, 1, None, "tc_opt must be 0, 1, or 2"; "tc_opt above two")]
+#[test_case(-1, 4, 1, None, "tc_opt must be 0, 1, 2, or 3"; "tc_opt above three")]
 #[test_case(-1, 1, 1, Some(5), "axis choice out of bounds"; "past the last axis choice")]
 #[test_case(-1, 1, 1, Some(1), "axis choice out of bounds"; "a choice the pattern does not have")]
 fn apply_validates_its_arguments(

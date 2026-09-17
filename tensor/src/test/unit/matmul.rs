@@ -826,7 +826,7 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
     let optimized = optimize_kernel_with_config(
         ast,
         &amd_optimizer(AmdArch::Gfx1151, None),
-        &pinned_tc_config(0, TcOptLevel::Padded),
+        &pinned_tc_config(0, TcOptLevel::Unbounded),
     )
     .expect("gfx1151 padded tensor-core optimization");
 
