@@ -46,11 +46,14 @@ pub fn decode_resources(
 /// architectures with known register-file geometry (`None` otherwise). This is
 /// the first-order limiter for compute-bound kernels; LDS and workgroup limits
 /// are not modeled.
-fn vgpr_limited_occupancy(vgprs: u32, wave_size: u32, target_major: u32) -> Option<f32> {
+pub(crate) fn vgpr_limited_occupancy(vgprs: u32, wave_size: u32, target_major: u32) -> Option<f32> {
     // (vgpr_file_per_simd, max_waves_per_simd, vgpr_alloc_granule)
     let (file, max_waves, granule) = match (target_major, wave_size) {
-        // RDNA3 / RDNA3.5 (gfx11.x), wave32: 1536 VGPRs/SIMD, 16 waves/SIMD.
-        (11, 32) => (1536u32, 16u32, 16u32),
+        // RDNA3+ (gfx11.x/gfx12.x), wave32: 1536 VGPRs/SIMD, 16 waves/SIMD.
+        // The granule is LLVM's `getVGPRAllocGranule` under `FeatureGFX11FullVGPRs`
+        // (wave32 → 24, taken before the GFX10.3 `16` arm); llc's occupancy steps
+        // at 96/120/144 VGPRs (16→12→10→9 waves) only reproduce with 24.
+        (11 | 12, 32) => (1536u32, 16u32, 24u32),
         _ => return None,
     };
     let alloc = vgprs.max(1).div_ceil(granule) * granule;
