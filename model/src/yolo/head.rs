@@ -8,6 +8,29 @@ use svod_tensor::nn::{Conv2d, Layer, Module};
 use super::blocks::conv::{YoloConv, conv2d_bias};
 use super::error::Result;
 
+/// The dtype every head decodes in, whatever the backbone computed in.
+pub(crate) const HEAD_DTYPE: svod_dtype::DType = svod_dtype::DType::Float32;
+
+/// Bring a backbone's feature maps back to [`HEAD_DTYPE`] at the head boundary.
+///
+/// The heads stay f32 even when the rest of the network does not. A box branch
+/// emits ltrb as *distances in stride units*, so [`dist2bbox`] sees values up to
+/// ~80 — where f16's ulp is 0.0625, an order of magnitude past the 0.05 px the
+/// parity tests allow, and the rounding lands *before* the `× stride` multiply
+/// that would otherwise hide it. Anchors and strides are f32 constants, so
+/// `dist2bbox` itself already promotes; it is the branch convs feeding it that
+/// have to be cast. Cheap insurance — the heads are ~7% of forward time.
+///
+/// A no-op when the features are f32 already: `UOp::cast` returns the same node.
+pub(crate) fn in_head_dtype(feat: &Tensor) -> Tensor {
+    feat.cast(HEAD_DTYPE)
+}
+
+/// [`in_head_dtype`] across a head's feature pyramid.
+pub(crate) fn in_head_dtypes(feats: &[Tensor]) -> Vec<Tensor> {
+    feats.iter().map(in_head_dtype).collect()
+}
+
 /// Generate anchor points and stride tensor from feature map sizes.
 ///
 /// Returns `(anchors [2, A], strides [1, A])` as constant f32 tensors.

@@ -57,6 +57,7 @@ impl Detect {
     /// Run box + cls heads on each feature map, decode boxes via dist2bbox,
     /// sigmoid scores, and cat into `[B, 4+nc, A]`.
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
+        let feats = &super::head::in_head_dtypes(feats);
         let shape = feats[0].shape()?;
         let b = shape[0].clone();
 
@@ -118,12 +119,15 @@ impl Yolo26Detect {
     pub fn with_zero_weights(config: YoloConfig) -> Self {
         let scale = config.scale;
         let [_, _, c2, c3, c4] = scaled_channels(scale);
-        Self {
+        let mut model = Self {
             config: config.clone(),
             backbone: YoloBackbone::empty(scale),
             neck: super::neck::YoloNeck::empty(scale),
             head: Detect::empty(&[c2, c3, c4], config.nc, config.reg_max),
-        }
+        };
+        loader::cast_placeholders(&mut model, &config.compute_dtype)
+            .expect("a freshly built model round-trips its own state dict");
+        model
     }
 
     pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
@@ -141,12 +145,14 @@ impl Yolo26Detect {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let sd = loader::load_weights(sd, &config.compute_dtype)?;
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "")?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let images = &self.config.cast_input(images);
         let (l4, l6, l10) = crate::state::scoped("backbone", || self.backbone.forward(images))?;
         let (p3, p4, p5) = crate::state::scoped("neck", || self.neck.forward(&l4, &l6, &l10))?;
         crate::state::scoped("head", || self.head.forward(&[p3, p4, p5]))
@@ -178,12 +184,15 @@ impl Yolo26DetectP2 {
         let scale = config.scale;
         let sc = |yaml_c| crate::yolo::config::scale_channels(yaml_c, scale);
         let ch = [sc(128), sc(256), sc(512), sc(1024)];
-        Self {
+        let mut model = Self {
             config: config.clone(),
             backbone: YoloBackbone::empty(scale),
             neck: super::neck::YoloNeckP2::empty(scale),
             head: Detect::empty_with_strides(&ch, config.nc, config.reg_max, &P2_STRIDES),
-        }
+        };
+        loader::cast_placeholders(&mut model, &config.compute_dtype)
+            .expect("a freshly built model round-trips its own state dict");
+        model
     }
 
     pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
@@ -201,12 +210,14 @@ impl Yolo26DetectP2 {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let sd = loader::load_weights(sd, &config.compute_dtype)?;
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "")?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let images = &self.config.cast_input(images);
         let (l2, l4, l6, l10) = self.backbone.forward_with_p2(images)?;
         let (p2, p3, p4, p5) = self.neck.forward(&l2, &l4, &l6, &l10)?;
         self.head.forward(&[p2, p3, p4, p5])
@@ -237,12 +248,15 @@ impl Yolo26DetectP6 {
     pub fn with_zero_weights(config: YoloConfig) -> Self {
         let scale = config.scale;
         let [_, _, c2, c3, c5, c6] = super::backbone::p6_scaled_channels(scale);
-        Self {
+        let mut model = Self {
             config: config.clone(),
             backbone: super::backbone::YoloBackboneP6::empty(scale),
             neck: super::neck::YoloNeckP6::empty(scale),
             head: Detect::empty_with_strides(&[c2, c3, c5, c6], config.nc, config.reg_max, &P6_STRIDES),
-        }
+        };
+        loader::cast_placeholders(&mut model, &config.compute_dtype)
+            .expect("a freshly built model round-trips its own state dict");
+        model
     }
 
     pub fn from_hub(model_id: &str, config: YoloConfig) -> Result<Self> {
@@ -260,12 +274,14 @@ impl Yolo26DetectP6 {
     }
 
     pub fn from_state_dict(sd: &StateDict, config: YoloConfig) -> Result<Self> {
+        let sd = loader::load_weights(sd, &config.compute_dtype)?;
         let mut model = Self::with_zero_weights(config);
-        model.load_state_dict(sd, "")?;
+        model.load_state_dict(&sd, "")?;
         Ok(model)
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
+        let images = &self.config.cast_input(images);
         let (l4, l6, l8, l12) = self.backbone.forward(images)?;
         let (p3, p4, p5, p6) = self.neck.forward(&l4, &l6, &l8, &l12)?;
         self.head.forward(&[p3, p4, p5, p6])

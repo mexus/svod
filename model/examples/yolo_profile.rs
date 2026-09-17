@@ -74,12 +74,36 @@ impl ScaleArg {
     }
 }
 
+/// Compute dtype for the backbone and neck. The heads always decode in f32.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DtypeArg {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl From<DtypeArg> for svod_dtype::DType {
+    fn from(arg: DtypeArg) -> Self {
+        match arg {
+            DtypeArg::F32 => svod_dtype::DType::Float32,
+            DtypeArg::F16 => svod_dtype::DType::Float16,
+            DtypeArg::Bf16 => svod_dtype::DType::BFloat16,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "YOLO26 per-kernel profiling harness (CPU now, CUDA later)", long_about = None)]
 struct Args {
     /// Model scale.
     #[arg(long, value_enum, default_value_t = ScaleArg::X)]
     scale: ScaleArg,
+
+    /// Compute dtype for backbone + neck (heads stay f32). f16 halves weight
+    /// bandwidth and doubles tensor-core peak on consumer Ampere, where tf32
+    /// buys no FLOPS over plain f32.
+    #[arg(long, value_enum, default_value_t = DtypeArg::F32)]
+    dtype: DtypeArg,
 
     /// Number of classes the checkpoint was trained with.
     #[arg(long, default_value_t = 80)]
@@ -233,10 +257,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.size,
         args.batch
     );
+    println!("compute dtype: {:?} (heads f32)", svod_dtype::DType::from(args.dtype));
 
     // --- load -------------------------------------------------------------
     let t_load = Instant::now();
-    let cfg = YoloConfig::new(args.scale.into(), args.nc).with_max_batch_size(args.batch.max(1));
+    let cfg = YoloConfig::new(args.scale.into(), args.nc)
+        .with_max_batch_size(args.batch.max(1))
+        .with_compute_dtype(args.dtype.into());
     let model = if let Some(ref path) = args.local {
         Yolo26Detect::from_safetensors(path, cfg)?
     } else {
@@ -254,10 +281,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input: Vec<f32> = match &args.input {
         Some(path) => {
             let bytes = std::fs::read(path).map_err(|e| format!("--input {}: {e}", path.display()))?;
-            let floats: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            let floats: Vec<f32> =
+                bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let want = args.batch * 3 * args.size * args.size;
             if floats.len() != want {
                 return Err(format!(
