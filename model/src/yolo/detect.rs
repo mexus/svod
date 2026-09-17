@@ -147,9 +147,9 @@ impl Yolo26Detect {
     }
 
     pub fn forward(&self, images: &Tensor) -> Result<Tensor> {
-        let (l4, l6, l10) = self.backbone.forward(images)?;
-        let (p3, p4, p5) = self.neck.forward(&l4, &l6, &l10)?;
-        self.head.forward(&[p3, p4, p5])
+        let (l4, l6, l10) = crate::state::scoped("backbone", || self.backbone.forward(images))?;
+        let (p3, p4, p5) = crate::state::scoped("neck", || self.neck.forward(&l4, &l6, &l10))?;
+        crate::state::scoped("head", || self.head.forward(&[p3, p4, p5]))
     }
 }
 
