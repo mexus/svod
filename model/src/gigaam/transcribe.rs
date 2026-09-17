@@ -262,7 +262,11 @@ impl GigaAmTranscriber {
         let max_batch_by_memory = (target_scores_bytes / bytes_per_batch.max(1)).max(1);
         let max_batch = max_batch_by_memory.min(model.config.max_batch_size);
 
-        let prepare_config = PrepareConfig::from_env();
+        // Device-local output: the [B, T_sub, vocab] log-probs come back in
+        // one copy over the copy engine. Decoding straight from the host-mapped
+        // BAR costs a PCIe round trip per float — 6 s of a 13 s run on a
+        // discrete AMD card.
+        let prepare_config = PrepareConfig::device_local();
         // The encoder's mel input is device-local: it is only ever written by
         // an on-device copy from the mel JIT's output.
         let mel_spec = InputSpec::f32(&[max_batch, model.config.n_mels, max_t_mel]).device_local();
@@ -431,10 +435,12 @@ impl svod_arch::pipelines::audio::Transcriber for GigaAmTranscriber {
                     }
                     let total_vocab = decoder.total_vocab();
                     let item_stride = max_t_sub * total_vocab;
-                    // The typed view drains the async fused encoder+head dispatch.
-                    let logits = jit.log_probs_view::<f32>()?;
+                    // One prefix copyout drains the fused encoder+head dispatch
+                    // and skips the inactive lanes of a partial last batch.
+                    let mut raw = vec![0f32; b * item_stride];
+                    jit.log_probs()?.copyout_prefix(bytemuck::cast_slice_mut(&mut raw))?;
                     t_encoder += t_enc.elapsed();
-                    let flat = logits.to_slice().expect("contiguous logits");
+                    let flat: &[f32] = &raw;
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subsampled_len(subs_kernel_size, *mel_len);
                         // Frames span the decode window; frame_shift maps a frame
