@@ -1,5 +1,6 @@
 use super::super::types::{OptArgExt, OptOps};
 use super::*;
+use test_case::test_case;
 
 /// A SINK with one WEAK axis at `constant`, so `generate_actions` has something to split; the WEAK extent caps the renderer's global max at 32.
 fn weak_axis_scheduler(constant: i32) -> Scheduler {
@@ -532,4 +533,174 @@ fn test_remote_beam_worker_error_invalidates_cache() {
     );
     assert!(matches!(result, Err(OptError::BeamWorker { .. })));
     assert!(cache_get(&guard.key).is_none(), "a stale entry must be dropped when the worker fails");
+}
+
+/// `out[row] = sum_c x[row + c]` on a GPU renderer: the matvec shape whose hand-coded
+/// stack is several actions deep, so greedy expansion cannot reach it.
+fn matvec_scheduler() -> Scheduler {
+    use svod_dtype::DType;
+    use svod_ir::AxisType;
+    Scheduler::new(
+        crate::test::unit::optimizer::kernels::row_reduce(AxisType::Global, 64, 128, DType::Float32, None),
+        crate::optimizer::Renderer::cuda(),
+    )
+}
+
+/// The opts [`heuristic_seed`] stacks on `scheduler`, asserted to be out of reach of one expansion.
+#[track_caller]
+fn unreachable_seed(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Opt> {
+    let seed = heuristic_seed(scheduler, config).expect("the matvec shape has a hand-coded stack");
+    assert!(
+        seed.applied_opts.len() > scheduler.applied_opts.len() + 1,
+        "the fixture must need more than one action: {:?}",
+        seed.applied_opts
+    );
+    assert!(
+        !generate_actions(scheduler, config).iter().any(|candidate| candidate.applied_opts == seed.applied_opts),
+        "a seed one expansion away would not prove anything"
+    );
+    seed.applied_opts
+}
+
+/// The hand-coded kernel is timed in the first wave, so a search whose scorer prefers it returns it.
+#[test]
+fn beam_search_seeds_the_hand_coded_kernel() {
+    let scheduler = matvec_scheduler();
+    let config = BeamConfig { beam_width: 2, disable_cache: true, ..Default::default() };
+    let seed_opts = unreachable_seed(&scheduler, &config);
+    let scored = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let score = {
+        let (seed_opts, scored) = (seed_opts.clone(), std::sync::Arc::clone(&scored));
+        move |candidate: &Scheduler, _early_stop: Option<Duration>| {
+            scored.lock().unwrap().push(candidate.applied_opts.clone());
+            let winner = candidate.applied_opts == seed_opts;
+            Some(CandidateMetrics {
+                timing: Duration::from_nanos(if winner { 100 } else { 1000 }),
+                ir_hash: plan_identity(&candidate.applied_opts),
+                compute_ops: Some(1),
+            })
+        }
+    };
+    let result = beam_search(scheduler, &config, score).expect("beam search");
+    assert_eq!(result.scheduler.applied_opts, seed_opts, "the seeded stack must win when it is fastest");
+    assert_eq!(result.timing, Duration::from_nanos(100));
+    let scored = scored.lock().unwrap();
+    assert_eq!(
+        scored.iter().filter(|opts| **opts == seed_opts).count(),
+        1,
+        "the seed is timed once, in the first wave"
+    );
+}
+
+/// A seed nobody can use must not divert the search: scoring it slowest leaves the
+/// winner exactly where a search that never saw it lands.
+#[test]
+fn a_losing_seed_leaves_the_search_unchanged() {
+    let scheduler = matvec_scheduler();
+    let config = BeamConfig { beam_width: 2, disable_cache: true, ..Default::default() };
+    let seed_opts = unreachable_seed(&scheduler, &config);
+    // `slowest` times the seed and loses; `dropped` never returns metrics for it,
+    // which is precisely how the search behaved before it was seeded.
+    let run = |slowest: bool| {
+        let seed_opts = seed_opts.clone();
+        let score = move |candidate: &Scheduler, _early_stop: Option<Duration>| {
+            let identity = plan_identity(&candidate.applied_opts);
+            if candidate.applied_opts == seed_opts {
+                return slowest.then_some(CandidateMetrics {
+                    timing: Duration::from_secs(1),
+                    ir_hash: identity,
+                    compute_ops: Some(1),
+                });
+            }
+            Some(CandidateMetrics { timing: plan_timing(identity)?, ir_hash: identity, compute_ops: Some(1) })
+        };
+        beam_search(scheduler.clone(), &config, score).expect("beam search")
+    };
+    let (timed, unseeded) = (run(true), run(false));
+    assert_ne!(timed.scheduler.applied_opts, seed_opts, "a losing seed must not win");
+    assert_eq!(timed.scheduler.applied_opts, unseeded.scheduler.applied_opts);
+    assert_eq!(timed.timing, unseeded.timing);
+    assert_eq!(timed.iterations, unseeded.iterations);
+}
+
+/// The staged loop seeds its first compile wave too, not just the plain one.
+#[test]
+fn staged_beam_seeds_the_hand_coded_kernel() {
+    let scheduler = matvec_scheduler();
+    let config =
+        BeamConfig { beam_width: 2, min_progress_ns: 1_000_000_000, disable_cache: true, ..Default::default() };
+    let seed_opts = unreachable_seed(&scheduler, &config);
+    let waves = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let result = beam_search_staged(
+        scheduler,
+        &config,
+        {
+            let waves = std::sync::Arc::clone(&waves);
+            move |candidates: &[Scheduler], emit: &mut dyn FnMut(usize, CompiledCandidate<u64>)| {
+                waves.lock().unwrap().push(candidates.iter().map(|c| c.applied_opts.clone()).collect::<Vec<_>>());
+                for (index, candidate) in candidates.iter().enumerate() {
+                    emit(index, compiled(plan_identity(&candidate.applied_opts), Some(1)));
+                }
+            }
+        },
+        |identity: &u64, _early_stop| {
+            Some(if *identity == plan_identity(&seed_opts) { Duration::from_nanos(1) } else { Duration::from_nanos(2) })
+        },
+    )
+    .expect("staged beam search");
+    assert!(waves.lock().unwrap()[0].contains(&seed_opts), "the seed belongs to the first wave");
+    assert_eq!(result.scheduler.applied_opts, seed_opts);
+}
+
+/// The remote protocol carries the seed as a multi-opt suffix: the worker replays the
+/// whole stack from the recorded prefix, and the parent can return it as the winner.
+#[test]
+fn remote_beam_replays_the_multi_opt_seed() {
+    let scheduler = matvec_scheduler();
+    let config =
+        BeamConfig { beam_width: 2, min_progress_ns: 1_000_000_000, disable_cache: true, ..Default::default() };
+    let base = scheduler.applied_opts.len();
+    let seed_opts = unreachable_seed(&scheduler, &config);
+    let replayed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let worker = scheduler.clone();
+    let result = beam_search_remote_staged(
+        scheduler,
+        &config,
+        |candidates: &[Vec<Opt>], emit: &mut dyn FnMut(usize, CompiledCandidate<u64>)| {
+            assert!(candidates.contains(&seed_opts), "the first wave must carry the seed's full plan");
+            for (index, opts) in candidates.iter().enumerate() {
+                // The worker rebuilds every candidate from the base AST alone.
+                let Some(candidate) = apply_remote_candidate(worker.clone(), base, opts, &config) else { continue };
+                assert_eq!(&candidate.applied_opts, opts, "replay must reproduce the plan exactly");
+                replayed.lock().unwrap().push(opts.clone());
+                emit(index, compiled(plan_identity(opts), Some(1)));
+            }
+            Ok(())
+        },
+        |identity: &u64, _early_stop| {
+            Some(if *identity == plan_identity(&seed_opts) { Duration::from_nanos(1) } else { Duration::from_nanos(2) })
+        },
+    )
+    .expect("remote beam search");
+    assert!(replayed.lock().unwrap().contains(&seed_opts), "the seed must survive the worker's replay");
+    assert_eq!(result.scheduler.applied_opts, seed_opts);
+    assert_eq!(result.timing, Duration::from_nanos(1));
+}
+
+/// The worker rebuilds a seed from the base AST alone, whatever the heuristics stacked:
+/// a tensor-core tile with its post-TC extras, or the decode matvec's four-opt split.
+#[test_case(crate::optimizer::Renderer::cuda(), 512, 512, 512; "tensor cores on cuda")]
+#[test_case(crate::optimizer::Renderer::for_amd_arch(svod_dtype::AmdArch::Gfx1201), 512, 512, 512; "tensor cores on rdna4")]
+#[test_case(crate::optimizer::Renderer::for_amd_arch(svod_dtype::AmdArch::Gfx1201), 5, 5120, 1280; "decode matvec on rdna4")]
+fn every_seed_replays_through_the_remote_protocol(renderer: crate::optimizer::Renderer, m: i64, n: i64, k: i64) {
+    use svod_dtype::DType;
+    let sink = crate::test::unit::optimizer::kernels::matmul_accum(m, n, k, DType::Float16, DType::Float32);
+    let scheduler = Scheduler::new(sink, renderer);
+    let config = BeamConfig::default();
+    let seed = heuristic_seed(&scheduler, &config).expect("the shape has a hand-coded stack");
+    assert!(seed.applied_opts.len() > 1, "a one-opt seed would not exercise the multi-opt suffix");
+    let base = scheduler.applied_opts.len();
+    let replayed =
+        apply_remote_candidate(scheduler, base, &seed.applied_opts, &config).expect("the worker must replay the seed");
+    assert_eq!(replayed.applied_opts, seed.applied_opts);
 }
