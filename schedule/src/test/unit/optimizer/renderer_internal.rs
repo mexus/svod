@@ -138,7 +138,7 @@ fn amd_fp8_dtype_capabilities_are_arch_specific(arch: AmdArch, dtype: ScalarDTyp
 #[test_case(AmdArch::Gfx942, 4, (16, 16, 32), DType::FP8E4M3, DType::Float32; "cdna3")]
 #[test_case(AmdArch::Gfx950, 8, (16, 16, 128), DType::FP8E4M3, DType::Float32; "cdna4")]
 #[test_case(AmdArch::Gfx1151, 4, (16, 16, 16), DType::Int8, DType::Int32; "rdna3")]
-#[test_case(AmdArch::Gfx1201, 4, (16, 16, 16), DType::BFloat16, DType::BFloat16; "rdna4")]
+#[test_case(AmdArch::Gfx1201, 5, (16, 16, 16), DType::BFloat16, DType::BFloat16; "rdna4")]
 fn amd_tensor_core_tables_match_architecture(
     arch: AmdArch,
     len: usize,
@@ -154,12 +154,12 @@ fn amd_tensor_core_tables_match_architecture(
     );
     assert!(!renderer.tensor_cores.iter().any(|tc| tc.dtype_in == DType::Float32), "no fp32 input core");
 
-    // RDNA3/RDNA4 declare no fp8 core; CDNA3 declares no int8 one.
+    // RDNA3/RDNA4 declare no fp8 core; both declare the `iu8` one, which CDNA lacks.
     let fp8 = renderer.tensor_cores.iter().any(|tc| tc.dtype_in.scalar_dtype().is_fp8());
     assert_eq!(fp8, matches!(arch, AmdArch::Gfx942 | AmdArch::Gfx950), "{arch} fp8 core");
     assert_eq!(
         renderer.tensor_cores.iter().any(|tc| tc.dtype_in == DType::Int8 && tc.dtype_out == DType::Int32),
-        matches!(arch, AmdArch::Gfx1151),
+        !arch.is_cdna(),
         "{arch} int8 core"
     );
 }

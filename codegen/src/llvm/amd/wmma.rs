@@ -65,7 +65,7 @@ pub fn render_wmma_amd(
     let scaled_fp8 = matches!(arch, AmdArch::Gfx950)
         && k == 128
         && matches!(in_scalar, Some(ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2));
-    let rdna_int8 = !arch.is_cdna() && !arch.is_rdna4() && in_scalar == Some(ScalarDType::Int8);
+    let rdna_int8 = !arch.is_cdna() && in_scalar == Some(ScalarDType::Int8);
     let a_op = bitcast_operand(kernel, &dst, "a", &a_dtype, &a_name, bf16_native, scaled_fp8, rdna_int8);
     let b_op = bitcast_operand(kernel, &dst, "b", &b_dtype, &b_name, bf16_native, scaled_fp8, rdna_int8);
     let c_op = bitcast_operand(kernel, &dst, "c", &c_dtype, &c_name, bf16_native, false, false);
@@ -109,7 +109,8 @@ pub fn render_wmma_amd(
 /// go as `i16` (the `bf16.1k`/RDNA `.bf16` intrinsics), except for the CDNA4
 /// K=32 `.bf16` form which takes native `<N x bfloat>` (`bf16_native`); K=32
 /// fp8 lanes pack into one `iN`, scaled K=128 uses packed i32 vectors, and
-/// RDNA3 int8 lanes pack four-at-a-time into i32 vectors.
+/// RDNA int8 lanes pack four-at-a-time into i32 vectors (RDNA3's 16 lanes give
+/// `<4 x i32>`, RDNA4's 8 give `<2 x i32>`).
 fn wmma_wire_type(dtype: &DType, bf16_native: bool) -> (String, bool) {
     wmma_wire_type_with_scaled_fp8(dtype, bf16_native, false, false)
 }
@@ -228,36 +229,20 @@ fn resolve_intrinsic(
     if k != 16 {
         return None;
     }
-    let in_suffix = match in_dt {
-        ScalarDType::Float16 => "f16",
-        ScalarDType::BFloat16 => "bf16",
-        ScalarDType::Int8 if !arch.is_rdna4() => "iu8",
-        _ => return None,
-    };
-    let acc_suffix = match acc_dt {
-        ScalarDType::Float32 => "f32",
-        ScalarDType::Float16 => "f16",
-        ScalarDType::BFloat16 => "bf16",
-        ScalarDType::Int32 => "i32",
+    // The accumulator is pinned to the operand: only these pairs exist, and an
+    // unlisted one (`iu8` into f32, say) would name an intrinsic LLVM lowers to
+    // a silent extern call. RDNA4 appends the overloaded result/input vector
+    // widths — int8 rides eight lanes as two packed i32 words.
+    let (in_suffix, acc_suffix, overload) = match (in_dt, acc_dt) {
+        (ScalarDType::Float16, ScalarDType::Float32) => ("f16", "f32", "v8f32.v8f16"),
+        (ScalarDType::Float16, ScalarDType::Float16) => ("f16", "f16", "v8f16.v8f16"),
+        (ScalarDType::BFloat16, ScalarDType::Float32) => ("bf16", "f32", "v8f32.v8i16"),
+        (ScalarDType::BFloat16, ScalarDType::BFloat16) => ("bf16", "bf16", "v8i16.v8i16"),
+        (ScalarDType::Int8, ScalarDType::Int32) => ("iu8", "i32", "v8i32.v2i32"),
         _ => return None,
     };
     let base = format!("llvm.amdgcn.wmma.{acc_suffix}.{n}x{m}x{k}.{in_suffix}");
-    if !arch.is_rdna4() {
-        return Some(base);
-    }
-    let acc_overload = match acc_dt {
-        ScalarDType::Float32 => "v8f32",
-        ScalarDType::Float16 => "v8f16",
-        ScalarDType::BFloat16 => "v8i16",
-        ScalarDType::Int32 => "v8i32",
-        _ => return None,
-    };
-    let in_overload = match in_dt {
-        ScalarDType::Float16 => "v8f16",
-        ScalarDType::BFloat16 => "v8i16",
-        _ => return None,
-    };
-    Some(format!("{base}.{acc_overload}.{in_overload}"))
+    Some(if arch.is_rdna4() { format!("{base}.{overload}") } else { base })
 }
 
 #[cfg(test)]

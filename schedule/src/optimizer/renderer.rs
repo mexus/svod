@@ -1121,6 +1121,7 @@ impl TensorCore {
             AMD_RDNA4.build(DType::Float16, DType::Float16),
             AMD_RDNA4.build(DType::BFloat16, DType::Float32),
             AMD_RDNA4.build(DType::BFloat16, DType::BFloat16),
+            AMD_RDNA4.build(DType::Int8, DType::Int32),
         ]
     }
 
