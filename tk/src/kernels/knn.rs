@@ -64,12 +64,11 @@ const BLK: usize = 16;
 /// and regresses, so the sweet spot is `2·BLK`, not maximal.
 const TM: usize = 32;
 
-/// The GPU arch(es) this kernel is built for: gfx942 (CDNA3 MFMA, wave64) and
-/// gfx1151 (RDNA3.5 WMMA, wave32). Both resolve the accumulator/operand fragments
-/// by role through [`crate::ArchCaps`]; the launcher gates against this list.
-/// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
-pub const KNN_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
+/// The GPU arch(es) this kernel is built for: gfx942 (CDNA3 MFMA, wave64) and the
+/// wave32 RDNA WMMA parts. All resolve the accumulator/operand fragments by role
+/// through [`crate::ArchCaps`]; the launcher gates against this list.
+/// Validated on gfx942 (CDNA3), gfx1151 (RDNA3.5) and gfx1201 (RDNA4).
+pub const KNN_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(crate::target::CDNA_RDNA_WMMA);
 
 const POS_INF: f64 = f64::INFINITY;
 const NEG_INF: f64 = f64::NEG_INFINITY;

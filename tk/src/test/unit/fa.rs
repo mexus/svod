@@ -1096,14 +1096,18 @@ fn fa_policy_declines_tiles_past_shared_memory(arch: svod_dtype::GpuArch, d: usi
     assert_eq!(policy.config(1, 1024, 8, d, true).map(|cfg| (cfg.q_blk, cfg.kv_blk)), tile);
 }
 
-/// The relayout band RDNA stages through LDS counts toward the budget.
+/// The relayout band gfx11 stages through LDS counts toward the budget. gfx12
+/// shares one fragment across the accumulator and operand roles, so — like CDNA —
+/// it reuses the accumulator in registers and carries no band.
 #[test]
 fn fa_policy_counts_the_rdna_band() {
-    let rdna = crate::kernels::fa::FaPolicy::for_arch(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151));
-    let cdna = crate::kernels::fa::FaPolicy::for_arch(svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942));
-    assert!(rdna.att_band && !cdna.att_band);
-    assert_eq!(rdna.shared_bytes((16, 32), 64) - cdna.shared_bytes((16, 32), 64), 8 * 32 * 16 * 2);
+    let amd = |a| crate::kernels::fa::FaPolicy::for_arch(svod_dtype::GpuArch::Amd(a));
+    let (gfx11, cdna, gfx12) =
+        (amd(svod_dtype::AmdArch::Gfx1151), amd(svod_dtype::AmdArch::Gfx942), amd(svod_dtype::AmdArch::Gfx1201));
+    assert!(gfx11.att_band && !cdna.att_band && !gfx12.att_band);
+    assert_eq!(gfx11.shared_bytes((16, 32), 64) - cdna.shared_bytes((16, 32), 64), 8 * 32 * 16 * 2);
     assert_eq!(cdna.shared_bytes((16, 32), 64), 4 * 32 * 64 * 2);
+    assert_eq!(gfx12.shared_bytes((16, 32), 64), cdna.shared_bytes((16, 32), 64));
 }
 
 // ── Metal (Apple7+, `simdgroup_matrix`) ───────────────────────────────────────

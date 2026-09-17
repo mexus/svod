@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use snafu::ensure;
-use svod_dtype::{AmdArch, CudaArch, DType};
+use svod_dtype::{CudaArch, DType};
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
@@ -18,10 +18,11 @@ use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at};
 use crate::scaffold::GlSpec;
 use crate::{ArchCaps, ArchSet, Kernel};
 
-/// Architectures on which the scalar shuffle implementation is supported: the AMD
-/// pair plus CUDA from Ampere up (the kernel needs only `shfl.sync` and `ex2`).
+/// Architectures on which the scalar shuffle implementation is supported: the CDNA
+/// and RDNA parts plus CUDA from Ampere up (the kernel needs only `shfl.sync` and
+/// `ex2`).
 pub const SQ_ATTENTION_SUPPORTED_ARCHS: ArchSet =
-    ArchSet::amd(&[AmdArch::Gfx942, AmdArch::Gfx1151]).with_cuda_from(CudaArch::from_compute_capability(8, 0));
+    ArchSet::amd(crate::target::CDNA_RDNA_WMMA).with_cuda_from(CudaArch::from_compute_capability(8, 0));
 
 /// Compile-time masking options for [`single_query_attention`].
 #[derive(Clone, Copy, Default)]

@@ -175,19 +175,23 @@ fn frag_roles_resolve_to_canonical_constants() {
     assert_eq!(r.frag(AccumulatorT), Some(RT_16X16_W32_ACC_T));
     assert_eq!(r.shared_default(), Some(ST_16X16_SWIZZLED_W32));
     assert_eq!(r.shared_swizzled(), Some(ST_16X16_SWIZZLED_W32));
-    assert!(!r.acc_reusable_as_input(), "RDNA acc/input fragments differ ⇒ LDS relayout");
+    assert!(!r.acc_reusable_as_input(), "gfx11 acc/input fragments differ ⇒ LDS relayout");
 }
 
-/// gfx1201 (RDNA4, wave32) resolves every role to the single strided 8/lane
+/// RDNA4 (gfx1200/gfx1201, wave32) resolves every role to the single strided 8/lane
 /// [`RT_16X16_GFX12`] — gfx12 drops RDNA3's wave-half replication and its even/odd
 /// accumulator, so operand, B operand, accumulator and the N-major `AccumulatorT`
 /// store are one fragment, as on CDNA. Hardware-verified on gfx1201; a regression
 /// back onto the `RT_16X16_W32_*` shapes is what made the matmul compute garbage.
 /// The LDS strip is unchanged (the wave32 swizzled ept-8 strip serves both gfx11
 /// and gfx12).
-#[test]
-fn gfx1201_caps_resolve_gfx12_fragments() {
-    let c = ArchCaps::for_amd(AmdArch::Gfx1201);
+/// Sharing one fragment across the roles is also what licenses the register
+/// acc→input handoff (hardware-verified on gfx1201), which drops FA's per-warp
+/// LDS relayout band.
+#[test_case(AmdArch::Gfx1200; "gfx1200")]
+#[test_case(AmdArch::Gfx1201; "gfx1201")]
+fn rdna4_caps_resolve_gfx12_fragments(arch: AmdArch) {
+    let c = ArchCaps::for_amd(arch);
     assert_eq!(c.wave_size, 32);
     assert!(c.has_matrix_core_layouts());
     for role in [Accumulator, Operand, OperandB, AccumulatorT] {
@@ -195,6 +199,22 @@ fn gfx1201_caps_resolve_gfx12_fragments() {
     }
     assert_eq!(c.shared_default(), Some(ST_16X16_SWIZZLED_W32));
     assert_eq!(c.shared_swizzled(), Some(ST_16X16_SWIZZLED_W32));
+    assert!(c.acc_reusable_as_input(), "one gfx12 fragment for both roles ⇒ a register copy");
+}
+
+/// Every kernel bar the gfx942-only direct-launch FA wrapper admits the RDNA4
+/// parts; the RDNA-only sets (norm, NT gemm) admit them without admitting CDNA.
+#[test]
+fn rdna4_is_in_the_shared_arch_lists() {
+    use crate::target::{CDNA_RDNA_WMMA, RDNA_WMMA};
+
+    for arch in [AmdArch::Gfx1200, AmdArch::Gfx1201] {
+        let gpu = GpuArch::Amd(arch);
+        assert!(crate::ArchSet::amd(RDNA_WMMA).supports(gpu), "{arch:?} in RDNA_WMMA");
+        assert!(crate::ArchSet::amd(CDNA_RDNA_WMMA).supports(gpu), "{arch:?} in CDNA_RDNA_WMMA");
+    }
+    assert!(!crate::ArchSet::amd(RDNA_WMMA).supports(GpuArch::Amd(AmdArch::Gfx942)));
+    assert!(crate::ArchSet::amd(CDNA_RDNA_WMMA).supports(GpuArch::Amd(AmdArch::Gfx942)));
 }
 
 /// [`ArchSet`](crate::ArchSet) membership: the AMD list is exact, the CUDA floor is

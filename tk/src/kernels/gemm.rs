@@ -639,8 +639,8 @@ impl Strips<'_> {
 /// The arches [`gemm_nt`] is enabled for. The core is arch-generic; a family
 /// joins with its own measured tile table in [`GemmPolicy::for_arch`], a new
 /// part of a known family with an entry here once validated.
-pub const GEMM_NT_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx1151])
-    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+pub const GEMM_NT_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(crate::target::RDNA_WMMA).with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// The CUDA default tile: 128×64, a 2×2 wave grid (128 threads), two 32×32 f32
 /// accumulators per wave, `k_step = 32` and the two-stage `cp.async` pipeline.
@@ -1114,7 +1114,7 @@ pub struct MatmulCfg {
     /// multiple of 16 (the WMMA K-edge) and divide N. Lowering it cuts the live
     /// operand VGPR/lane (each WMMA input replicates all `k_step`/16 K-sub-steps),
     /// raising occupancy — the dominant occupancy lever on gfx11/wave32, whose
-    /// input fragment is 16/lane ([`GFX1151_CFG`] uses 32). gfx942 keeps [`K_STEP`]
+    /// input fragment is 16/lane ([`RDNA_CFG`] uses 32). gfx942 keeps [`K_STEP`]
     /// (64). `0` means "use [`K_STEP`]" so older literal/`..M1_CFG` builders that
     /// predate the field still get the default — see [`MatmulCfg::k_step`].
     pub k_step: usize,
@@ -1187,7 +1187,8 @@ pub const M1_CFG: MatmulCfg =
 pub const SMALL_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 1, wave_cols: 1, n_accum: 1, l2_swizzle: false, vec_load: false, k_step: K_STEP };
 
-/// gfx1151 (RDNA3.5, wave32) config: 64×64 block, 2×2
+/// The RDNA (wave32 WMMA) config, measured on gfx1151 and inherited by the other
+/// parts of the family: 64×64 block, 2×2
 /// waves (4 waves / 128 threads), ONE
 /// 32×32 accumulator/wave, 128-bit vec fills, no L2 swizzle (single-XCD APU), and
 /// **`k_step = 32`**. The `reg=32` tile keeps accumulator VGPR ≈ 32/lane; the
@@ -1197,7 +1198,7 @@ pub const SMALL_CFG: MatmulCfg =
 /// memory stall a double buffer could hide. gfx942 keeps `k_step = K_STEP` (64). A
 /// smaller `k_step` lowers the WMMA-input VGPR but adds barriers, so the tuned value
 /// trades occupancy against barrier overhead.
-pub const GFX1151_CFG: MatmulCfg =
+pub const RDNA_CFG: MatmulCfg =
     MatmulCfg { block: 64, wave_rows: 2, wave_cols: 2, n_accum: 1, l2_swizzle: false, vec_load: true, k_step: 32 };
 
 /// CUDA sm_80+ (`mma.sync`, warp32) config: 128×128 block, 2×4 waves (256 threads),
@@ -1233,15 +1234,16 @@ pub fn cfg_for_n(n: usize) -> MatmulCfg {
     if n <= 768 && n.is_multiple_of(SMALL_CFG.block) { SMALL_CFG } else { M1_CFG }
 }
 
-/// Per-arch config: gfx1151 (RDNA3.5 wave32) uses the occupancy-tuned
-/// [`GFX1151_CFG`]; CUDA the register-pressure-tuned [`SM80_CFG`] (or
+/// Per-family config: RDNA (wave32 WMMA — gfx11 and gfx12 alike) uses the
+/// occupancy-tuned [`RDNA_CFG`]; CUDA the register-pressure-tuned [`SM80_CFG`] (or
 /// [`SM80_SMALL_CFG`] when N only tiles by 64); gfx942 (CDNA wave64) keeps the
-/// size-adaptive [`cfg_for_n`]. Arch-specific peak tuning lives here (the generic
-/// optimizer stays generic); this is the tk peer of HK shipping separate
-/// gfx942/gfx950/gfx1250 kernels.
+/// size-adaptive [`cfg_for_n`]. Keyed by family, not part, so a new card of a
+/// measured family runs its table instead of another family's wave64 constants.
+/// Family-specific peak tuning lives here (the generic optimizer stays generic);
+/// this is the tk peer of HK shipping separate gfx942/gfx950/gfx1250 kernels.
 pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
     match arch {
-        svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1151) if n.is_multiple_of(GFX1151_CFG.block) => GFX1151_CFG,
+        svod_dtype::GpuArch::Amd(amd) if !amd.is_cdna() && n.is_multiple_of(RDNA_CFG.block) => RDNA_CFG,
         svod_dtype::GpuArch::Cuda(_) if n.is_multiple_of(SM80_CFG.block) => SM80_CFG,
         svod_dtype::GpuArch::Cuda(_) => SM80_SMALL_CFG,
         svod_dtype::GpuArch::Metal(_) => METAL_CFG,
@@ -1250,15 +1252,15 @@ pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
 }
 
 /// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64),
-/// gfx1151 (gfx11 WMMA, wave32 — the `_W32_*` fragment shapes) and CUDA sm_80+
-/// (`mma.sync.m16n8k16`, warp32 — the two-half `RT_16X16_MMA` fragment). The
-/// launcher gates against this; see [`crate::target::check_target`]. Validated on
-/// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere) — gfx942 before the
-/// vector LDS gathers (PR #177), not re-run since.
-pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
-        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
-        .with_metal_from(svod_dtype::MetalFamily::Apple(7));
+/// the wave32 RDNA parts (gfx11 WMMA — the `_W32_*` fragment shapes — and gfx12's
+/// strided `RT_16X16_GFX12`) and CUDA sm_80+ (`mma.sync.m16n8k16`, warp32 — the
+/// two-half `RT_16X16_MMA` fragment). The launcher gates against this; see
+/// [`crate::target::check_target`]. Validated on gfx942 (CDNA3), gfx1151
+/// (RDNA3.5), gfx1201 (RDNA4) and sm_86 (Ampere) — gfx942 before the vector LDS
+/// gathers (PR #177), not re-run since.
+pub const MATMUL_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(crate::target::CDNA_RDNA_WMMA)
+    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
+    .with_metal_from(svod_dtype::MetalFamily::Apple(7));
 
 /// **Graph-native** `n×n` matrix multiply — returns a lazy output [`Tensor`] (a
 /// `custom_kernel` / `Op::Call` node), the matmul peer of [`crate::flash_attention`].

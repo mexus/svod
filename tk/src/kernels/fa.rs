@@ -65,17 +65,17 @@ fn iconst(v: i64) -> Arc<UOp> {
 }
 
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
-/// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), gfx1151
-/// (RDNA3.5 WMMA, wave32), CUDA sm_80+ (`mma.sync`, warp32) and Apple7+
+/// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), the wave32
+/// RDNA parts (gfx1151 gfx11 WMMA, gfx1200/gfx1201 RDNA4 WMMA), CUDA sm_80+
+/// (`mma.sync`, warp32) and Apple7+
 /// (`simdgroup_matrix`, SIMD-group 32). The launcher gates
 /// against this list; generic launch infrastructure stays architecture-agnostic.
 /// gfx942 was validated on hardware before the vector LDS gathers and the single
 /// fenced K/V commit (PR #177) and has not been re-run since; its golden graph
 /// digests were re-baselined for those two changes without it.
-pub const FA_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
-        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
-        .with_metal_from(svod_dtype::MetalFamily::Apple(7));
+pub const FA_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(crate::target::CDNA_RDNA_WMMA)
+    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
+    .with_metal_from(svod_dtype::MetalFamily::Apple(7));
 
 /// Whether `device` can run the production graph flash-attention kernel.
 /// Uses the same architecture and toolchain gate as [`crate::launch_custom`].

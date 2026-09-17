@@ -148,12 +148,6 @@ impl ArchCaps {
         Family::of(self.arch)
     }
 
-    /// Whether the arch is AMD CDNA (MFMA, wave64) — the only arch whose
-    /// accumulator and input fragments share one layout.
-    fn is_cdna(&self) -> bool {
-        self.amd().is_some_and(AmdArch::is_cdna)
-    }
-
     /// Whether tk defines matrix-core fragment layouts for this arch (so
     /// [`Self::frag`] and the shared-tile strips resolve): AMD, and CUDA from
     /// Ampere (the f16/bf16 `m16n8k16` floor).
@@ -244,15 +238,16 @@ impl ArchCaps {
     /// a register copy. True on CDNA (MFMA acc == input fragment) and CUDA with the
     /// `mma.sync` layouts (the two-half 16×16 f32 accumulator holds the m16n8 C
     /// fragments in exactly the A fragment's register order — ThunderKittens
-    /// `mma_AB(o, att_bf, v)`); false on RDNA, where the acc→input handoff must
-    /// round-trip through LDS instead, and wherever [`Self::frag`] is `None`. On
-    /// gfx11 that is forced (the even/odd `<8×f32>` accumulator and the replicated
-    /// `<16×in>` input differ); gfx12 shares [`RT_16X16_GFX12`] across both roles
-    /// and keeps the LDS round-trip only until the reuse path is validated on it.
-    /// True on Metal: one `simdgroup_matrix` lane map serves both roles.
+    /// `mma_AB(o, att_bf, v)`); true on gfx12, whose strided 8/lane
+    /// [`RT_16X16_GFX12`] serves every role (hardware-verified on gfx1201, where it
+    /// drops FA's per-warp LDS relayout band). False on gfx11, where the even/odd
+    /// `<8×f32>` accumulator and the replicated `<16×in>` input differ, so the
+    /// acc→input handoff must round-trip through LDS; false wherever
+    /// [`Self::frag`] is `None`. True on Metal: one `simdgroup_matrix` lane map
+    /// serves both roles.
     pub fn acc_reusable_as_input(&self) -> bool {
         match self.arch {
-            GpuArch::Amd(_) => self.is_cdna(),
+            GpuArch::Amd(amd) => amd.is_cdna() || amd.is_rdna4(),
             GpuArch::Cuda(cuda) => cuda.has_bf16_mma(),
             // The `simdgroup_matrix` B operand and the f32 accumulator carry the same
             // `thread_elements()` map (hardware-verified), and it is the B position an
