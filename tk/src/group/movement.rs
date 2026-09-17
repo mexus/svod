@@ -624,7 +624,9 @@ impl<'k> Group<'k> {
     /// The `ldmatrix.x4` plan for the LOCAL→REG hop, when it applies: a CUDA
     /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a lane
     /// map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4) covers,
-    /// and a swizzle that keeps 16-byte row chunks contiguous.
+    /// and a swizzle that keeps 16-byte row chunks contiguous. The CUDA guard is
+    /// load-bearing: gfx12's fragment passes the shape test too, and only its
+    /// strided map having no `ldmatrix` form would otherwise keep it out.
     fn ldmatrix_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<LdmatrixX4> {
         let base = &rt.base.base;
         (self.ker.caps.cuda().is_some()

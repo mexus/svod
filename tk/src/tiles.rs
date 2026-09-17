@@ -7,10 +7,11 @@
 //!
 //! `elements_per_thread` is carried **explicitly** per shape rather than derived
 //! `num_elements / WARP_THREADS`, because it is a function of the matrix-core
-//! fragment layout, which differs by arch: CDNA wave64 16×16 = 4/lane; RDNA
+//! fragment layout, which differs by arch: CDNA wave64 16×16 = 4/lane; gfx11
 //! wave32 = 8/lane for the accumulator and **16/lane for the (replicated) WMMA
-//! inputs** (256/32 × the 0-15≡16-31 wave-half replication). The `_W32_*`
-//! constants below are the RDNA (gfx11) shapes; the unsuffixed ones are gfx942.
+//! inputs** (256/32 × the 0-15≡16-31 wave-half replication); gfx12 wave32 drops
+//! that replication — 8/lane for every role. The `_W32_*` constants below are the
+//! gfx11 shapes, [`RT_16X16_GFX12`] the gfx12 one; the unsuffixed ones are gfx942.
 
 pub use crate::layout::LaneMap;
 use crate::swizzle::Swizzle;
@@ -34,7 +35,7 @@ pub struct BaseShape {
     pub rows: usize,
     pub cols: usize,
     /// Elements each lane holds for one base fragment — arch/layout-specific (see
-    /// the module docs), NOT always `num_elements / wave_size` (RDNA inputs are
+    /// the module docs), NOT always `num_elements / wave_size` (gfx11 inputs are
     /// replicated, so `ept > num_elements / wave_size`).
     pub ept: usize,
 }
@@ -94,7 +95,7 @@ pub const RT_16X32: RTBaseShape =
 pub const RT_32X16: RTBaseShape =
     RTBaseShape { base: BaseShape { rows: 32, cols: 16, ept: 8 }, map: LaneMap::Strided { stride: 8 } };
 
-// ── RDNA (gfx11, wave32) base shapes — for the gfx1151 WMMA matmul ────────────
+// ── RDNA3 (gfx11, wave32) base shapes — for the gfx1151 WMMA matmul ───────────
 //
 // Accumulator: ept = 256/32 = 8, [`LaneMap::Interleaved`] (the RDNA3 WMMA f32
 // even/odd row map; NOT the gfx12/CK contiguous layout). Inputs: ept = 16
@@ -113,10 +114,18 @@ pub const RT_16X16_W32_IN: RTBaseShape =
 /// wave32 WMMA f32 accumulator, **transposed** for an N-major memory store
 /// ([`LaneMap::InterleavedT`]). Used for the FA output
 /// tile (`o_reg_t`, `O[q,d]`) — the transpose of the `[d,q]` PV accumulator
-/// ([`RT_16X16_W32_ACC`]). gfx942 reaches the same transposed store through the
-/// plain stride map, so this is RDNA-only.
+/// ([`RT_16X16_W32_ACC`]). gfx942 and gfx12 reach the same transposed store through
+/// the plain stride map, so this is gfx11-only.
 pub const RT_16X16_W32_ACC_T: RTBaseShape =
     RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, map: LaneMap::InterleavedT };
+
+/// gfx12 (RDNA4, wave32) WMMA fragment — every `FragRole` on the arch. gfx12
+/// drops RDNA3's wave-half replication: 8 elements/lane for the inputs AND the
+/// f32 accumulator, under CDNA's strided map at stride 8. An operand reads
+/// `row = L%16, col = 8·(L/16)+j`; a `Col` accumulator and the N-major
+/// `AccumulatorT` store read its transpose. Hardware-verified on gfx1201.
+pub const RT_16X16_GFX12: RTBaseShape =
+    RTBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, map: LaneMap::Strided { stride: 8 } };
 
 // ── CUDA sm_80+ (warp32, `mma.sync.m16n8k16`) base shapes ─────────────────────
 //

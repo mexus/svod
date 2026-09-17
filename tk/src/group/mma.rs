@@ -84,9 +84,9 @@ fn wmma_desc(arch: GpuArch, dtype_in: &DType, dtype_out: &DType) -> WmmaMetadata
 
 /// Per-lane element count for a WMMA operand = product of its upcast-axis sizes
 /// (`wmma_from_tc` builds these as `log2(elements_per_thread)` size-2 entries, so
-/// the product is the elements-per-thread). gfx942 16×16×16 → A/B/C = 4/4/4; RDNA
-/// → 16/16/8 (replicated 16-wide inputs, 8-wide accumulator); CUDA m16n8k16 →
-/// 8/4/4. Empty axes ⇒ 1.
+/// the product is the elements-per-thread). gfx942 16×16×16 → A/B/C = 4/4/4; gfx11
+/// → 16/16/8 (replicated 16-wide inputs, 8-wide accumulator); gfx12 → 8/8/8; CUDA
+/// m16n8k16 → 8/4/4. Empty axes ⇒ 1.
 fn upcast_count(axes: &[(AxisId, usize)]) -> i64 {
     axes.iter().map(|(_, sz)| *sz as i64).product()
 }
@@ -170,6 +170,20 @@ impl MmaPlan {
             // The A fragment's column axis is the core's K, whatever the arch.
             assert_eq!(a.base.base.cols, meta.dims.2, "mma: the A fragment's columns must equal the core's K");
             let axes = meta.upcast_axes.as_ref().expect("unexpanded WMMA metadata");
+            // On AMD the register count of a step comes from the descriptor alone,
+            // so a tile carrying another AMD arch's fragment (gfx11's replicated
+            // 16/lane input vs gfx12's 8/lane) would be read at the wrong width in
+            // silence — pin tile and descriptor together. CUDA is excluded on
+            // purpose: its tile ept 8 differs from the per-half `(8, 4, 4)`.
+            if arch.amd().is_some() {
+                for (name, t, want) in [("A", a, &axes.a), ("B", b, &axes.b), ("C", c, &axes.c)] {
+                    assert_eq!(
+                        t.base.base.elements_per_thread() as i64,
+                        upcast_count(want),
+                        "mma: operand {name}'s elements/lane must match the {arch:?} matrix-core descriptor"
+                    );
+                }
+            }
             let regs = |axes| (0..upcast_count(axes)).collect();
             // A `Col` accumulator holds `Cᵀ`, so the product must be built as
             // `Cᵀ = Bᵀ·Aᵀ` from the (already transposed) operand readings — the

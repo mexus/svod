@@ -3,8 +3,9 @@
 //! hand-set per call. gfx942 must reproduce the prior wave64 literals
 //! bit-for-bit (the builders now thread these instead of the old constants);
 //! gfx1151 (RDNA3.5, wave32) gets the correct control-path caps and is built for
-//! by both matmul and FA (in `MATMUL_/FA_SUPPORTED_ARCHS`); its RDNA WMMA fragment
-//! layout is carried by the `RT_16X16_W32_*` tile shapes selected in the kernels.
+//! by both matmul and FA (in `MATMUL_/FA_SUPPORTED_ARCHS`); its gfx11 WMMA fragment
+//! layout is carried by the `RT_16X16_W32_*` tile shapes selected in the kernels,
+//! while gfx12 (RDNA4) takes the single strided `RT_16X16_GFX12` for every role.
 //! CUDA sm_80+ resolves every role to the two-half `mma.sync` fragment
 //! (`RT_16X16_MMA`); pre-Ampere CUDA has no fragment table.
 
@@ -17,8 +18,8 @@ use crate::arch::FragRole;
 use crate::arch::FragRole::{Accumulator, AccumulatorT, Operand, OperandB};
 use crate::layout::ReduceTree;
 use crate::tiles::{
-    RT_16X16, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16, ST_16X16_MMA,
-    ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
+    RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T, RT_16X16_W32_IN, ST_16X16,
+    ST_16X16_MMA, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
 };
 
 const SM_86: GpuArch = GpuArch::Cuda(CudaArch::from_compute_capability(8, 6));
@@ -127,9 +128,11 @@ fn caps_without_fragment_layouts(arch: GpuArch) {
 /// detected arch* (`group::wmma_desc` looks up `Renderer::for_amd_arch(caps.arch)`),
 /// so it tracks the GPU in use — not a hand-built descriptor. Confirm the
 /// 16×16×16 f16 core resolves with the arch's wave thread count on both the
-/// validated CDNA3 path (64) and the deferred RDNA3.5 path (32), and that CUDA
-/// exposes the rectangular `m16n8k16` `(8,16,16)` core with `(8,4,4)` elements per
-/// lane (the shape `group::mma` plans two halves over) instead of a square one.
+/// validated CDNA3 path (64) and the deferred RDNA3.5 path (32), that gfx1201
+/// (RDNA4) carries the un-replicated `(8,8,8)` widths tk's [`RT_16X16_GFX12`] is
+/// sized to, and that CUDA exposes the rectangular `m16n8k16` `(8,16,16)` core with
+/// `(8,4,4)` elements per lane (the shape `group::mma` plans two halves over)
+/// instead of a square one.
 #[test]
 fn wmma_descriptor_resolves_per_detected_arch() {
     let core = |ren: Renderer, dims| {
@@ -140,6 +143,7 @@ fn wmma_descriptor_resolves_per_detected_arch() {
     };
     assert_eq!(core(Renderer::for_amd_arch(AmdArch::Gfx942), (16, 16, 16)), Some((64, (4, 4, 4))), "gfx942 MFMA");
     assert_eq!(core(Renderer::for_amd_arch(AmdArch::Gfx1151), (16, 16, 16)), Some((32, (16, 16, 8))), "gfx1151 WMMA");
+    assert_eq!(core(Renderer::for_amd_arch(AmdArch::Gfx1201), (16, 16, 16)), Some((32, (8, 8, 8))), "gfx1201 WMMA");
     let sm86 = CudaArch::from_compute_capability(8, 6);
     assert_eq!(core(Renderer::for_cuda_arch(sm86), (16, 16, 16)), None, "sm_86 has no square core");
     assert_eq!(core(Renderer::for_cuda_arch(sm86), (8, 16, 16)), Some((32, (8, 4, 4))), "sm_86 m16n8k16");
@@ -172,6 +176,25 @@ fn frag_roles_resolve_to_canonical_constants() {
     assert_eq!(r.shared_default(), Some(ST_16X16_SWIZZLED_W32));
     assert_eq!(r.shared_swizzled(), Some(ST_16X16_SWIZZLED_W32));
     assert!(!r.acc_reusable_as_input(), "RDNA acc/input fragments differ ⇒ LDS relayout");
+}
+
+/// gfx1201 (RDNA4, wave32) resolves every role to the single strided 8/lane
+/// [`RT_16X16_GFX12`] — gfx12 drops RDNA3's wave-half replication and its even/odd
+/// accumulator, so operand, B operand, accumulator and the N-major `AccumulatorT`
+/// store are one fragment, as on CDNA. Hardware-verified on gfx1201; a regression
+/// back onto the `RT_16X16_W32_*` shapes is what made the matmul compute garbage.
+/// The LDS strip is unchanged (the wave32 swizzled ept-8 strip serves both gfx11
+/// and gfx12).
+#[test]
+fn gfx1201_caps_resolve_gfx12_fragments() {
+    let c = ArchCaps::for_amd(AmdArch::Gfx1201);
+    assert_eq!(c.wave_size, 32);
+    assert!(c.has_matrix_core_layouts());
+    for role in [Accumulator, Operand, OperandB, AccumulatorT] {
+        assert_eq!(c.frag(role), Some(RT_16X16_GFX12), "{role:?}");
+    }
+    assert_eq!(c.shared_default(), Some(ST_16X16_SWIZZLED_W32));
+    assert_eq!(c.shared_swizzled(), Some(ST_16X16_SWIZZLED_W32));
 }
 
 /// [`ArchSet`](crate::ArchSet) membership: the AMD list is exact, the CUDA floor is

@@ -1113,8 +1113,8 @@ pub struct MatmulCfg {
     /// K-reduction step (LDS strip depth) for the single-buffered K-loop. Must be a
     /// multiple of 16 (the WMMA K-edge) and divide N. Lowering it cuts the live
     /// operand VGPR/lane (each WMMA input replicates all `k_step`/16 K-sub-steps),
-    /// raising occupancy — the dominant occupancy lever on RDNA3.5/wave32
-    /// ([`GFX1151_CFG`] uses 32). gfx942 keeps [`K_STEP`]
+    /// raising occupancy — the dominant occupancy lever on gfx11/wave32, whose
+    /// input fragment is 16/lane ([`GFX1151_CFG`] uses 32). gfx942 keeps [`K_STEP`]
     /// (64). `0` means "use [`K_STEP`]" so older literal/`..M1_CFG` builders that
     /// predate the field still get the default — see [`MatmulCfg::k_step`].
     pub k_step: usize,
@@ -1193,7 +1193,7 @@ pub const SMALL_CFG: MatmulCfg =
 /// **`k_step = 32`**. The `reg=32` tile keeps accumulator VGPR ≈ 32/lane; the
 /// `k_step=32` halves the live WMMA-input fragment VGPR vs the default 64 (the input
 /// replicates all `k_step`/16 K-sub-steps per lane), raising occupancy. `k_step` is
-/// the dominant occupancy lever on RDNA3.5/wave32; the single-buffered path has no
+/// the dominant occupancy lever on gfx11/wave32; the single-buffered path has no
 /// memory stall a double buffer could hide. gfx942 keeps `k_step = K_STEP` (64). A
 /// smaller `k_step` lowers the WMMA-input VGPR but adds barriers, so the tuned value
 /// trades occupancy against barrier overhead.
@@ -1250,7 +1250,7 @@ pub fn cfg_for_arch(arch: svod_dtype::GpuArch, n: usize) -> MatmulCfg {
 }
 
 /// The GPU arch(es) the tile matmul is built for: gfx942 (CDNA MFMA, wave64),
-/// gfx1151 (RDNA3.5 WMMA, wave32 — the `_W32_*` fragment shapes) and CUDA sm_80+
+/// gfx1151 (gfx11 WMMA, wave32 — the `_W32_*` fragment shapes) and CUDA sm_80+
 /// (`mma.sync.m16n8k16`, warp32 — the two-half `RT_16X16_MMA` fragment). The
 /// launcher gates against this; see [`crate::target::check_target`]. Validated on
 /// gfx942 (CDNA3), gfx1151 (RDNA3.5) and sm_86 (Ampere) — gfx942 before the

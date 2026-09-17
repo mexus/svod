@@ -29,10 +29,15 @@
 //!
 //! # Supported targets
 //! - **gfx942** (CDNA3) — wave64, MFMA.
-//! - **gfx1151** (RDNA3.5) — wave32, WMMA.
+//! - **gfx1151** (RDNA3.5) — wave32, gfx11 WMMA (replicated inputs, even/odd
+//!   accumulator — the `_W32_*` shapes).
 //! - **CUDA sm_80+** — warp32, `mma.sync.m16n8k16` (a 16×16 tile as two m16n8
 //!   halves, [`layout::LaneMap::MmaSync`]); [`matmul`], [`flash_attention`] and the
 //!   shuffle-only [`single_query_attention`].
+//!
+//! gfx12 (RDNA4) fragments are defined — one strided 8/lane
+//! [`tiles::RT_16X16_GFX12`] for every role — but no kernel's [`ArchSet`] admits
+//! the arch yet.
 //!
 //! Each kernel declares the arches it is built for as an [`ArchSet`]. Inputs are
 //! bf16/f16, accumulation is f32, the WMMA/MFMA K-edge is 16; the per-arch

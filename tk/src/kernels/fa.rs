@@ -136,11 +136,12 @@ struct FaScratch<'k> {
     att: RT<'k>,
     att_mma: RT<'k>,
     max_vec_last: RV<'k>,
-    /// RDNA-only per-warp LDS scratch (`[NUM_WARPS·kv_blk, q_blk]`) for the
-    /// `att → att_mma` accumulator→input relayout. `None` on gfx942, where the
-    /// accumulator and WMMA-input fragment layouts coincide so a register `copy`
-    /// suffices; `Some` on gfx11, where they differ and the relayout must round-trip
-    /// through LDS (store the even/odd accumulator, reload as the replicated input).
+    /// Per-warp LDS scratch (`[NUM_WARPS·kv_blk, q_blk]`) for the
+    /// `att → att_mma` accumulator→input relayout. `None` wherever
+    /// [`ArchCaps::acc_reusable_as_input`](crate::ArchCaps::acc_reusable_as_input)
+    /// holds (gfx942, CUDA, Metal) so a register `copy` suffices; `Some` on RDNA,
+    /// where the relayout must round-trip through LDS — on gfx11 because the even/odd
+    /// accumulator and the replicated input genuinely differ.
     att_smem: Option<ST>,
 }
 
@@ -282,9 +283,9 @@ fn fa_softmax_pv<'k>(
     // fragments share a layout, so a register `copy` (with the f32→in-dtype cast)
     // suffices. On gfx11 they differ (even/odd `<8×f32>` acc vs replicated `<16×in>`
     // input), so a register copy is wrong — round-trip through this warp's LDS band:
-    // store the even/odd accumulator (matrix `(kv,q)` order), barrier, reload with
-    // the replicated-input map (`K=kv=element`, `N=q=lane%16`). Both lane maps are
-    // the matmul-validated ones, so the relayout is correct by construction.
+    // store the accumulator (matrix `(kv,q)` order), barrier, reload under the input
+    // map (on gfx11 `K=kv=element`, `N=q=lane%16`). Both lane maps are the
+    // matmul-validated ones, so the relayout is correct by construction.
     let att_mma = match att_smem {
         None => warp.copy(att_mma.after((lp.index(), &norm_vec)), &att),
         Some(att_smem) => {

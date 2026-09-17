@@ -33,9 +33,10 @@ pub(crate) fn fragment_device() -> Option<crate::ArchCaps> {
     crate::target::resolve_arch(&dev).map(crate::ArchCaps::for_arch).filter(crate::ArchCaps::has_matrix_core_layouts)
 }
 
-/// Whether the env-selected device is an AMD GPU with fragment layouts.
-pub(crate) fn is_amd_device() -> bool {
-    fragment_device().and_then(|caps| caps.amd()).is_some()
+/// The env-selected device's caps when its wave is 32 lanes — the gate for the
+/// wave32 fragment-map hardware tests (gfx11, gfx12, CUDA, Metal alike).
+pub(crate) fn wave32_fragment_device() -> Option<crate::ArchCaps> {
+    fragment_device().filter(|caps| caps.wave_size == 32)
 }
 
 /// Whether the env-selected device is AMD CDNA (gfx942, wave64).
