@@ -4,6 +4,7 @@ use svod_tensor::nn::Module;
 use super::attention::PSABlock;
 use super::bottleneck::YoloBottleneck;
 use super::conv::YoloConv;
+use crate::state::{scoped, scoped_index};
 use crate::yolo::error::Result;
 
 /// `cv1 → chunk(2) → chain → cat → cv2`, the forward shared by C2f and C3k2.
@@ -16,11 +17,13 @@ fn forward_chain<B>(
     step: impl Fn(&B, &Tensor) -> Result<Tensor>,
     x: &Tensor,
 ) -> Result<Tensor> {
-    let mut parts = cv1.forward(x)?.chunk(2, 1)?;
-    for blk in chain {
-        parts.push(step(blk, parts.last().expect("cv1 output is chunked in two"))?);
+    let mut parts = scoped("cv1", || cv1.forward(x))?.chunk(2, 1)?;
+    for (i, blk) in chain.iter().enumerate() {
+        let next = scoped_index("m", i, || step(blk, parts.last().expect("cv1 output is chunked in two")))?;
+        parts.push(next);
     }
-    cv2.forward(&Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?)
+    let cat = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?;
+    scoped("cv2", || cv2.forward(&cat))
 }
 
 // ---------------------------------------------------------------------------
@@ -83,9 +86,12 @@ impl C3k {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let left = self.m.iter().try_fold(self.cv1.forward(x)?, |acc, blk| blk.forward(&acc))?;
-        let right = self.cv2.forward(x)?;
-        self.cv3.forward(&Tensor::cat(&[&left, &right], 1)?)
+        let left = scoped("cv1", || self.cv1.forward(x))?;
+        let left =
+            self.m.iter().enumerate().try_fold(left, |acc, (i, blk)| scoped_index("m", i, || blk.forward(&acc)))?;
+        let right = scoped("cv2", || self.cv2.forward(x))?;
+        let cat = Tensor::cat(&[&left, &right], 1)?;
+        scoped("cv3", || self.cv3.forward(&cat))
     }
 }
 
@@ -108,7 +114,10 @@ impl C3k2Inner {
         match self {
             C3k2Inner::Bottleneck(b) => b.forward(x),
             C3k2Inner::C3k(c) => c.forward(x),
-            C3k2Inner::Attn(b, psa) => psa.forward(&b.forward(x)?),
+            C3k2Inner::Attn(b, psa) => {
+                let h = scoped("0", || b.forward(x))?;
+                scoped("1", || psa.forward(&h))
+            }
         }
     }
 }

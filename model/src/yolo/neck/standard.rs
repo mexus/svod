@@ -6,6 +6,7 @@
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Module, ResizeMode};
 
+use crate::state::scoped;
 use crate::yolo::backbone::scaled_channels;
 use crate::yolo::blocks::conv::YoloConv;
 use crate::yolo::blocks::csp::C3k2;
@@ -55,20 +56,20 @@ impl YoloNeck {
         // FPN top-down
         let up = l10.upsample(&[2, 2], ResizeMode::Nearest)?;
         let cat = Tensor::cat(&[&up, l6], 1)?;
-        let l13 = self.c3k2_13.forward(&cat)?;
+        let l13 = scoped("13", || self.c3k2_13.forward(&cat))?;
 
         let up = l13.upsample(&[2, 2], ResizeMode::Nearest)?;
         let cat = Tensor::cat(&[&up, l4], 1)?;
-        let l16 = self.c3k2_16.forward(&cat)?;
+        let l16 = scoped("16", || self.c3k2_16.forward(&cat))?;
 
         // PAN bottom-up
-        let l17 = self.conv17.forward(&l16)?;
+        let l17 = scoped("17", || self.conv17.forward(&l16))?;
         let cat = Tensor::cat(&[&l17, &l13], 1)?;
-        let l19 = self.c3k2_19.forward(&cat)?;
+        let l19 = scoped("19", || self.c3k2_19.forward(&cat))?;
 
-        let l20 = self.conv20.forward(&l19)?;
+        let l20 = scoped("20", || self.conv20.forward(&l19))?;
         let cat = Tensor::cat(&[&l20, l10], 1)?;
-        let l22 = self.c3k2_22.forward(&cat)?;
+        let l22 = scoped("22", || self.c3k2_22.forward(&cat))?;
 
         Ok((l16, l19, l22))
     }

@@ -7,6 +7,7 @@ use svod_tensor::nn::{Conv2d, Layer, Module};
 
 use super::blocks::conv::{YoloConv, conv2d_bias};
 use super::error::Result;
+use crate::state::scoped;
 
 /// The dtype every head decodes in, whatever the backbone computed in.
 pub(crate) const HEAD_DTYPE: svod_dtype::DType = svod_dtype::DType::Float32;
@@ -97,9 +98,9 @@ impl BoxBranch {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.conv0.forward(x)?;
-        let x = self.conv1.forward(&x)?;
-        Ok(self.conv2.forward(&x)?)
+        let x = scoped("0", || self.conv0.forward(x))?;
+        let x = scoped("1", || self.conv1.forward(&x))?;
+        Ok(scoped("2", || self.conv2.forward(&x))?)
     }
 }
 
@@ -132,11 +133,11 @@ impl ClsBranch {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.dw0.forward(x)?;
-        let x = self.conv0.forward(&x)?;
-        let x = self.dw1.forward(&x)?;
-        let x = self.conv1.forward(&x)?;
-        Ok(self.conv2.forward(&x)?)
+        let x = scoped("0.0", || self.dw0.forward(x))?;
+        let x = scoped("0.1", || self.conv0.forward(&x))?;
+        let x = scoped("1.0", || self.dw1.forward(&x))?;
+        let x = scoped("1.1", || self.conv1.forward(&x))?;
+        Ok(scoped("2", || self.conv2.forward(&x))?)
     }
 }
 

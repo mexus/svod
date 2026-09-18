@@ -8,7 +8,7 @@ use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
-use crate::state::StateDict;
+use crate::state::{StateDict, scoped_index};
 
 use super::backbone::{YoloBackbone, scaled_channels};
 use super::config::{P2_STRIDES, P6_STRIDES, YoloConfig};
@@ -71,11 +71,11 @@ impl Detect {
             let hw = h * w;
             feat_sizes.push((h, w));
 
-            let box_out = self.cv2[i].forward(feat)?;
+            let box_out = scoped_index("one2one_cv2", i, || self.cv2[i].forward(feat))?;
             let box_out = box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?;
             boxes_list.push(box_out);
 
-            let cls_out = self.cv3[i].forward(feat)?;
+            let cls_out = scoped_index("one2one_cv3", i, || self.cv3[i].forward(feat))?;
             let cls_out = cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?;
             scores_list.push(cls_out);
         }
