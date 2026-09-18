@@ -842,7 +842,8 @@ fn axis_id_of(scheduler: &Scheduler, axis: usize) -> Option<AxisId> {
 /// workgroup (LOCAL, padded to the tile when that stays cheap) and `rows` per
 /// thread (UPCAST), and the reduce left to each lane is unrolled to the vector
 /// access width. GROUP precedes UNROLL: an unrolled reduce range no longer
-/// belongs to its REDUCE.
+/// belongs to its REDUCE. GROUP is best effort, the rest of the tile is not:
+/// a declined split still beats the generic tail.
 pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use tracing::debug;
 
@@ -943,8 +944,11 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
                 let axis = axis_of(&trial, id).ok_or(OptError::MissingAxisParameter)?;
                 apply_opt(&mut trial, &Opt::upcast(axis, *extent), true)?;
             }
+            // Best effort: a GROUP the renderer declines (a nested reduce, a
+            // grouped size past its shared memory) leaves the row tile worth
+            // keeping, as a serial per-lane reduce.
             if tile.lanes > 1 {
-                apply_opt(&mut trial, &Opt::group(reduce_logical, tile.lanes), true)?;
+                let _ = apply_opt(&mut trial, &Opt::group(reduce_logical, tile.lanes), true);
             }
             if tile.block > 1 {
                 let axis = axis_of(&trial, &row_id).ok_or(OptError::MissingAxisParameter)?;
@@ -956,7 +960,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
             }
             Ok(())
         })();
-        if applied.is_err() {
+        if applied.is_err() || trial.applied_opts.is_empty() {
             continue;
         }
 

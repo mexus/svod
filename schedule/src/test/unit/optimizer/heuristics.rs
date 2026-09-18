@@ -775,3 +775,32 @@ fn matvec_config_overrides_the_device_tile() {
         &[Opt::upcast(0, 5), Opt::group(0, 16), Opt::local(0, 8), Opt::upcast(0, 2), Opt::unroll(1, 8)]
     );
 }
+
+/// A GROUP the renderer declines — here a shared-memory budget the lane split
+/// does not fit — must not cost the row tile: the rest of the fast path still
+/// applies and a decode step's GEMV keeps its LOCAL/UPCAST instead of falling
+/// through to the generic tail.
+#[test_case(Renderer::cuda(), 16, plain_row_reduce, &[Opt::local(0, 4), Opt::upcast(0, 4)]; "cuda keeps the block and the rows")]
+#[test_case(Renderer::amd_rdna3(), 512, skinny_batch, &[Opt::upcast(0, 5), Opt::local(0, 4), Opt::unroll(0, 8)]; "rdna keeps the batch upcast and the block")]
+fn matvec_fast_path_survives_a_declined_group(
+    mut renderer: Renderer,
+    shared_max: usize,
+    sink: fn() -> Arc<UOp>,
+    expected: &[Opt],
+) {
+    renderer.shared_max = shared_max;
+    let (applied, scheduler) = run(sink(), renderer, &HeuristicsConfig::default(), apply_matvec_fast_path);
+    assert!(applied, "a declined GROUP must not abort the fast path");
+    assert_eq!(scheduler.applied_opts, expected);
+    assert!(scheduler.axes_of(&[AxisType::GroupReduce]).is_empty(), "GROUP was declined");
+}
+
+/// `y[r] = sum_c x[r, c]`: the fast path's plainest shape.
+fn plain_row_reduce() -> Arc<UOp> {
+    row_reduce(AxisType::Global, 64, 128, DType::Float32, None)
+}
+
+/// A decoder step's projection: five rows through one weight.
+fn skinny_batch() -> Arc<UOp> {
+    matmul_accum(5, 1280, 1280, DType::Float16, DType::Float32)
+}
