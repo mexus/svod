@@ -96,6 +96,18 @@ pub(crate) fn matmul_with(m: i64, n: i64, k: i64, stored: DType, map: impl Fn(Ar
     kernel.sink(product.reduce(vec![kernel.range(2)].into(), ReduceOp::Add), &[0, 1])
 }
 
+/// A convolution's shape: `C[m1, m2, n] = sum_k A[m1, m2, k] * B[k, n]`, two M
+/// axes sharing every weight, over f16 operands and an f32 accumulator.
+pub(crate) fn two_m_matmul(m1: i64, m2: i64, n: i64, k: i64) -> Arc<UOp> {
+    let kernel =
+        Ranged::new(&[(m1, AxisType::Global), (m2, AxisType::Global), (n, AxisType::Global), (k, AxisType::Reduce)]);
+    let row = plus(times(&kernel.range(0), m2), kernel.range(1));
+    let a = kernel.index(&DType::Float16, m1 * m2 * k, plus(times(&row, k), kernel.range(3)));
+    let b = kernel.index(&DType::Float16, k * n, plus(times(&kernel.range(3), n), kernel.range(2)));
+    let product = a.try_mul(&b).expect("mul").cast(DType::Float32);
+    kernel.sink(product.reduce(vec![kernel.range(3)].into(), ReduceOp::Add), &[0, 1, 2])
+}
+
 /// Two N axes, so a divisibility retry has somewhere to land: `n_bad` is axis 3.
 pub(crate) fn two_n_matmul(n_bad: i64, n_good: i64) -> Arc<UOp> {
     let kernel = Ranged::new(&[
