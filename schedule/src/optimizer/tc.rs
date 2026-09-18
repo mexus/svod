@@ -171,19 +171,19 @@ pub fn select_tensor_core(
     let Some(mut in1_scalar) = in1_dt.scalar() else { return Ok(None) };
     let Some(out_scalar) = out_dt.scalar() else { return Ok(None) };
 
-    // Dtype emulation runs after TC application. Match an unsupported FP8
-    // input against the f16 WMMA it will become, rather than either missing the
-    // TC opportunity or claiming a native FP8 matrix instruction.
-    if in0_scalar.is_fp8()
-        && !renderer.supports_dtype(in0_scalar)
-        && renderer.supports_dtype(svod_dtype::ScalarDType::Float16)
-    {
+    // An FP8 input the renderer has no matrix core for reaches the WMMA as
+    // f16, whether dtype emulation widens it after TC application or the
+    // renderer converts it natively (RDNA4). Match it against the f16 core
+    // rather than missing the TC opportunity or claiming a native FP8 one.
+    let f16_core_for_fp8 = |scalar: svod_dtype::ScalarDType| {
+        scalar.is_fp8()
+            && !renderer.supports_matrix_dtype(scalar)
+            && renderer.supports_dtype(svod_dtype::ScalarDType::Float16)
+    };
+    if f16_core_for_fp8(in0_scalar) {
         in0_scalar = svod_dtype::ScalarDType::Float16;
     }
-    if in1_scalar.is_fp8()
-        && !renderer.supports_dtype(in1_scalar)
-        && renderer.supports_dtype(svod_dtype::ScalarDType::Float16)
-    {
+    if f16_core_for_fp8(in1_scalar) {
         in1_scalar = svod_dtype::ScalarDType::Float16;
     }
 
@@ -491,8 +491,16 @@ fn apply_axis_choice_impl(
         let subst_b: HashMap<UOpKey, Arc<UOp>> =
             placeholders.iter().enumerate().map(|(i, ph)| (UOpKey(ph.clone()), ne[inv_b[i]].clone())).collect();
 
-        let src_a = ret_a.substitute(&subst_a);
-        let src_b = ret_b.substitute(&subst_b);
+        // An fp8 operand on a part with no fp8 matrix core was matched to the
+        // f16 core above; widen it here so the WMMA sees its own input dtype.
+        // The renderer converts natively where it can and dtype emulation
+        // decomposes the cast elsewhere.
+        let widen = |src: Arc<UOp>| match (src.dtype().scalar(), tc.dtype_in.scalar()) {
+            (Some(from), Some(to)) if from.is_fp8() && from != to => src.cast(svod_dtype::DType::Scalar(to)),
+            _ => src,
+        };
+        let src_a = widen(ret_a.substitute(&subst_a));
+        let src_b = widen(ret_b.substitute(&subst_b));
 
         // Step 4: Build tc_upcast_axes from ne ranges
         //

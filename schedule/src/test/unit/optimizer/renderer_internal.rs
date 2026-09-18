@@ -113,22 +113,22 @@ fn fingerprint_tracks_the_exact_target_and_every_capability() {
     assert_ne!(with_ops.cache_fingerprint(), gfx1151.with_rewrite_capabilities(fewer, None, None).cache_fingerprint());
 }
 
-/// CDNA renders OCP FP8 natively but not the FNUZ encodings; RDNA renders none
-/// of them. `supports_matrix_dtype` is checked separately because CDNA keeps an
-/// FP8 matrix operand its ALU must widen.
-#[test_case(AmdArch::Gfx942, ScalarDType::FP8E4M3, true; "cdna3 keeps OCP fp8")]
-#[test_case(AmdArch::Gfx942, ScalarDType::FP8E4M3FNUZ, false; "cdna3 decomposes FNUZ fp8")]
-#[test_case(AmdArch::Gfx1151, ScalarDType::FP8E4M3, false; "rdna3 decomposes OCP fp8")]
-#[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2FNUZ, false; "rdna4 decomposes FNUZ fp8")]
-fn amd_fp8_dtype_capabilities_are_arch_specific(arch: AmdArch, dtype: ScalarDType, supported: bool) {
+/// CDNA and RDNA4 store and convert OCP FP8 natively but not the FNUZ
+/// encodings; RDNA3 renders none of them. Only CDNA has an FP8 matrix core,
+/// and every AMD part widens FP8 before its ALU.
+#[test_case(AmdArch::Gfx942, ScalarDType::FP8E4M3, true, true; "cdna3 keeps OCP fp8")]
+#[test_case(AmdArch::Gfx942, ScalarDType::FP8E4M3FNUZ, false, false; "cdna3 decomposes FNUZ fp8")]
+#[test_case(AmdArch::Gfx1151, ScalarDType::FP8E4M3, false, false; "rdna3 decomposes OCP fp8")]
+#[test_case(AmdArch::Gfx1201, ScalarDType::FP8E4M3, true, false; "rdna4 converts OCP fp8 without a matrix core")]
+#[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2, true, false; "rdna4 converts bf8 without a matrix core")]
+#[test_case(AmdArch::Gfx1201, ScalarDType::FP8E5M2FNUZ, false, false; "rdna4 decomposes FNUZ fp8")]
+fn amd_fp8_dtype_capabilities_are_arch_specific(arch: AmdArch, dtype: ScalarDType, supported: bool, matrix: bool) {
     let renderer = Renderer::for_amd_arch(arch);
     assert_eq!(renderer.supports_storage_dtype(dtype), supported, "{arch} storage");
     assert_eq!(renderer.supports_conversion_dtype(dtype), supported, "{arch} conversion");
     assert_eq!(renderer.supports_dtype(dtype), supported, "{arch} support");
-
-    let fp8_alu_split = matches!(arch, AmdArch::Gfx942 | AmdArch::Gfx950) && dtype.is_fp8();
-    assert_eq!(renderer.supports_matrix_dtype(dtype), supported, "{arch} matrix operand");
-    assert_eq!(renderer.supports_alu_dtype(dtype), supported && !fp8_alu_split, "{arch} ALU stays scalar");
+    assert_eq!(renderer.supports_matrix_dtype(dtype), matrix, "{arch} matrix operand");
+    assert_eq!(renderer.supports_alu_dtype(dtype), supported && !dtype.is_fp8(), "{arch} ALU widens fp8");
 }
 
 /// The AMD tensor-core tables: tinygrad `tc.py:132` for CDNA3 (four cores, no

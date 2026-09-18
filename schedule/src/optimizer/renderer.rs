@@ -495,7 +495,7 @@ impl Renderer {
             extra_matcher: None,
             decomposition_matcher: None,
             renderer_ops: None,
-            supported_dtypes: Self::common_dtypes(),
+            supported_dtypes: Self::fp8_dtypes(),
             decomposition_profile: "none",
             extra_profile: "none",
         }
@@ -758,9 +758,12 @@ impl Renderer {
         self.supports_dtype(dtype)
     }
 
+    /// AMD parts store and convert OCP FP8 natively but have no FP8 ALU, so
+    /// arithmetic on it is widened; RDNA4 joins CDNA here with its
+    /// `v_cvt_*_fp8` instructions (RDNA3 has none and decomposes FP8 fully).
     pub fn supports_alu_dtype(&self, dtype: ScalarDType) -> bool {
         self.supports_dtype(dtype)
-            && !(matches!(self.device, RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4)
+            && !(matches!(self.device, RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4 | RendererDevice::AmdRdna4)
                 && matches!(dtype, ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2))
     }
 
