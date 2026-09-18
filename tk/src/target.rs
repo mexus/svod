@@ -8,8 +8,9 @@
 //! or failing deep in compile.
 //!
 //! The gate is generic over the supported set: a kernel passes its own [`ArchSet`]
-//! (k-means and k-NN declare the AMD pair; flash-attention, matmul and
-//! single-query attention add `sm_80+`).
+//! (k-means and k-NN declare [`CDNA_RDNA_WMMA`]; flash-attention, matmul and
+//! single-query attention add `sm_80+`; norm and the NT GEMM are wave32-only and
+//! declare [`RDNA_WMMA`]).
 //! Adding a GPU is "declare it here (and supply its arch-specific kernel bits)",
 //! not "rewrite this"; the generic launch infra (`compile`/`run_kernel`/
 //! `graph_launch`) stays arch-agnostic — only the per-kernel launcher invokes this.
@@ -35,6 +36,17 @@ pub struct ArchSet {
     pub cuda_min: Option<CudaArch>,
     pub metal_min: Option<MetalFamily>,
 }
+
+/// The wave32 WMMA parts tk carries validated fragment tables for: RDNA3.5
+/// (gfx11 shapes — replicated inputs, even/odd accumulator) and RDNA4 (the
+/// strided 8/lane gfx12 fragment). One family, one config table
+/// ([`crate::arch::Family::Rdna`]), so a kernel names the family's parts rather
+/// than a single measured card.
+pub const RDNA_WMMA: &[AmdArch] = &[AmdArch::Gfx1151, AmdArch::Gfx1200, AmdArch::Gfx1201];
+
+/// [`RDNA_WMMA`] plus the validated CDNA part (gfx942, MFMA wave64) — the AMD
+/// list of a kernel whose body is arch-generic across both families.
+pub const CDNA_RDNA_WMMA: &[AmdArch] = &[AmdArch::Gfx942, AmdArch::Gfx1151, AmdArch::Gfx1200, AmdArch::Gfx1201];
 
 impl ArchSet {
     /// AMD-only support.
@@ -104,7 +116,28 @@ pub fn compute_units(spec: &DeviceSpec) -> Option<usize> {
             (node.simd_per_cu > 0).then(|| (node.simd_count / node.simd_per_cu) as usize)
         }
         DeviceSpec::Cuda { device_id } => {
-            svod_device::registry::resolve_cuda_sm_count(*device_id).ok().map(|sms| sms as usize)
+            svod_device::registry::resolve_cuda_limits(*device_id).ok().map(|limits| limits.sm_count as usize)
+        }
+        DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
+    }
+}
+
+/// How many one-wave workgroups a compute unit of the device behind `spec`
+/// keeps resident, when the backend reports it: the wave slots of a CU's SIMDs
+/// on AMD, the resident-block cap of an SM on CUDA. What a latency-bound
+/// kernel's grid has to reach for the device to be busy.
+pub fn resident_waves_per_cu(spec: &DeviceSpec) -> Option<usize> {
+    match spec {
+        DeviceSpec::Amd { device_id } => {
+            let node = svod_device::amd::topology::enumerate().into_iter().nth(*device_id)?;
+            let waves = (node.simd_per_cu * node.max_waves_per_simd) as usize;
+            (waves > 0).then_some(waves)
+        }
+        DeviceSpec::Cuda { device_id } => {
+            let limits = svod_device::registry::resolve_cuda_limits(*device_id).ok()?;
+            let warps = limits.max_threads_per_sm.checked_div(limits.warp_size)?;
+            let waves = limits.max_blocks_per_sm.min(warps) as usize;
+            (waves > 0).then_some(waves)
         }
         DeviceSpec::Metal { .. } | DeviceSpec::Cpu | DeviceSpec::WebGpu | DeviceSpec::Disk { .. } => None,
     }

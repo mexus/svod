@@ -3,7 +3,7 @@
 //! The heavy tests (marked `#[ignore]`) load real `whisper-tiny` weights. Run
 //! them with `cargo test -- --ignored`.
 
-use svod_arch::pipelines::audio::Transcriber;
+use svod_arch::pipelines::audio::{RunOptions, Transcriber};
 
 use crate::whisper::{
     DecodeOptions, DecodeStrategy, ModelDimensions, N_TEXT_CTX, WhisperAlignedTranscriber, WhisperPlan, WhisperSize,
@@ -62,8 +62,10 @@ fn generalized_scheduler_runs_greedy_with_slot_refill() {
     let windows = fake_windows();
     let refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
 
-    let (refilled, _) = refill.transcribe_windows(&refs, false).expect("refilled greedy transcribe");
-    let (concurrent, profile) = concurrent.transcribe_windows(&refs, true).expect("concurrent greedy transcribe");
+    let (refilled, _) = refill.transcribe_windows(&refs, RunOptions::default()).expect("refilled greedy transcribe");
+    let (concurrent, profile) = concurrent
+        .transcribe_windows(&refs, RunOptions { profile: true, ..Default::default() })
+        .expect("concurrent greedy transcribe");
     assert_eq!(refilled.len(), concurrent.len());
     for (index, (refilled, concurrent)) in refilled.iter().zip(concurrent).enumerate() {
         assert_eq!(refilled.text, concurrent.text, "window {index}: slot geometry changed greedy output");
@@ -135,8 +137,8 @@ fn generalized_scheduler_runs_beam_sizes_two_and_five() {
         .unwrap();
         let windows = fake_windows();
         let refs: Vec<_> = windows.iter().map(Vec::as_slice).collect();
-        let (refilled, _) = refill.transcribe_windows(&refs, false).unwrap();
-        let (concurrent, _) = concurrent.transcribe_windows(&refs, false).unwrap();
+        let (refilled, _) = refill.transcribe_windows(&refs, RunOptions::default()).unwrap();
+        let (concurrent, _) = concurrent.transcribe_windows(&refs, RunOptions::default()).unwrap();
         assert_eq!(refilled, concurrent, "beam-{size} output changed with physical slot geometry");
     }
 }
@@ -181,7 +183,27 @@ fn seeded_sampling_is_independent_of_slot_geometry() {
     .unwrap();
     let windows = fake_windows();
     let refs: Vec<_> = windows.iter().map(Vec::as_slice).collect();
-    let (serial, _) = serial.transcribe_windows(&refs, false).unwrap();
-    let (concurrent, _) = concurrent.transcribe_windows(&refs, false).unwrap();
+    let (serial, _) = serial.transcribe_windows(&refs, RunOptions::default()).unwrap();
+    let (concurrent, _) = concurrent.transcribe_windows(&refs, RunOptions::default()).unwrap();
     assert_eq!(serial, concurrent);
+}
+
+/// The aligner is a per-call choice: only a run asking for words replays the
+/// decoder through the alignment graph.
+#[test]
+#[ignore = "heavy: real whisper-tiny weights + JIT compile"]
+fn alignment_runs_only_when_words_are_requested() {
+    let mut transcriber = tiny_transcriber(1, 1);
+    transcriber.set_language(Some("en".to_string()));
+    let windows = fake_windows();
+    let refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+
+    let (plain, profile) =
+        transcriber.transcribe_windows(&refs, RunOptions { profile: true, ..Default::default() }).unwrap();
+    assert!(profile.expect("profiled run").stage("alignment_graph").is_none(), "aligner ran without words");
+    assert!(plain.iter().all(|t| t.words.is_empty()));
+
+    let (_, profile) =
+        transcriber.transcribe_windows(&refs, RunOptions { profile: true, words: true, ..Default::default() }).unwrap();
+    assert!(profile.expect("profiled run").stage("alignment_graph").is_some(), "words requested without the aligner");
 }

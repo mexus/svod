@@ -25,7 +25,7 @@ use once_cell::sync::Lazy;
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::Scheduler;
-use super::config::BeamConfig;
+use super::config::{BeamConfig, HeuristicsConfig};
 use super::error::*;
 use super::opts::apply_opt;
 use super::types::{Opt, OptArg, OptOps};
@@ -274,6 +274,28 @@ fn generate_actions(scheduler: &Scheduler, config: &BeamConfig) -> Vec<Scheduler
     out
 }
 
+/// The hand-coded kernel, as a first-wave BEAM candidate.
+///
+/// Greedy width-K expansion prunes a lineage whose single actions each lose,
+/// so a multi-opt heuristic stack (e.g. the matvec GROUP+LOCAL+UPCAST+UNROLL
+/// one) is unreachable from the bare scheduler. Timing it alongside the first
+/// wave makes the search's answer never worse than the heuristic one.
+///
+/// `None` when the heuristics add nothing or land outside the search's limits.
+fn heuristic_seed(scheduler: &Scheduler, config: &BeamConfig) -> Option<Scheduler> {
+    let mut seed = scheduler.clone();
+    super::heuristics::hand_coded_optimizations(&mut seed, &HeuristicsConfig::from_env());
+    (seed.applied_opts != scheduler.applied_opts && validate_limits(&seed, config)).then_some(seed)
+}
+
+/// Under `BEAM_DEBUG`, report once whether the [`heuristic_seed`] survived
+/// compilation and how its timing compares to the wave's winner.
+fn debug_seed_fate(seed: &mut Option<Vec<Opt>>, timed: &[(Scheduler, Duration)]) {
+    let Some(opts) = seed.take().filter(|_| beam_debug_enabled()) else { return };
+    let timing = timed.iter().find(|(state, _)| state.applied_opts == opts).map(|(_, timing)| *timing);
+    eprintln!("[beam] seed {opts:?}: timing={timing:?} wave best={:?}", timed.first().map(|(_, timing)| *timing));
+}
+
 /// Validate that a scheduler state is within configured limits.
 ///
 /// Per-candidate filter: reject if `(up_axes_prod / tc_up) > max_upcast`
@@ -293,8 +315,12 @@ fn validate_limits(scheduler: &Scheduler, config: &BeamConfig) -> bool {
 }
 
 /// Reconstruct one remote BEAM candidate without creating candidate UOps in
-/// the parent process. The final action uses the same prefilter/apply/limit
-/// path as [`generate_actions`].
+/// the parent process.
+///
+/// The suffix past `base_opt_count` is replayed whole: one action for an
+/// expanded candidate, the full stack for a [`heuristic_seed`]. [`passes_prefilter`]
+/// is not re-run here — it is a parent-side generation filter, and a seed's opts
+/// never went through it.
 pub fn apply_remote_candidate(
     mut scheduler: Scheduler,
     base_opt_count: usize,
@@ -307,14 +333,9 @@ pub fn apply_remote_candidate(
     if opts.len() == base_opt_count {
         return validate_limits(&scheduler, config).then_some(scheduler);
     }
-    for opt in &opts[base_opt_count..opts.len() - 1] {
+    for opt in &opts[base_opt_count..] {
         apply_opt(&mut scheduler, opt, true).ok()?;
     }
-    let action = opts.last()?;
-    if !passes_prefilter(&scheduler, action) {
-        return None;
-    }
-    apply_opt(&mut scheduler, action, true).ok()?;
     validate_limits(&scheduler, config).then_some(scheduler)
 }
 
@@ -487,6 +508,8 @@ where
     // incumbent to beat. Avoids one wasted compile+time per `beam_search`
     // invocation (also charged on cache replay through `OPT_CACHE`).
     let mut beam: Vec<(Scheduler, Duration)> = vec![(scheduler.clone(), Duration::MAX)];
+    let mut seed = heuristic_seed(&scheduler, config);
+    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
 
     // `seen_libs` and `least_compute_ops` persist across the entire beam
     // search. Identity-keyed dedup carries across iterations, so a kernel
@@ -503,7 +526,8 @@ where
 
         // 1. EXPAND: Generate all valid next states from current beam (sequential)
         // Note: Scheduler is not Sync due to OnceCell caches, so expansion is sequential
-        let candidates: Vec<Scheduler> = beam.iter().flat_map(|(s, _)| generate_actions(s, config)).collect();
+        let mut candidates: Vec<Scheduler> = beam.iter().flat_map(|(s, _)| generate_actions(s, config)).collect();
+        candidates.extend(seed.take());
 
         if candidates.is_empty() {
             break;
@@ -568,6 +592,7 @@ where
         // 3. SORT: Sort by timing (best first)
         let mut sorted = timed;
         sorted.sort_by_key(|(_, t)| *t);
+        debug_seed_fate(&mut seed_opts, &sorted);
 
         // 4. CHECK TERMINATION — exit when the new best is already below
         //    the progress floor (fast-enough kernel) OR when the gain over
@@ -637,13 +662,17 @@ where
         stage_timings: BeamStageTimings::default(),
     };
     let mut beam = vec![(scheduler.clone(), Duration::MAX)];
+    let mut seed = heuristic_seed(&scheduler, config);
+    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
     let mut seen_binary = std::collections::HashSet::new();
 
     loop {
         result.iterations += 1;
 
         let started = Instant::now();
-        let candidates: Vec<Scheduler> = beam.iter().flat_map(|(state, _)| generate_actions(state, config)).collect();
+        let mut candidates: Vec<Scheduler> =
+            beam.iter().flat_map(|(state, _)| generate_actions(state, config)).collect();
+        candidates.extend(seed.take());
         result.stage_timings.generation += started.elapsed();
         result.generated += candidates.len();
         if candidates.is_empty() {
@@ -686,6 +715,7 @@ where
         }
 
         timed.sort_by_key(|(_, timing)| *timing);
+        debug_seed_fate(&mut seed_opts, &timed);
         let best_new = timed[0].1;
         let best_old = beam.first().map(|(_, timing)| *timing).unwrap_or(Duration::MAX);
         let min_progress = Duration::from_nanos(config.min_progress_ns);
@@ -729,12 +759,15 @@ where
         stage_timings: BeamStageTimings::default(),
     };
     let mut beam = vec![(scheduler.clone(), Duration::MAX)];
+    let mut seed = heuristic_seed(&scheduler, config);
+    let mut seed_opts = seed.as_ref().map(|state| state.applied_opts.clone());
     let mut seen_binary = std::collections::HashSet::new();
 
     loop {
         result.iterations += 1;
         let started = Instant::now();
-        let candidates = beam.iter().flat_map(|(state, _)| generate_actions(state, config)).collect::<Vec<_>>();
+        let mut candidates = beam.iter().flat_map(|(state, _)| generate_actions(state, config)).collect::<Vec<_>>();
+        candidates.extend(seed.take());
         let candidate_opts = candidates.iter().map(|candidate| candidate.applied_opts.clone()).collect::<Vec<_>>();
         result.stage_timings.generation += started.elapsed();
         result.generated += candidates.len();
@@ -774,6 +807,7 @@ where
             break;
         }
         timed.sort_by_key(|(_, timing)| *timing);
+        debug_seed_fate(&mut seed_opts, &timed);
         let best_new = timed[0].1;
         let best_old = beam.first().map(|(_, timing)| *timing).unwrap_or(Duration::MAX);
         let min_progress = Duration::from_nanos(config.min_progress_ns);
@@ -834,7 +868,18 @@ static CACHE_DB: Lazy<Option<sled::Db>> = Lazy::new(|| {
         None => dirs::cache_dir()?.join("svod"),
     };
     std::fs::create_dir_all(&cache_dir).ok()?;
-    sled::open(cache_dir.join("beam_cache")).ok()
+    match sled::open(cache_dir.join("beam_cache")) {
+        Ok(db) => Some(db),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                dir = %cache_dir.display(),
+                "BEAM cache unavailable: every kernel is searched afresh and nothing is saved \
+                 (another svod process holding the database lock is the usual cause)"
+            );
+            None
+        }
+    }
 });
 
 /// Cache key for beam search results.
@@ -911,7 +956,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 9,
+            schema: 11,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,

@@ -42,7 +42,7 @@ impl Transcriber for PresetTranscriber {
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
-        _profile: bool,
+        _opts: RunOptions,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Infallible> {
         assert_eq!(windows.len(), self.out.len(), "preset length must match window count");
         Ok((self.out.clone(), None))
@@ -236,10 +236,10 @@ impl Transcriber for ProfilingTranscriber {
     fn transcribe_window(
         &mut self,
         _window: &[f32],
-        profile: bool,
+        opts: RunOptions,
     ) -> Result<(Transcript, Option<RunProfile>), Infallible> {
         // Emit the stage only when this call asked for a profile.
-        let prof = profile.then(|| {
+        let prof = opts.profile.then(|| {
             let mut p = RunProfile::default();
             p.push(svod_runtime::StageProfile::host("decode", std::time::Duration::from_millis(1)));
             p
@@ -344,7 +344,7 @@ impl Transcriber for WalkTranscriber {
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
-        _profile: bool,
+        _opts: RunOptions,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Infallible> {
         self.window_lens.extend(windows.iter().map(|w| w.len()));
         Ok((windows.iter().map(|_| self.answers.pop_front().unwrap_or_default()).collect(), None))
@@ -432,4 +432,40 @@ fn without_the_opt_in_chunks_are_decoded_at_the_splitters_boundaries() {
     let out = t.transcribe_chunks(&waveform, &chunks, RunOptions::default()).unwrap();
     assert_eq!(t.window_lens, vec![30, 30], "one batched pass, no seek walk");
     assert_eq!(out.chunks.iter().map(|c| c.start_sec).collect::<Vec<_>>(), vec![0.0, 30.0]);
+}
+
+// ─── Per-call switches reach the model ────────────────────────────────────────
+
+/// Records the [`RunOptions`] each window call received.
+#[derive(Default)]
+struct OptsRecorder {
+    seen: Vec<RunOptions>,
+}
+
+impl Transcriber for OptsRecorder {
+    type Error = Infallible;
+    fn sample_rate(&self) -> u32 {
+        1
+    }
+    fn transcribe_windows(
+        &mut self,
+        windows: &[&[f32]],
+        opts: RunOptions,
+    ) -> Result<(Vec<Transcript>, Option<RunProfile>), Infallible> {
+        self.seen.push(opts);
+        Ok((windows.iter().map(|_| Transcript::default()).collect(), None))
+    }
+}
+
+/// A model decides per call whether to do words-only work (Whisper's aligner),
+/// so the pipeline hands it the caller's switches unchanged.
+#[test]
+fn window_calls_carry_the_run_options() {
+    let waveform = vec![0.0_f32; 10];
+    let mut asr = Asr::new(FixedLengthSplitter::new(5, 1), OptsRecorder::default());
+    let opts = RunOptions { words: true, segments: false, profile: true };
+    asr.transcribe(&waveform, opts).unwrap();
+    let seen = &asr.transcriber_mut().seen;
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|o| o.words && o.profile && !o.segments), "{seen:?}");
 }

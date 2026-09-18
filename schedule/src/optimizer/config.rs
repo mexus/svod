@@ -107,12 +107,19 @@ pub enum TcOpt {
     Strict,
 
     /// Any reduce-axis count: the tensor core takes one divisible reduce axis
-    /// and the others stay loops around the WMMA (TC_OPT=1, default).
-    #[default]
+    /// and the others stay loops around the WMMA (TC_OPT=1).
     Relaxed,
 
-    /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2).
+    /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2, default)
+    /// inside the tensor-core padding budget, so a 1500-row GEMM still tiles
+    /// at 1504 while a 5-row GEMV never pays for 16.
+    #[default]
     Padded,
+
+    /// [`Self::Padded`] with only PADTO's own 4x work limit, tinygrad's
+    /// TC_OPT=2 (TC_OPT=3): a partial tile is worth having even at a beam
+    /// width of 5, as the padded-fragment codegen tests need.
+    Unbounded,
 }
 
 impl TcOpt {
@@ -122,6 +129,7 @@ impl TcOpt {
             Self::Strict => 0,
             Self::Relaxed => 1,
             Self::Padded => 2,
+            Self::Unbounded => 3,
         }
     }
 }
@@ -308,15 +316,13 @@ pub struct HeuristicsConfig {
     pub tc_enabled: TcUsage,
     /// Tensor core optimization level.
     ///
-    /// Defaults to [`TcOpt::Relaxed`] (`TC_OPT=1`), one step above tinygrad's
-    /// heuristic default (`helpers.py:238`): convolutions lower to a reduce
-    /// over (channels, taps), and a scalar path there runs at 1-3 TFLOPS where
-    /// the tensor core on the channel axis with the taps as an outer loop runs
-    /// at 4-18 TFLOPS on every measured shape (RTX 3060, f16). `TC_OPT=2` is
-    /// only the *BEAM action space* default (`search.py:22`), so the heuristic
-    /// path must not inherit it — tensor cores would silently PADTO a shape the
-    /// author did not ask to pad. Benchmarks that want the padded behaviour
-    /// set it explicitly.
+    /// Defaults to [`TcOpt::Padded`] (`TC_OPT=2`): the tensor core takes any
+    /// divisible reduce axis (convolutions lower to a reduce over channels and
+    /// taps, and the scalar path there runs at a fraction of the WMMA's), and a
+    /// non-divisible M/N/K is padded when the padding adds at most a quarter
+    /// to the axis, so a 1500-row GEMM tiles at 1504
+    /// while a 5-row GEMV stays scalar. `TC_OPT=3` pads without the budget,
+    /// tinygrad's `TC_OPT=2`; `TC_OPT=1` never pads.
     pub tc_opt: TcOpt,
     /// Tensor core selection mode.
     pub tc_select: TcSelect,
@@ -324,12 +330,13 @@ pub struct HeuristicsConfig {
     // Matrix-vector optimization
     /// Enable matrix-vector optimization.
     pub matvec_enabled: bool,
-    /// Matrix-vector block size (rows per workgroup).
-    pub matvec_blocksize: usize,
-    /// Matrix-vector reduction split (threads per reduction row).
-    pub threads_per_row: usize,
-    /// Matrix-vector output lane split (rows computed per thread).
-    pub rows_per_thread: usize,
+    /// Matrix-vector rows per workgroup; `None` takes the device default.
+    pub matvec_blocksize: Option<usize>,
+    /// Matrix-vector reduce split (threads per row); `None` takes the device
+    /// default, a wave on AMD.
+    pub threads_per_row: Option<usize>,
+    /// Matrix-vector rows accumulated per thread; `None` takes the device default.
+    pub rows_per_thread: Option<usize>,
 
     // Reduction thresholds
     /// Threshold for applying grouped reduction.
@@ -387,14 +394,14 @@ impl HeuristicsConfig {
     ///
     /// * `SVOD_THREADS` - Kernel `core_id` split, the process thread budget (default: available_parallelism)
     /// * `SVOD_MV` - Enable/disable matvec fast-path (`0` disables)
-    /// * `SVOD_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec local block size
-    /// * `SVOD_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split
-    /// * `SVOD_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
+    /// * `SVOD_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec rows per workgroup (default: per device)
+    /// * `SVOD_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split (default: per device)
+    /// * `SVOD_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec rows per thread (default: per device)
     /// * `SVOD_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     /// * `SVOD_NOLOCALS` - Disable LOCAL axis selection after grouped-reduction matching
     /// * `SVOD_TC` - Tensor-core usage: `0` disables, `2` shape-only, else enabled
-    /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), or padded (`2`)
+    /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), padded within budget (`2`), or padded up to 4x work (`3`)
     /// * `TC_SELECT` / `SVOD_TC_SELECT` - Auto (`-1`) or a tensor-core index
     pub fn from_env() -> Self {
         let parse_usize = |keys: &[&str], default: usize| {
@@ -403,9 +410,11 @@ impl HeuristicsConfig {
 
         let thread_count = thread_budget();
         let matvec_enabled = std::env::var("SVOD_MV").map(|v| v != "0").unwrap_or(true);
-        let matvec_blocksize = parse_usize(&["SVOD_MV_BLOCKSIZE", "MV_BLOCKSIZE"], 4);
-        let threads_per_row = parse_usize(&["SVOD_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"], 8);
-        let rows_per_thread = parse_usize(&["SVOD_MV_ROWS_PER_THREAD", "MV_ROWS_PER_THREAD"], 4);
+        let parse_override =
+            |keys: &[&str]| keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok()));
+        let matvec_blocksize = parse_override(&["SVOD_MV_BLOCKSIZE", "MV_BLOCKSIZE"]);
+        let threads_per_row = parse_override(&["SVOD_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"]);
+        let rows_per_thread = parse_override(&["SVOD_MV_ROWS_PER_THREAD", "MV_ROWS_PER_THREAD"]);
         let k_vectorize = std::env::var("SVOD_K_VECTORIZE").is_ok();
         // Default enabled, use SVOD_NO_OUTPUT_UPCAST to disable
         let output_upcast = std::env::var("SVOD_NO_OUTPUT_UPCAST").is_err();
@@ -418,10 +427,11 @@ impl HeuristicsConfig {
             Some("2") => TcUsage::ShapeOnly,
             _ => TcUsage::Enabled,
         };
-        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 1) {
+        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 2) {
             0 => TcOpt::Strict,
+            1 => TcOpt::Relaxed,
             2 => TcOpt::Padded,
-            _ => TcOpt::Relaxed,
+            _ => TcOpt::Unbounded,
         };
         let tc_select = ["SVOD_TC_SELECT", "TC_SELECT"]
             .iter()
@@ -451,12 +461,12 @@ impl Default for HeuristicsConfig {
     fn default() -> Self {
         Self {
             tc_enabled: TcUsage::Enabled,
-            tc_opt: TcOpt::Relaxed,
+            tc_opt: TcOpt::Padded,
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
-            matvec_blocksize: 4,
-            threads_per_row: 8,
-            rows_per_thread: 4,
+            matvec_blocksize: None,
+            threads_per_row: None,
+            rows_per_thread: None,
             grouped_threshold: 256,
             unroll_threshold: 32,
             disable_locals: false,
@@ -477,9 +487,9 @@ impl HeuristicsConfig {
         #[builder(default)] tc_opt: TcOpt,
         #[builder(default)] tc_select: TcSelect,
         #[builder(default = true)] matvec_enabled: bool,
-        #[builder(default = 4)] matvec_blocksize: usize,
-        #[builder(default = 8)] threads_per_row: usize,
-        #[builder(default = 4)] rows_per_thread: usize,
+        matvec_blocksize: Option<usize>,
+        threads_per_row: Option<usize>,
+        rows_per_thread: Option<usize>,
         #[builder(default = 256)] grouped_threshold: usize,
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,

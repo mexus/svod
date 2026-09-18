@@ -127,8 +127,11 @@ boundary is.
 ## Device-local memory and the SDMA copy queue
 
 The backend installs an **SDMA copy queue** (`AmdCopyQueue`) at device-open on
-CDNA parts — RDNA keeps the host-visible path, and `AMD_DISABLE_SDMA` turns the
-attempt off entirely — which flips `has_sdma_queue` true. With it, intermediates
+every part, which flips `has_sdma_queue` true; `AMD_DISABLE_SDMA` turns the
+attempt off and keeps every buffer host-visible. (The queue was CDNA-only until
+the HDP flush handshake moved to one private channel; the intermittent RDNA
+hangs it was blamed for came from that handshake, and the queue measures
+48 GB/s each way on an RX 9070 XT.) With it, intermediates
 can live in **device-only VRAM** (`cpu_access = false`) and host↔device copies go
 through asynchronous DMA: `_copyin`/`_copyout` stage through the SDMA queue,
 `_transfer` does a direct device→device copy. When no copy queue is present the

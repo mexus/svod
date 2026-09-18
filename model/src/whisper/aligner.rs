@@ -62,10 +62,23 @@ struct Lane {
     prompt_len: usize,
 }
 
+/// Rows a tensor-core tile covers. The relaxed tensor-core level does not pad,
+/// so a replay whose row count is not a multiple of it (229 was) lowers every
+/// projection to the scalar path, an order of magnitude behind the encoder's
+/// tiles on the same weights.
+const TC_ROWS: usize = 16;
+
+/// Token positions the replay is prepared for: `max_tokens` of text after a
+/// `prompt_len` prompt, with `<|notimestamps|>` and EOT, in whole tensor-core
+/// tiles and never past the model's `n_text_ctx`.
+pub(crate) fn replay_rows(max_tokens: usize, prompt_len: usize, n_text_ctx: usize) -> usize {
+    (max_tokens + prompt_len + 2).next_multiple_of(TC_ROWS).min(n_text_ctx)
+}
+
 impl WhisperAligner {
     /// `max_tokens` bounds the text tokens one window hands over; the graph is
-    /// sized to that plus the prompt and terminators, never past the model's
-    /// context.
+    /// sized to that plus the prompt and terminators, rounded up to whole
+    /// tensor-core tiles, never past the model's context.
     pub fn new(model: Whisper, size: WhisperSize, batch_size: usize, max_tokens: usize) -> Result<Self> {
         if batch_size == 0 {
             return Err(decode_err("alignment batch must be non-zero"));
@@ -74,13 +87,20 @@ impl WhisperAligner {
         let dims = &model.dims;
         let (layer_heads, d_head) = (dims.n_text_layer * dims.n_text_head, dims.n_text_state / dims.n_text_head);
         let prompt_len = if dims.is_multilingual() { 3 } else { 1 };
-        let text_ctx = (max_tokens + prompt_len + 2).min(dims.n_text_ctx);
+        let text_ctx = replay_rows(max_tokens, prompt_len, dims.n_text_ctx);
         let cache_dtype = dims.cache_dtype();
         let cache_bytes = N_AUDIO_CTX * layer_heads * d_head * cache_dtype.bytes();
         let cache_spec =
             InputSpec::new(&[batch_size, N_AUDIO_CTX, layer_heads, d_head], cache_dtype.clone()).device_local();
         let mut jit = WhisperAlignmentJit::new(WhisperAlignmentModel::new(model, heads.clone()));
-        jit.prepare(cache_spec.clone(), cache_spec, InputSpec::i32(&[batch_size, text_ctx]))?;
+        // The attention output is read back with one copyout; see the
+        // recogniser's `prepare_config` for why the host mapping is avoided.
+        jit.prepare_with_config(
+            cache_spec.clone(),
+            cache_spec,
+            InputSpec::i32(&[batch_size, text_ctx]),
+            &svod_tensor::PrepareConfig::device_local(),
+        )?;
         Ok(Self { jit, n_heads: heads.len(), batch_size, text_ctx, cache_dtype, cache_bytes })
     }
 

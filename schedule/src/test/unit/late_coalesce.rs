@@ -241,15 +241,117 @@ fn coalescing_groups_scalar_loads_by_run(sink: Arc<UOp>, renderer: Renderer, gro
     assert_eq!(shrink_count(&result), shrinks, "{}", result.tree());
 }
 
+/// The widest fold is a 16-byte access on the LLVM GPU targets — sixteen fp8
+/// lanes, eight 16-bit, four f32 — and four lanes of any width where the source
+/// language stops there. A run longer than the widest fold walks the ladder
+/// down, so a one-byte buffer folds 16/8/4/2/1 rather than 16 or nothing.
+///
+/// The one-byte rows are the ones that matter: fp8 stopped at four lanes before
+/// this ladder, so 16 is the only fold it widened. That fold is reachable on
+/// each of these targets and safe on each. AMD stores fp8 natively and keeps
+/// the wide access; the CUDA profiles `for_cuda_arch` hands out list no fp8
+/// storage dtype, so the same 16-wide group is decomposed back into sixteen
+/// scalar byte loads and no fp8 cast survives to meet the NVPTX renderer's
+/// refusal of them.
+#[test_case(ScalarDType::FP8E4M3, Renderer::amd_rdna4(), 16, vec![16]; "sixteen fp8 lanes are one access on RDNA4")]
+#[test_case(ScalarDType::FP8E5M2, Renderer::amd_cdna3(), 16, vec![16]; "sixteen fp8 lanes are one access on CDNA3")]
+#[test_case(ScalarDType::FP8E4M3, Renderer::cuda_sm80(false), 16, vec![16]; "sixteen fp8 lanes are one access on CUDA")]
+#[test_case(ScalarDType::FP8E4M3, Renderer::amd_rdna4(), 24, vec![16, 8]; "a one-byte run walks the fold ladder down")]
+#[test_case(ScalarDType::FP8E4M3, Renderer::metal(), 16, vec![4, 4, 4, 4]; "MSL stops a one-byte fold at four lanes")]
+#[test_case(ScalarDType::FP8E4M3, Renderer::cpu(), 16, vec![4, 4, 4, 4]; "the host stops a one-byte fold at four lanes")]
+#[test_case(ScalarDType::BFloat16, Renderer::amd_rdna3(), 8, vec![8]; "eight bf16 lanes are one access on RDNA")]
+#[test_case(ScalarDType::Float16, Renderer::cuda_sm80(false), 8, vec![8]; "eight f16 lanes are one access on CUDA")]
+#[test_case(ScalarDType::BFloat16, Renderer::metal(), 8, vec![4, 4]; "MSL stops at four lanes")]
+#[test_case(ScalarDType::BFloat16, Renderer::cpu(), 8, vec![4, 4]; "the host keeps four lanes")]
+#[test_case(ScalarDType::Float32, Renderer::amd_rdna3(), 8, vec![4, 4]; "f32 stays at four lanes")]
+#[test_case(ScalarDType::Int32, Renderer::amd_rdna4(), 8, vec![4, 4]; "i32 stays at four lanes")]
+fn the_widest_fold_is_the_target_access_width(scalar: ScalarDType, renderer: Renderer, lanes: i64, widths: Vec<usize>) {
+    let buffer = UOp::param(0, lanes as usize, DType::Scalar(scalar), None);
+    let accesses = (0..lanes).map(|offset| load_at(&buffer, UOp::index_const(offset))).collect();
+    let result = memory_coalescing(UOp::sink(accesses), &renderer);
+    assert_eq!(group_layout(&result), (widths, vec![]), "{}", result.tree());
+}
+
+/// The renderer capabilities the LLVM AMD backend binds: no decomposition
+/// matcher, and the fp8 ALU widening as the extra matcher (`svod-codegen`
+/// `llvm::amd_extra_matcher`).
+fn amd_llvm_capabilities(arch: svod_dtype::AmdArch) -> Renderer {
+    Renderer::for_amd_arch(arch).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        None,
+        Some(crate::devectorize::amd_non_native_fp8_patterns().clone()),
+    )
+}
+
+/// Sixteen contiguous fp8 lanes, each widened and summed into one `wide` output.
+fn fp8_cast_kernel(scalar: ScalarDType, wide: DType) -> Arc<UOp> {
+    let input = UOp::param(0, 16, DType::Scalar(scalar), None);
+    let sum = (0..16)
+        .map(|lane| load_at(&input, UOp::index_const(lane)).cast(wide.clone()))
+        .reduce(|a, b| a.add(&b))
+        .expect("sixteen lanes");
+    UOp::sink(vec![index_of(UOp::param(1, 1, wide.clone(), None), UOp::index_const(0)).store(sum)])
+}
+
+/// A one-byte buffer folds to a 16-lane access, and the whole post-optimization
+/// pipeline keeps that as *one* wide fp8 load feeding *scalar* casts.
+///
+/// Both halves matter. The wide load is what the fold buys (`<16 x i8>` is one
+/// 16-byte access), and the scalar casts are what the LLVM renderers
+/// require: `llvm::amd::ops::is_fp8_cast` only matches a cast whose operands
+/// are scalar, and a vector one would fall through to `lcast`, which refuses
+/// fp8. Verified end to end against `svod-codegen`: on gfx942 and gfx1201 this
+/// kernel renders `load <16 x i8>` plus sixteen `@llvm.amdgcn.cvt.f32.{fp8,bf8}`
+/// calls, and clang selects `v_cvt_f32_{fp8,bf8}` for both archs.
+#[test_case(svod_dtype::AmdArch::Gfx942, ScalarDType::FP8E4M3, DType::Float32; "cdna3 e4m3 to f32")]
+#[test_case(svod_dtype::AmdArch::Gfx942, ScalarDType::FP8E5M2, DType::Float16; "cdna3 e5m2 to f16")]
+#[test_case(svod_dtype::AmdArch::Gfx1201, ScalarDType::FP8E4M3, DType::Float32; "rdna4 e4m3 to f32")]
+#[test_case(svod_dtype::AmdArch::Gfx1201, ScalarDType::FP8E5M2, DType::Float16; "rdna4 e5m2 to f16")]
+fn a_sixteen_lane_fp8_fold_survives_post_optimization_as_scalar_casts(
+    arch: svod_dtype::AmdArch,
+    scalar: ScalarDType,
+    wide: DType,
+) {
+    let renderer = amd_llvm_capabilities(arch);
+    let post = crate::optimizer::apply_post_optimization_with_renderer(fp8_cast_kernel(scalar, wide), &renderer)
+        .expect("post optimization");
+
+    let wide_loads: Vec<_> = loads(&post)
+        .into_iter()
+        .filter(|load| matches!(unwrap_op!(load, Op::Load(l) => l).index.op(), Op::Shrink(..)))
+        .collect();
+    assert_eq!(wide_loads.len(), 1, "the sixteen lanes must stay one access: {}", post.tree());
+    let Op::Shrink(ops::Shrink { sizes, .. }) = unwrap_op!(wide_loads[0], Op::Load(l) => l).index.op() else {
+        unreachable!()
+    };
+    assert_eq!(const_int(sizes), 16, "{}", post.tree());
+
+    let mut fp8_casts = 0;
+    for node in post.toposort() {
+        let Op::Cast(ops::Cast { src, dtype }) = node.op() else { continue };
+        if !dtype.base().is_fp8() && !src.dtype().base().is_fp8() {
+            continue;
+        }
+        fp8_casts += 1;
+        assert_eq!(
+            (dtype.vcount(), src.dtype().vcount()),
+            (1, 1),
+            "an fp8 cast must reach the renderer scalar: {}",
+            post.tree()
+        );
+    }
+    assert_eq!(fp8_casts, 16, "one widening cast per folded lane: {}", post.tree());
+}
+
 /// Only the allowlisted element types are grouped; everything else stays scalar.
 #[test_case(ScalarDType::Float16, 1 ; "float16 folds")]
+#[test_case(ScalarDType::BFloat16, 1 ; "bfloat16 folds")]
 #[test_case(ScalarDType::Int32, 1 ; "int32 folds")]
 #[test_case(ScalarDType::UInt32, 1 ; "uint32 folds")]
 #[test_case(ScalarDType::FP8E4M3, 1 ; "fp8 e4m3 folds")]
 #[test_case(ScalarDType::FP8E5M2, 1 ; "fp8 e5m2 folds")]
 #[test_case(ScalarDType::Int8, 4 ; "int8 is not foldable")]
 #[test_case(ScalarDType::Float64, 4 ; "float64 is not foldable")]
-#[test_case(ScalarDType::BFloat16, 4 ; "bfloat16 is not foldable")]
 fn only_allowlisted_element_types_coalesce(scalar: ScalarDType, groups: usize) {
     let result = memory_coalescing(contiguous_loads(UOp::param(0, 16, DType::Scalar(scalar), None)), &Renderer::cpu());
     assert_eq!(loads(&result).len(), groups, "{}", result.tree());

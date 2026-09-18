@@ -203,6 +203,23 @@ impl Renderer {
         }
     }
 
+    /// Bytes one vector global access may move on this target: 16 on the LLVM GPU
+    /// targets, whose `<8 x half>` load is one `global_load_dwordx4` /
+    /// `ld.global.v4.b32`; 8 for a 16-bit type elsewhere, where the source
+    /// languages stop at four lanes. Read by the late memory coalescing.
+    pub fn access_bytes(&self) -> usize {
+        match self.device {
+            RendererDevice::AmdRdna3
+            | RendererDevice::AmdRdna4
+            | RendererDevice::AmdCdna3
+            | RendererDevice::AmdCdna4
+            | RendererDevice::CudaSm75
+            | RendererDevice::CudaSm80
+            | RendererDevice::CudaSm89 => 16,
+            RendererDevice::Cpu | RendererDevice::Metal | RendererDevice::IntelXe | RendererDevice::WebGpu => 8,
+        }
+    }
+
     /// How the hand heuristic sizes the per-warp output tile once a tensor core
     /// has landed.
     ///
@@ -478,7 +495,7 @@ impl Renderer {
             extra_matcher: None,
             decomposition_matcher: None,
             renderer_ops: None,
-            supported_dtypes: Self::common_dtypes(),
+            supported_dtypes: Self::fp8_dtypes(),
             decomposition_profile: "none",
             extra_profile: "none",
         }
@@ -741,9 +758,12 @@ impl Renderer {
         self.supports_dtype(dtype)
     }
 
+    /// AMD parts store and convert OCP FP8 natively but have no FP8 ALU, so
+    /// arithmetic on it is widened; RDNA4 joins CDNA here with its
+    /// `v_cvt_*_fp8` instructions (RDNA3 has none and decomposes FP8 fully).
     pub fn supports_alu_dtype(&self, dtype: ScalarDType) -> bool {
         self.supports_dtype(dtype)
-            && !(matches!(self.device, RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4)
+            && !(matches!(self.device, RendererDevice::AmdCdna3 | RendererDevice::AmdCdna4 | RendererDevice::AmdRdna4)
                 && matches!(dtype, ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2))
     }
 
@@ -1104,6 +1124,7 @@ impl TensorCore {
             AMD_RDNA4.build(DType::Float16, DType::Float16),
             AMD_RDNA4.build(DType::BFloat16, DType::Float32),
             AMD_RDNA4.build(DType::BFloat16, DType::BFloat16),
+            AMD_RDNA4.build(DType::Int8, DType::Int32),
         ]
     }
 

@@ -158,7 +158,8 @@ pub fn resolve_metal_family(device_id: usize) -> Result<svod_dtype::MetalFamily>
     Ok(crate::metal::MetalDevice::open(device_id)?.family())
 }
 
-/// The streaming-multiprocessor count of CUDA device `device_id`.
-pub fn resolve_cuda_sm_count(device_id: usize) -> Result<u32> {
-    Ok(crate::cuda::CudaDevice::open(device_id)?.limits().sm_count)
+/// The static limits of CUDA device `device_id`, read from the opened
+/// (cached) device.
+pub fn resolve_cuda_limits(device_id: usize) -> Result<crate::cuda::CudaLimits> {
+    Ok(*crate::cuda::CudaDevice::open(device_id)?.limits())
 }

@@ -131,14 +131,27 @@ pub const fn wait_reg_mem_engine(x: u32) -> u32 {
 
 /// `function = >= comparison`. Used for signal-value waits.
 pub const WAIT_REG_MEM_FUNC_GEQ: u32 = 5;
+/// `function = == comparison`. Used for the HDP flush handshake.
+pub const WAIT_REG_MEM_FUNC_EQ: u32 = 3;
 
-// ── HDP flush register handshake addresses ────────────────────────────────
+// ── HDP flush register handshake ──────────────────────────────────────────
 //
 // A register-space WAIT_REG_MEM against the BIF HDP flush register pair is
 // emitted before `acquire_mem` in `memory_barrier`. Without this handshake,
-// host writes to GTT (kernarg arena, ring) may not be visible to the GPU's
-// command processor when it consumes the next packet — manifests as a hung
-// dispatch with the signal never firing.
+// host writes through the BAR (kernarg arena) may not have left the HDP
+// write buffers when the command processor consumes the next packet —
+// manifests as a hung dispatch with the signal never firing.
+//
+// The REQ/DONE pair is one handshake channel per bit — CP0..CP9, SDMA0/1,
+// then twenty reserved engines — shared by every agent on the GPU. amdgpu
+// gives each of its rings a bit of its own (`amdgpu_gfx_get_hdp_flush_mask`:
+// gfx `cp0 << pipe`, compute `cp2 << pipe`, MES cp8, KIQ cp9) and waits on
+// that bit alone. Requesting and waiting on all 32 bits at once, as tinygrad
+// does, races those kernel handshakes: once a concurrent MES/KIQ handshake
+// retires its bit, DONE never reads all-ones again and the CP polls forever
+// (seen on gfx1201 on roughly every other GigaAM load, rptr frozen on this
+// packet). A user queue owns no pipe under MES, so svod takes a channel no
+// kernel ring uses on any supported arch: reserved engine 0.
 //
 // The register pair address is **uniform across supported arches**:
 // gfx9 and gfx10+ both define `NBIO_BASE_INST0_SEG2 = 0x0D20`, and every
@@ -149,6 +162,9 @@ pub const WAIT_REG_MEM_FUNC_GEQ: u32 = 5;
 // this is purely a name disambiguation, not an address change).
 pub const HDP_FLUSH_REQ_ADDR: u32 = 0xD20 + 262;
 pub const HDP_FLUSH_DONE_ADDR: u32 = 0xD20 + 263;
+/// `GPU_HDP_FLUSH_REQ/DONE.RSVD_ENG0`, laid out identically in nbio 7.9,
+/// nbio 4.3 and nbif 6.3.1.
+pub const HDP_FLUSH_CHANNEL: u32 = 1 << 12;
 
 // ── PACKET3 opcodes & constants (PM4 dispatch path, single-XCC) ──────────
 //
@@ -455,30 +471,26 @@ pub fn wait_reg_mem(addr: u64, value: u32, mask: u32) -> [u32; 7] {
     ]
 }
 
-/// Build a register-space WAIT_REG_MEM packet that polls `reg_done` until it
-/// matches the value the CP previously wrote to `reg_req`. This is the
-/// "register handshake" variant: `mem_space = 0` (register), `operation = 1`
-/// (signals CP to perform the write-then-poll handshake). Used by
-/// `memory_barrier` to flush the HDP
-/// before subsequent cache invalidations — without this handshake, host
-/// writes to GTT memory (kernarg arena, ring buffers) are not guaranteed
-/// to be visible to the GPU's command processor.
+/// Build a register-space WAIT_REG_MEM packet that writes `value` to
+/// `reg_req` and polls `reg_done` until `(reg_done & mask) == value`. This is
+/// the "register handshake" variant: `mem_space = 0` (register),
+/// `operation = 1` (write-then-poll), the same encoding and poll interval as
+/// amdgpu's `gfx_v12_0_ring_emit_hdp_flush`.
 ///
 /// Layout: 7 dwords (same shape as memory-space variant), but the two
 /// address dwords carry `(reg_req, reg_done)` instead of `(addr_lo, addr_hi)`.
 pub fn wait_reg_mem_register(reg_req: u32, reg_done: u32, value: u32, mask: u32) -> [u32; 7] {
     let info = wait_reg_mem_mem_space(0)            // 0 = register space
         | wait_reg_mem_operation(1)                  // 1 = REQ→DONE handshake
-        | wait_reg_mem_function(WAIT_REG_MEM_FUNC_GEQ)
+        | wait_reg_mem_function(WAIT_REG_MEM_FUNC_EQ)
         | wait_reg_mem_engine(0);
-    [packet3(PACKET3_WAIT_REG_MEM, 5), info, reg_req, reg_done, value, mask, 4]
+    [packet3(PACKET3_WAIT_REG_MEM, 5), info, reg_req, reg_done, value, mask, 0x20]
 }
 
-/// Build the HDP flush handshake packet for `memory_barrier`. Polls the
-/// BIF GPU_HDP_FLUSH_REQ/DONE register pair with `value = mask = 0xFFFF_FFFF`
-/// (full handshake — wait for all engines).
+/// Build the HDP flush handshake packet for `memory_barrier`: request a
+/// flush on svod's own [`HDP_FLUSH_CHANNEL`] and wait for that bit alone.
 pub fn hdp_flush() -> [u32; 7] {
-    wait_reg_mem_register(HDP_FLUSH_REQ_ADDR, HDP_FLUSH_DONE_ADDR, 0xFFFF_FFFF, 0xFFFF_FFFF)
+    wait_reg_mem_register(HDP_FLUSH_REQ_ADDR, HDP_FLUSH_DONE_ADDR, HDP_FLUSH_CHANNEL, HDP_FLUSH_CHANNEL)
 }
 
 /// Build a `PACKET3_SET_SH_REG`. `reg_offset` is the SH-relative offset

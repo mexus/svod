@@ -16,7 +16,7 @@ use svod_tensor::rand::manual_seed;
 use svod_tensor::testing::allclose_f32;
 
 use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_with};
-use crate::kernels::matmul::{MATMUL_SUPPORTED_ARCHS, matmul};
+use crate::kernels::gemm::{MATMUL_SUPPORTED_ARCHS, matmul};
 
 use super::device_supported;
 
@@ -131,7 +131,7 @@ fn prop_fa_vs_sdpa_amd() {
             t
         });
 
-        let Some(got_t) = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref() })
+        let Some(got_t) = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref(), ..Default::default() })
             .expect("fa build")
         else {
             return Ok(()); // shapes chosen to tile; the guard prevents an ineligible device

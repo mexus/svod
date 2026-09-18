@@ -193,15 +193,24 @@ pub enum Error {
 /// `Operand*` error if the shape is indeterminate, the wrong rank, or has a symbolic
 /// (non-constant) dimension. Kernel builders need statically-known dims, so a
 /// malformed operand is a caller error reported through `Result`, not a panic.
-pub(crate) fn concrete_dims(
-    t: &Tensor,
-    kernel: &'static str,
-    operand: &'static str,
-    rank: usize,
-) -> Result<Vec<usize>> {
+pub fn concrete_dims(t: &Tensor, kernel: &'static str, operand: &'static str, rank: usize) -> Result<Vec<usize>> {
     let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
     snafu::ensure!(shape.len() == rank, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
     (0..rank).map(|i| shape[i].as_const().context(OperandSymbolicDimSnafu { kernel, operand, axis: i })).collect()
+}
+
+/// [`concrete_dims`] for an operand of any rank of at least `min_rank`.
+pub fn concrete_dims_at_least(
+    t: &Tensor,
+    kernel: &'static str,
+    operand: &'static str,
+    min_rank: usize,
+) -> Result<Vec<usize>> {
+    let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
+    snafu::ensure!(shape.len() >= min_rank, OperandRankSnafu { kernel, operand, expected: min_rank, got: shape.len() });
+    (0..shape.len())
+        .map(|i| shape[i].as_const().context(OperandSymbolicDimSnafu { kernel, operand, axis: i }))
+        .collect()
 }
 
 /// Compile `sink` for `device` and dispatch it against `buffers`, populating the
@@ -419,12 +428,12 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
 /// use svod_tensor::Tensor;
 /// use svod_dtype::{AmdArch, DType};
 /// use svod_tk::{ArchCaps, run_kernel};
-/// use svod_tk::kernels::matmul::{GFX1151_CFG, build_matmul_cfg};
+/// use svod_tk::kernels::gemm::{RDNA_CFG, build_matmul_cfg};
 /// let n = 256usize;
-/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
-/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
+/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let mut c = Tensor::empty(&[n, n], DType::Float32);
-/// let cfg = GFX1151_CFG;
+/// let cfg = RDNA_CFG;
 /// let block = cfg.threads(ArchCaps::for_amd(AmdArch::Gfx1151).wave_size);
 /// run_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],
 ///     move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
@@ -468,12 +477,12 @@ where
 /// use svod_tensor::Tensor;
 /// use svod_dtype::{AmdArch, DType};
 /// use svod_tk::{ArchCaps, graph_launch};
-/// use svod_tk::kernels::matmul::{GFX1151_CFG, build_matmul_cfg};
+/// use svod_tk::kernels::gemm::{RDNA_CFG, build_matmul_cfg};
 /// let n = 256usize;
-/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
-/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
+/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let out = Tensor::empty(&[n, n], DType::Float32);
-/// let cfg = GFX1151_CFG;
+/// let cfg = RDNA_CFG;
 /// let caps = ArchCaps::for_amd(AmdArch::Gfx1151);
 /// // Wrap the hand-built SINK as a lazy graph node — composes + `prepare()`s like
 /// // any tensor op (`build_matmul_cfg` is the worked kernel body).
@@ -571,13 +580,13 @@ where
 /// the arch lets arch-dependent fit rules (e.g. a head dim the wave size must
 /// divide) decline to `Ok(None)` instead of masquerading as caller bugs.
 /// Shared by [`crate::matmul`] and [`crate::flash_attention_with`].
-pub fn launch_custom(
+pub fn launch_custom<T>(
     device: &DeviceSpec,
     archs: ArchSet,
     validate: impl FnOnce(GpuArch) -> Result<()>,
     applies: impl FnOnce(GpuArch) -> bool,
-    build: impl FnOnce(GpuArch) -> Result<Tensor>,
-) -> Result<Option<Tensor>> {
+    build: impl FnOnce(GpuArch) -> Result<T>,
+) -> Result<Option<T>> {
     // "Can this device run the kernel at all?" — wrong arch / missing toolchain is
     // environmental, so `None` (the caller's fallback), never an error.
     let Some(arch) = crate::target::resolve_supported_arch(device, archs).ok() else {
@@ -606,12 +615,12 @@ pub fn launch_custom(
 /// use svod_tensor::Tensor;
 /// use svod_dtype::{AmdArch, DType};
 /// use svod_tk::{ArchCaps, compile_kernel};
-/// use svod_tk::kernels::matmul::{GFX1151_CFG, build_matmul_cfg};
+/// use svod_tk::kernels::gemm::{RDNA_CFG, build_matmul_cfg};
 /// let n = 256usize;
-/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
-/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16).unwrap();
+/// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
+/// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let mut c = Tensor::empty(&[n, n], DType::Float32);
-/// let cfg = GFX1151_CFG;
+/// let cfg = RDNA_CFG;
 /// let block = cfg.threads(ArchCaps::for_amd(AmdArch::Gfx1151).wave_size);
 /// // Render + compile ONCE …
 /// let compiled = compile_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],

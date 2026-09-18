@@ -122,8 +122,13 @@ impl MultiHeadAttention {
         let dt = q_fa.dtype();
         let sixteen_bit = dt == DType::BFloat16 || dt == DType::Float16;
         let direct = if sixteen_bit && (d / self.n_head).is_multiple_of(16) {
-            svod_tk::flash_attention_with(&q_fa, &k_fa, &v_fa, svod_tk::FaOpts { causal, key_lens })
-                .map_err(tk_launch_error)?
+            svod_tk::flash_attention_with(
+                &q_fa,
+                &k_fa,
+                &v_fa,
+                svod_tk::FaOpts { causal, key_lens, ..Default::default() },
+            )
+            .map_err(tk_launch_error)?
         } else {
             None
         };

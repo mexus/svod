@@ -379,20 +379,21 @@ pub trait Transcriber {
 
     /// Transcribe every decode window (the model owns internal batching),
     /// returning uncropped per-window transcripts plus the per-stage
-    /// [`RunProfile`] — populated only when `profile` is set (a per-call choice,
-    /// so the same transcriber serves profiled and unprofiled runs). Defaults to
+    /// [`RunProfile`] — populated only when `opts.profile` is set. `opts` carries the
+    /// per-call switches, so one transcriber serves profiled/unprofiled and
+    /// words-on/off runs. Defaults to
     /// looping [`Self::transcribe_window`] and **merging** its per-window profiles (via
     /// [`RunProfile::merge`]); override for a model that batches the encoder and
     /// profiles the batch as a whole.
     fn transcribe_windows(
         &mut self,
         windows: &[&[f32]],
-        profile: bool,
+        opts: RunOptions,
     ) -> Result<(Vec<Transcript>, Option<RunProfile>), Self::Error> {
         let mut transcripts = Vec::with_capacity(windows.len());
         let mut prof: Option<RunProfile> = None;
         for w in windows {
-            let (transcript, stage) = self.transcribe_window(w, profile)?;
+            let (transcript, stage) = self.transcribe_window(w, opts)?;
             transcripts.push(transcript);
             if let Some(stage) = stage {
                 prof.get_or_insert_with(RunProfile::default).merge(stage);
@@ -406,9 +407,9 @@ pub trait Transcriber {
     fn transcribe_window(
         &mut self,
         window: &[f32],
-        profile: bool,
+        opts: RunOptions,
     ) -> Result<(Transcript, Option<RunProfile>), Self::Error> {
-        let (mut transcripts, prof) = self.transcribe_windows(&[window], profile)?;
+        let (mut transcripts, prof) = self.transcribe_windows(&[window], opts)?;
         Ok((transcripts.pop().unwrap_or_default(), prof))
     }
 
@@ -450,7 +451,7 @@ pub trait Transcriber {
             while seek < region.end {
                 let decode_end = seek.saturating_add(region.window_len).min(waveform.len());
                 let (mut transcripts, window_profile) =
-                    self.transcribe_windows(&[&waveform[seek..decode_end]], opts.profile)?;
+                    self.transcribe_windows(&[&waveform[seek..decode_end]], opts)?;
                 if let Some(stage) = window_profile {
                     prof.get_or_insert_with(RunProfile::default).merge(stage);
                 }
@@ -491,7 +492,7 @@ pub trait Transcriber {
         let metas: Vec<ChunkGeom> =
             chunks.iter().map(|chunk| ChunkGeom::new(chunk, waveform.len(), sample_rate)).collect();
         let windows: Vec<&[f32]> = metas.iter().map(|m| &waveform[m.decode_start..m.decode_end]).collect();
-        let (transcripts, prof) = self.transcribe_windows(&windows, opts.profile)?;
+        let (transcripts, prof) = self.transcribe_windows(&windows, opts)?;
         let results: Vec<ChunkResult> = transcripts.into_iter().zip(&metas).map(|(t, m)| m.finish(t, opts)).collect();
         let text = results.iter().map(|c| c.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
         Ok(Transcription { text, chunks: results, profile: prof })

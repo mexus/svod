@@ -16,8 +16,8 @@ use std::sync::Arc;
 use svod_dtype::{DType, DeviceSpec};
 use svod_ir::UOp;
 
-use crate::kernels::fa::{FaConfig, build_fa_mw_rdb};
-use crate::kernels::matmul::{M1_CFG, build_matmul_cfg};
+use crate::kernels::fa::{FaConfig, FaMask, build_fa_mw_rdb};
+use crate::kernels::gemm::{M1_CFG, build_matmul_cfg};
 use crate::{ArchCaps, Kernel, kernel_fingerprint};
 use svod_ir::ops;
 
@@ -38,7 +38,7 @@ fn matmul_sink() -> Arc<UOp> {
 /// appends a 5th `[B]` i32 `key_lens` global.
 const FA_DIMS: (usize, usize, usize, usize, usize) = (1, 2, 2, 64, 128); // (b, h, h_kv, d, n)
 
-fn fa_bufs(masked: bool) -> Vec<Arc<UOp>> {
+fn fa_bufs(mask: FaMask) -> Vec<Arc<UOp>> {
     let (b, h, h_kv, d, n) = FA_DIMS;
     let mut bufs = vec![
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h * d, DType::BFloat16),
@@ -46,16 +46,19 @@ fn fa_bufs(masked: bool) -> Vec<Arc<UOp>> {
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h_kv * d, DType::BFloat16),
         UOp::new_buffer(DeviceSpec::Cpu, b * n * h_kv * d, DType::BFloat16),
     ];
-    if masked {
+    if mask.key_lens {
         bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b, DType::Int32)); // key_lens [B], trailing
+    }
+    if mask.seg_start {
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // seg_start [B, N], last
     }
     bufs
 }
 
-fn fa_sink_cfg(causal: bool, masked: bool) -> Arc<UOp> {
+fn fa_sink_cfg(causal: bool, mask: FaMask) -> Arc<UOp> {
     let (b, h, h_kv, d, n) = FA_DIMS;
     let ker =
-        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, fa_bufs(masked), ArchCaps::GFX942);
+        Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, fa_bufs(mask), ArchCaps::GFX942);
     build_fa_mw_rdb(
         &ker,
         b,
@@ -65,29 +68,44 @@ fn fa_sink_cfg(causal: bool, masked: bool) -> Arc<UOp> {
         d,
         FaConfig { q_blk: 16, kv_blk: 16, causal, ..Default::default() },
         DType::BFloat16,
-        masked,
+        mask,
     );
     ker.finish(1)
 }
 
 fn fa_sink() -> Arc<UOp> {
-    fa_sink_cfg(true, false)
+    fa_sink_cfg(true, FaMask::NONE)
 }
 
 // Committed structural golden digests. Update ONLY for an intentional graph change.
-const MATMUL_DIGEST: u128 = 0x0678_fad7_5395_74af_0000_0000_0000_0000;
-const MATMUL_NODES: usize = 536;
-const FA_DIGEST: u128 = 0xcb5c_0c18_143b_2390_0000_0000_0000_0000;
-const FA_NODES: usize = 899;
+//
+// Every digest here last moved in PR #177 for two changes, one commit each,
+// re-baselined WITHOUT a gfx942 run (these are gfx942 builds; the kernels were
+// validated on gfx1151 and sm_86): the LOCAL→REG gather of a Strided operand
+// fragment became `ept / group` unrolled vector reads (the matmul's node count
+// doubles: no gather loops, constant register indices), and the register-staged
+// K/V commit became one fenced store node handed to the gathers' WAR fence (the
+// FA graphs lose the per-commit `After`s and their fences).
+const MATMUL_DIGEST: u128 = 0xbd81_3d05_5b61_250e_0000_0000_0000_0000;
+const MATMUL_NODES: usize = 1208;
+const FA_DIGEST: u128 = 0x85de_2edf_a698_58df_0000_0000_0000_0000;
+const FA_NODES: usize = 808;
+// The FA digests moved again for the packed-row segment mask: the running max
+// starts at the finite f32 floor instead of `-∞` (one constant node per graph).
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
 // `key_lens:Some` branches GPU-free). The FA all-masked-row NaN fix is a key_lens
 // clamp at the kernel ENTRY (a tensor-graph op), so the SINK graph is unchanged.
-// The FA digests last moved when the softmax scale left `Q` for the f32 `QKᵀ`
-// accumulator: the multiply moves inside the KV loop, so each variant gains two nodes.
-const FA_NONCAUSAL_DIGEST: u128 = 0x3af5_5511_a827_0210_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 873;
-const FA_MASKED_DIGEST: u128 = 0x6a06_f161_5833_523c_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 897;
+// Before #177 the FA digests moved when the Q tile lost its f32 staging copy: the
+// gather lands the 16-bit operand dtype straight in registers (the softmax scale
+// already rides on the f32 `QKᵀ` accumulator), so each variant drops those 16 nodes.
+const FA_NONCAUSAL_DIGEST: u128 = 0x6475_0068_12c9_1094_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 782;
+const FA_MASKED_DIGEST: u128 = 0x80ff_e175_34fa_12b5_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 806;
+// Causal + segment-masked (packed rows): the `seg_start:Some` branch, a per-row
+// table read inside the score mask.
+const FA_SEGMENTED_DIGEST: u128 = 0x332c_6e0e_d894_ad5a_0000_0000_0000_0000;
+const FA_SEGMENTED_NODES: usize = 836;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
@@ -114,12 +132,19 @@ fn golden_fa_mw_rdb() {
 
 #[test]
 fn golden_fa_mw_rdb_noncausal() {
-    check("fa_mw_rdb[noncausal]", fa_sink_cfg(false, false), FA_NONCAUSAL_DIGEST, FA_NONCAUSAL_NODES);
+    check("fa_mw_rdb[noncausal]", fa_sink_cfg(false, FaMask::NONE), FA_NONCAUSAL_DIGEST, FA_NONCAUSAL_NODES);
 }
 
 #[test]
 fn golden_fa_mw_rdb_masked() {
-    check("fa_mw_rdb[noncausal,masked]", fa_sink_cfg(false, true), FA_MASKED_DIGEST, FA_MASKED_NODES);
+    let mask = FaMask { key_lens: true, seg_start: false };
+    check("fa_mw_rdb[noncausal,masked]", fa_sink_cfg(false, mask), FA_MASKED_DIGEST, FA_MASKED_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_segmented() {
+    let mask = FaMask { key_lens: false, seg_start: true };
+    check("fa_mw_rdb[causal,segmented]", fa_sink_cfg(true, mask), FA_SEGMENTED_DIGEST, FA_SEGMENTED_NODES);
 }
 
 /// The fingerprint is invariant to the global id counter: building the same kernel

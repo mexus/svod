@@ -319,6 +319,9 @@ fn wmma_ssa_sink(
 #[test_case::test_case(AmdArch::Gfx1201, 16, DType::Float16, 8, DType::Float32, 8, 8,
     &["@llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16(<8 x half>, <8 x half>, <8 x float>)"],
     &[]; "gfx1201 uses llvm overloaded vector suffixes")]
+#[test_case::test_case(AmdArch::Gfx1201, 16, DType::Int8, 8, DType::Int32, 8, 8,
+    &["bitcast <8 x i8>", "to <2 x i32>", "@llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32(i1 true, <2 x i32>", ", i1 true, <2 x i32>", ", <8 x i32>", ", i1 false)"],
+    &[]; "gfx1201 int8 packs eight lanes into two i32 words")]
 #[test_case::test_case(AmdArch::Gfx942, 32, DType::FP8E4M3, 8, DType::Float32, 4, 4,
     &["bitcast <8 x i8>", " to i64", "(i64, i64, <4 x float>, i32, i32, i32)"],
     &[]; "cdna3 fp8 packs eight lanes into one i64")]

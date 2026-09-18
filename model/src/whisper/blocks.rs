@@ -11,20 +11,23 @@ use super::error::Result;
 /// Whisper's linear forward. OpenAI keeps the matmul accumulator *and* the bias
 /// addition in FP32 when activation and weight are both half precision, so the
 /// result rounds exactly once, at the final cast. [`svod_tensor::nn::Layer`]'s
-/// `forward` has no accumulator-dtype knob, so this stays a free function.
+/// `forward` has no accumulator-dtype knob, so this stays a free function. An
+/// fp8 weight takes the same path: its per-channel scale multiplies the f32
+/// accumulator, so the reduce reads the fp8 weight directly and the decode
+/// matvec keeps its fast path.
 pub(crate) fn linear_forward(layer: &Linear, x: &Tensor) -> Result<Tensor> {
     let half = |dtype: &DType| *dtype == DType::Float16 || *dtype == DType::BFloat16;
     let output_dtype = x.dtype();
-    match &layer.bias {
-        Some(bias) if half(&output_dtype) && half(&layer.weight.dtype()) => Ok(x
-            .linear()
-            .weight(&layer.weight)
-            .dtype(DType::Float32)
-            .call()?
-            .try_add(bias.cast(DType::Float32))?
-            .cast(output_dtype)),
-        _ => Ok(x.linear().weight(&layer.weight).maybe_bias(layer.bias.as_ref()).call()?),
+    let weight_dtype = layer.weight.dtype();
+    if !(half(&output_dtype) && (half(&weight_dtype) || weight_dtype.is_fp8())) {
+        return Ok(svod_tensor::nn::Layer::forward(layer, x)?);
     }
+    let product = layer.apply_weight_scale(x.linear().weight(&layer.weight).dtype(DType::Float32).call()?)?;
+    let sum = match &layer.bias {
+        Some(bias) => product.try_add(bias.cast(DType::Float32))?,
+        None => product,
+    };
+    Ok(sum.cast(output_dtype))
 }
 
 /// Sinusoidal positional embeddings matching `whisper.model.sinusoids()`:

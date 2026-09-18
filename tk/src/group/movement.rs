@@ -12,8 +12,11 @@ use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_commit, cp_async_wai
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, wave_offset};
-use crate::index::{Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated};
-use crate::layout::LdmatrixX4;
+use crate::index::{
+    Idx, cidx, flat_index, flat_offset, index_off, index_off_gated, load_at, load_off, load_off_gated, load_off_vec,
+    store_off_vec, vec_elem,
+};
+use crate::layout::{LaneMap, LdmatrixX4};
 use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 use svod_ir::ops;
@@ -88,51 +91,74 @@ impl<'k> Group<'k> {
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let src_i_base = Self::tile_base(st, src, idxs, axis);
 
+        // Unrolled over the passes, so every register index is a constant and the
+        // buffer stays in registers; a lane's `ept` run is one shaped load, which
+        // the late coalescing folds to the widest global access.
         let stage = self.ker.alloc_reg((geom.total_calls * geom.ept) as usize, st.elem().clone());
-        let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
-        let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
-        let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
-
-        let off = iadd(
-            &src_i_base,
-            &iadd(
-                &iadd(&imul(&height, geom.base_rows * row_stride), &imul(&width, geom.base_cols)),
-                &iadd(&imul(&row, row_stride), &col),
-            ),
-        );
-        let mut load = load_off(src.uop(), off);
-        if src.elem() != st.elem() {
-            load = load.cast(st.elem().clone());
-        }
         let stage_shape = [geom.total_calls as usize, geom.ept as usize];
-        let stored = flat_index(&stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)])
-            .store(load)
-            .end(smallvec![outer, inner]);
+        let ept = geom.ept as usize;
+        let mut stores = Vec::with_capacity(stage_shape[0] * ept);
+        for pass in 0..geom.total_calls {
+            let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+            let off = iadd(
+                &src_i_base,
+                &iadd(
+                    &iadd(&imul(&height, geom.base_rows * row_stride), &imul(&width, geom.base_cols)),
+                    &iadd(&imul(&row, row_stride), &col),
+                ),
+            );
+            let run = load_off_vec(src.uop(), &off, ept);
+            for e in 0..ept {
+                let mut v = vec_elem(&run, e, ept);
+                if src.elem() != st.elem() {
+                    v = v.cast(st.elem().clone());
+                }
+                stores.push(flat_index(&stage, &stage_shape, &[Idx::Const(pass), Idx::Const(e as i64)]).store(v));
+            }
+        }
+        let stored = super::group_or_single(stores);
         self.ker.push_store(stored.clone(), stage.clone());
         stage.after(smallvec![stored])
     }
 
-    /// Commit a staged register buffer (from [`Self::stage_global_to_reg`]) into
-    /// the swizzled LDS tile — the VGPR→LDS `ds_write` half of the prefetch.
-    /// Recomputes the identical per-lane addressing. Ends in a workgroup barrier
-    /// when `barrier` (the single-buffer commit); the double-buffered pipeline
-    /// passes `false` and shares one barrier per iteration.
-    pub fn commit_reg_to_local(&self, st: ST, stage: &Arc<UOp>, barrier: bool) -> ST {
-        // The LDS destination geometry is fully determined by the tile shape (the
-        // global tile position only mattered when *staging* into the registers).
-        let geom = self.lds_fill_geom(&st);
-        let outer = self.ker.raw_range(geom.total_calls, AxisType::Loop);
-        let inner = self.ker.raw_range(geom.ept, AxisType::Upcast);
-        let (height, width, row, col) = self.fill_lane_rc(&geom, &outer, &inner);
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+    /// Commit staged register buffers (from [`Self::stage_global_to_reg`]) into
+    /// their swizzled LDS tiles — the VGPR→LDS `ds_write` half of the prefetch —
+    /// as ONE store node, returned for the caller to fence: wrap it in the
+    /// barrier that covers it (the pipeline's per-trip fence, or
+    /// [`Self::commit_reg_to_local`]'s own), never leave it bare. A local store
+    /// the graph does not fence is fenced by the optimizer's implicit-barrier
+    /// pass, once per unfenced edge, so a commit whose fence is elsewhere must
+    /// hand its store to that fence instead of an ordering edge. Recomputes the
+    /// fill's per-lane addressing, unrolled over the passes (constant register
+    /// indices), each lane's run as `ept / group` swizzle-safe vector stores
+    /// ([`lds_group`]).
+    pub fn commit_regs_to_local(&self, commits: &[(&ST, &Arc<UOp>)]) -> Arc<UOp> {
+        let mut stores = Vec::new();
+        for (st, stage) in commits {
+            // The LDS destination geometry is fully determined by the tile shape
+            // (the global tile position only mattered when staging into registers).
+            let geom = self.lds_fill_geom(st);
+            let stage_shape = [geom.total_calls as usize, geom.ept as usize];
+            let group = lds_group(st).min(geom.ept as usize);
+            for pass in 0..geom.total_calls {
+                for g in (0..geom.ept as usize).step_by(group) {
+                    let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(g as i64));
+                    let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+                    let off = st_swizzled_offset(st, height, width, srow, scol);
+                    let vals = (0..group)
+                        .map(|e| load_at(stage, &stage_shape, &[Idx::Const(pass), Idx::Const((g + e) as i64)]));
+                    stores.push(store_off_vec(st.uop(), &off, vals.collect()));
+                }
+            }
+        }
+        super::group_or_single(stores)
+    }
 
-        let stage_shape = [geom.total_calls as usize, geom.ept as usize];
-        let load = load_at(stage, &stage_shape, &[Idx::from(&outer), Idx::from(&inner)]);
-        let stored = st_index(&st, &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)])
-            .store(load)
-            .end(smallvec![outer, inner]);
-        let stored = if barrier { stored.barrier(SmallVec::new()) } else { stored };
-        self.finalize_st(st, stored)
+    /// [`Self::commit_regs_to_local`] for one tile, closed with its own workgroup
+    /// barrier (the single-buffer commit): the tile comes back ordered after it.
+    pub fn commit_reg_to_local(&self, st: ST, stage: &Arc<UOp>) -> ST {
+        let fenced = self.commit_regs_to_local(&[(&st, stage)]).barrier(SmallVec::new());
+        self.finalize_st(st, fenced)
     }
 
     /// Move a register tile `src` out into `dst` (tinygrad `Group.store`), with the
@@ -444,8 +470,8 @@ impl<'k> Group<'k> {
         let row = imod(&row0, base_rows);
         let width = idiv(&col0, base_cols);
 
-        // One shaped scalar-dtype load of the contiguous `vw`-run. The compiler
-        // may coalesce these logical lanes without widening the storage dtype.
+        // One shaped scalar-dtype load of the contiguous `vw`-run: the late
+        // coalescing folds it to one 128-bit access on the LLVM GPU targets.
         let off = iadd(&src_i_base, &iadd(&imul(&row0, row_stride), &col0));
         let src_offsets =
             UOp::stack((0..vw).map(|lane| if lane == 0 { off.clone() } else { iadd(&off, &cidx(lane)) }).collect());
@@ -516,6 +542,9 @@ impl<'k> Group<'k> {
         if let Some(plan) = self.ldmatrix_plan(&rt, st, transpose) {
             return self.ldmatrix_local_to_reg(rt, st, dst_idxs, idxs, plan);
         }
+        if let Some(group) = self.lds_vec_plan(&rt, st, transpose) {
+            return self.vec_local_to_reg(rt, st, dst_idxs, idxs, group);
+        }
         let height = self.ker.raw_range(rt_h, AxisType::Loop);
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
@@ -539,10 +568,65 @@ impl<'k> Group<'k> {
         self.finalize_reg(rt, ended)
     }
 
+    /// The vector-gather plan for the LOCAL→REG hop, when it applies: a fragment
+    /// whose register axis runs along a row (the [`LaneMap::Strided`] operand maps,
+    /// read untransposed — each lane holds a contiguous K run of one row), no
+    /// cast, and a run that divides into swizzle-safe groups ([`lds_group`]), so
+    /// each group is one `ds_read_b64`/`b128` instead of `group` 16-bit reads.
+    fn lds_vec_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<usize> {
+        let group = lds_group(st);
+        (matches!(rt.base.map, LaneMap::Strided { .. })
+            && !transpose
+            && st.elem() == rt.elem()
+            && group > 1
+            && rt.base.base.elements_per_thread().is_multiple_of(group))
+        .then_some(group)
+    }
+
+    /// LOCAL→REG gather as `ept / group` vector reads per fragment: the group's
+    /// first element is swizzled, the rest follow at constant offsets (the swizzle
+    /// permutes whole groups), and every register index is a constant.
+    fn vec_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx], group: usize) -> RT<'k> {
+        let laneid = self.ker.laneid();
+        let ept = rt.base.base.elements_per_thread();
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        let at = |block: Option<&Idx>, frags: i64, i: i64| match block {
+            None => Idx::Const(i),
+            Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), frags), &cidx(i))),
+        };
+        let mut stores = Vec::with_capacity((rt_h * rt_w) as usize * ept);
+        for h in 0..rt_h {
+            for w in 0..rt_w {
+                for g in (0..ept).step_by(group) {
+                    let (row, col) = rt.lane_rc(false, &laneid, &cidx(g as i64));
+                    let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
+                    let off = st_swizzled_offset(
+                        st,
+                        at(idxs.first(), rt_h, h).to_uop(),
+                        at(idxs.get(1), rt_w, w).to_uop(),
+                        srow,
+                        scol,
+                    );
+                    let run = load_off_vec(st.uop(), &off, group);
+                    for e in 0..group {
+                        let mut didx = dst_idxs.to_vec();
+                        didx.extend([Idx::Const(h), Idx::Const(w), Idx::Const((g + e) as i64)]);
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(vec_elem(&run, e, group)));
+                    }
+                }
+            }
+        }
+        let ended = super::group_or_single(stores);
+        self.finalize_reg(rt, ended)
+    }
+
     /// The `ldmatrix.x4` plan for the LOCAL→REG hop, when it applies: a CUDA
     /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a lane
     /// map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4) covers,
-    /// and a swizzle that keeps 16-byte row chunks contiguous.
+    /// and a swizzle that keeps 16-byte row chunks contiguous. The CUDA guard is
+    /// load-bearing: gfx12's fragment passes the shape test too, and only its
+    /// strided map having no `ldmatrix` form would otherwise keep it out.
     fn ldmatrix_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<LdmatrixX4> {
         let base = &rt.base.base;
         (self.ker.caps.cuda().is_some()
@@ -671,39 +755,49 @@ impl<'k> Group<'k> {
         let src_i_base = flat_offset(src.shape(), &idxs_t);
 
         let laneid = self.ker.laneid();
-        let height = self.ker.raw_range(s3, AxisType::Loop);
-        let width = self.ker.raw_range(s2, AxisType::Loop);
-        let inner = self.ker.raw_range(ept, AxisType::Loop);
-
-        let base_row = imul(&height, base_rows);
-        let base_col = imul(&width, base_cols);
-        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
-        let srow = iadd(&base_row, &row);
-        let scol = iadd(&base_col, &col);
-        let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
-
-        let gate = masked
-            .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
-            .flatten();
-        let mut load = match gate {
-            Some(g) => {
-                let zero = if src.elem().is_float() { ConstValue::Float(0.0) } else { ConstValue::Int(0) };
-                load_off_gated(src.uop(), off, g, UOp::const_(src.elem().clone(), zero))
+        let transpose = rt.layout == TileLayout::Col;
+        let ended = self.elementwise(&[s3 as usize, s2 as usize, ept as usize], |ix| {
+            let (row, col) = rt.lane_rc(transpose, &laneid, &ix[2].to_uop());
+            let srow = iadd(&imul(&ix[0].to_uop(), base_rows), &row);
+            let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
+            let off = iadd(&src_i_base, &iadd(&imul(&srow, row_stride), &scol));
+            let gate = masked
+                .then(|| self.boundary_gate(src.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .flatten();
+            let mut load = match gate {
+                Some(g) => {
+                    let zero = if src.elem().is_float() { ConstValue::Float(0.0) } else { ConstValue::Int(0) };
+                    load_off_gated(src.uop(), off, g, UOp::const_(src.elem().clone(), zero))
+                }
+                None => load_off(src.uop(), off),
+            };
+            if src.elem() != rt.elem() {
+                load = load.cast(rt.elem().clone());
             }
-            None => load_off(src.uop(), off),
-        };
-        if src.elem() != rt.elem() {
-            load = load.cast(rt.elem().clone());
-        }
-        let mut didx: Vec<Idx> = dst_idxs.to_vec();
-        didx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
-        let ended = flat_index(rt.uop(), rt.shape(), &didx).store(load).end(smallvec![height, width, inner]);
+            let mut didx: Vec<Idx> = dst_idxs.to_vec();
+            didx.extend(ix.iter().cloned());
+            flat_index(rt.uop(), rt.shape(), &didx).store(load)
+        });
         self.finalize_reg(rt, ended)
     }
 
     /// REG→LOCAL fragment scatter: each lane writes its register fragment into
     /// the (swizzled) LDS tile (the layout-transpose hop before write-back).
     pub(super) fn store_reg_to_local(&self, st: ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> ST {
+        let ended = self.scatter_reg_to_local(&st, rt, idxs, src_idxs);
+        self.finalize_st(st, ended)
+    }
+
+    /// [`Self::store`]'s REG→LOCAL hop closed with a workgroup barrier carrying
+    /// `deps`, so the tile a whole workgroup then reads back (the RDNA softmax
+    /// relayout band) is fenced once, by this store, and the implicit-barrier
+    /// pass has no bare local store to fence again.
+    pub fn store_local_fenced(&self, st: ST, rt: &RT<'k>, ix: MoveIdx, deps: SmallVec<[Arc<UOp>; 4]>) -> ST {
+        let fenced = self.scatter_reg_to_local(&st, rt, &ix.block, &ix.frag).barrier(deps);
+        self.finalize_st(st, fenced)
+    }
+
+    fn scatter_reg_to_local(&self, st: &ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> Arc<UOp> {
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
@@ -725,8 +819,7 @@ impl<'k> Group<'k> {
         let h_idx = wave_offset(idxs.first(), rt_h, &height);
         let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
-        let ended = st_index(&st, &didx).store(load).end(smallvec![height, width, inner]);
-        self.finalize_st(st, ended)
+        st_index(st, &didx).store(load).end(smallvec![height, width, inner])
     }
 
     /// REG→GLOBAL write-back: each lane writes its register fragment to the
@@ -740,6 +833,41 @@ impl<'k> Group<'k> {
         axis: usize,
         masked: bool,
     ) -> GL {
+        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, |v, _| v.clone())
+    }
+
+    /// [`Self::store`]'s REG→GLOBAL hop with a per-element **value transform**:
+    /// `value` receives the register element (already cast to the destination
+    /// dtype) and the flat global element offset the store is about to write, and
+    /// returns what is actually stored. An epilogue that reads a second tensor at
+    /// the store's own position — the GEMM's residual add — folds into this pass
+    /// instead of running its own over the register tile, which would round-trip
+    /// the tile through a second loop nest and spill it (measured: 8 B/lane of
+    /// scratch and −5% on the `[4096, 3072]·[1024, 3072]ᵀ` down-projection).
+    ///
+    /// # Panics
+    /// As [`Self::store`]: `ix.axis` must be in range for `dst`'s rank.
+    pub fn store_global_with<F>(&self, dst: GL, rt: &RT<'k>, ix: MoveIdx, value: F) -> GL
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_reg_to_global_with<F>(
+        &self,
+        dst: GL,
+        rt: &RT<'k>,
+        idxs: &[Idx],
+        src_idxs: &[Idx],
+        axis: usize,
+        masked: bool,
+        value: F,
+    ) -> GL
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
         let row_stride: i64 = dst.shape()[axis + 1..].iter().product::<usize>() as i64;
         let base_rows = rt.base.base.rows as i64;
         let base_cols = rt.base.base.cols as i64;
@@ -765,33 +893,50 @@ impl<'k> Group<'k> {
         let dst_i_base = flat_offset(dst.shape(), &idxs_t);
 
         let laneid = self.ker.laneid();
-        let height = self.ker.raw_range(s3, AxisType::Loop);
-        let width = self.ker.raw_range(s2, AxisType::Loop);
-        let inner = self.ker.raw_range(ept, AxisType::Loop);
+        let transpose = rt.layout == TileLayout::Col;
+        let ended = self.elementwise(&[s3 as usize, s2 as usize, ept as usize], |ix| {
+            let (row, col) = rt.lane_rc(transpose, &laneid, &ix[2].to_uop());
+            let srow = iadd(&imul(&ix[0].to_uop(), base_rows), &row);
+            let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
+            let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
 
-        let base_row = imul(&height, base_rows);
-        let base_col = imul(&width, base_cols);
-        let (row, col) = rt.lane_rc(rt.layout == TileLayout::Col, &laneid, &inner);
-        let srow = iadd(&base_row, &row);
-        let scol = iadd(&base_col, &col);
-        let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
-
-        let mut sidx: Vec<Idx> = src_idxs.to_vec();
-        sidx.extend([Idx::from(&height), Idx::from(&width), Idx::from(&inner)]);
-        let mut load = load_at(rt.uop(), rt.shape(), &sidx);
-        if rt.elem() != dst.elem() {
-            load = load.cast(dst.elem().clone());
-        }
-        let gate = masked
-            .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
-            .flatten();
-        let target = match gate {
-            Some(g) => index_off_gated(dst.uop(), off, g),
-            None => index_off(dst.uop(), off),
-        };
-        let ended = target.store(load).end(smallvec![height, width, inner]);
+            let mut sidx: Vec<Idx> = src_idxs.to_vec();
+            sidx.extend(ix.iter().cloned());
+            let mut load = load_at(rt.uop(), rt.shape(), &sidx);
+            if rt.elem() != dst.elem() {
+                load = load.cast(dst.elem().clone());
+            }
+            let load = value(&load, &off);
+            let gate = masked
+                .then(|| self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol))
+                .flatten();
+            let target = match gate {
+                Some(g) => index_off_gated(dst.uop(), off, g),
+                None => index_off(dst.uop(), off),
+            };
+            target.store(load)
+        });
         self.finalize_gl(dst, ended)
     }
+}
+
+/// Elements per swizzle-safe LDS group of `st`: the XOR swizzles permute at
+/// 8-byte granularity (`st.cuh:96` `<< 3`), the chunk swizzle and the identity at
+/// 16, so a run of that many consecutive elements stays one contiguous access
+/// under the swizzle.
+fn lds_group(st: &ST) -> usize {
+    let bytes = if st.base.swizzle.keeps_16b_chunks() { 16 } else { 8 };
+    bytes / st.elem().base().bytes()
+}
+
+/// The flat LDS element offset of swizzled `(height, width, srow, scol)` in `st`,
+/// honoring the double-buffer parity [`ST::base_offset`].
+fn st_swizzled_offset(st: &ST, height: Arc<UOp>, width: Arc<UOp>, srow: Arc<UOp>, scol: Arc<UOp>) -> Arc<UOp> {
+    let mut off = flat_offset(st.shape(), &[Idx::Uop(height), Idx::Uop(width), Idx::Uop(srow), Idx::Uop(scol)]);
+    if let Some(bo) = st.base_offset() {
+        off = off.try_add(bo).expect("swizzled offset: parity base offset add");
+    }
+    off
 }
 
 /// ST flat INDEX honoring the optional double-buffer parity [`ST::base_offset`].

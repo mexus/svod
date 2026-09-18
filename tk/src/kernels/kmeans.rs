@@ -60,11 +60,10 @@ const BLK: usize = 16;
 /// holds ~176 VGPR → 50% occ and runs ~1.7× faster despite the extra passes.
 const TM: usize = 16;
 
-/// The GPU arch(es) this kernel targets (gfx942 CDNA3 wave64 + gfx1151 RDNA3.5
-/// wave32). The launcher gates against this list.
-/// Validated on gfx942 (CDNA3) and gfx1151 (RDNA3.5).
-pub const KMEANS_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151]);
+/// The GPU arch(es) this kernel targets (gfx942 CDNA3 wave64 + the wave32 RDNA
+/// parts). The launcher gates against this list.
+/// Validated on gfx942 (CDNA3), gfx1151 (RDNA3.5) and gfx1201 (RDNA4).
+pub const KMEANS_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(crate::target::CDNA_RDNA_WMMA);
 
 const POS_INF: f64 = f64::INFINITY;
 

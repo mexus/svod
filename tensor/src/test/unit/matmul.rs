@@ -477,11 +477,14 @@ fn fused_matmul_kernel_ast(
 
 /// `decompose_with` carries the renderer's dtype decompositor — FP8 emulation
 /// needs it, native tensor-core paths must run without it.
+/// The optimizer renderer as the AMD runtime wires it: the target's
+/// decompositions plus the AMD extra matcher, which widens non-native fp8
+/// casts through f32 for the `v_cvt_*_fp8` path.
 fn amd_optimizer(arch: AmdArch, decompose_with: Option<&svod_codegen::llvm::LlvmTextRenderer>) -> OptimizerRenderer {
     OptimizerRenderer::for_amd_arch(arch).with_rewrite_capabilities(
         svod_ir::RendererOps::all(),
         decompose_with.and_then(svod_codegen::traits::Renderer::decompositor),
-        None,
+        Some(svod_codegen::llvm::amd_extra_matcher()),
     )
 }
 
@@ -512,46 +515,53 @@ fn render_amd(optimized: Arc<UOp>, arch: AmdArch, name: &str) -> (Arc<UOp>, svod
     (linear, rendered)
 }
 
-/// RDNA4 follows Tinygrad 8c8b43de's tensor-core table: FP8 storage is emulated
-/// as bytes, arithmetic is widened to f16, and the matmul uses the f16→f32
-/// gfx12 WMMA.
-#[test]
-fn test_matmul_fp8_gfx1201_decomposes_to_f16_wmma_compile_only() {
+/// RDNA4 has no FP8 matrix core, so an FP8 matmul takes the f16→f32 gfx12
+/// WMMA either way; the operands differ. OCP FP8 is stored as such and widened
+/// by the `v_cvt_f32_fp8` family, while the FNUZ encodings are emulated as
+/// bytes with the arithmetic widened to f16.
+#[test_case(DType::FP8E4M3, true, "llvm.amdgcn.cvt.f32.fp8"; "e4m3 converts natively")]
+#[test_case(DType::FP8E5M2, true, "llvm.amdgcn.cvt.f32.bf8"; "e5m2 converts natively")]
+#[test_case(DType::FP8E4M3FNUZ, false, ""; "e4m3fnuz decomposes")]
+#[test_case(DType::FP8E5M2FNUZ, false, ""; "e5m2fnuz decomposes")]
+fn test_matmul_fp8_gfx1201_uses_f16_wmma_compile_only(dtype: DType, native: bool, convert: &str) {
     use svod_dtype::ScalarDType;
 
-    for dtype in [DType::FP8E4M3, DType::FP8E5M2, DType::FP8E4M3FNUZ, DType::FP8E5M2FNUZ] {
-        let ast = matmul_kernel_ast(&[16, 16], &[16, 16], dtype.clone(), DType::Float32);
-        let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1201);
-        let optimized = optimize_kernel_with_config(
-            ast,
-            &amd_optimizer(AmdArch::Gfx1201, Some(&renderer)),
-            &pinned_tc_config(0, TcOptLevel::Strict),
-        )
-        .expect("gfx1201 FP8 decomposition and TC optimization");
+    let ast = matmul_kernel_ast(&[16, 16], &[16, 16], dtype.clone(), DType::Float32);
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1201);
+    let optimized = optimize_kernel_with_config(
+        ast,
+        &amd_optimizer(AmdArch::Gfx1201, Some(&renderer)),
+        &pinned_tc_config(0, TcOptLevel::Strict),
+    )
+    .expect("gfx1201 FP8 TC optimization");
 
-        let nodes = optimized.toposort();
-        let Op::Wmma(ops::Wmma { metadata: wmma, .. }) = find_wmma(&nodes).op() else { unreachable!() };
-        assert_eq!((wmma.dtype_in.clone(), wmma.dtype_out.clone()), (DType::Float16, DType::Float32));
-        assert_eq!((wmma.device, wmma.threads), (RendererDevice::AmdRdna4, 32));
-        assert!(
-            !nodes.iter().any(|u| u.dtype().base() == dtype.base()),
-            "{dtype:?} arithmetic must be fully decomposed"
-        );
-        assert!(
-            nodes
-                .iter()
-                .any(|u| matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.dtype.base() == ScalarDType::UInt8)),
-            "{dtype:?} storage must remain byte-addressed"
-        );
-
-        let (_, rendered) = render_amd(optimized, AmdArch::Gfx1201, "matmul_fp8_gfx1201");
-        assert!(
-            rendered.code.contains("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16"),
-            "{dtype:?} must select gfx12 f16 WMMA"
-        );
-        assert!(!rendered.code.contains("16x16x16.fp8"), "{dtype:?} must not claim native FP8 WMMA");
-        assert!(!rendered.code.contains("16x16x16.bf8"), "{dtype:?} must not alias E5M2 to native BF8 WMMA");
+    let nodes = optimized.toposort();
+    let Op::Wmma(ops::Wmma { metadata: wmma, .. }) = find_wmma(&nodes).op() else { unreachable!() };
+    assert_eq!((wmma.dtype_in.clone(), wmma.dtype_out.clone()), (DType::Float16, DType::Float32));
+    assert_eq!((wmma.device, wmma.threads), (RendererDevice::AmdRdna4, 32));
+    let storage = |scalar: ScalarDType| {
+        nodes.iter().any(|u| matches!(u.op(), Op::Param(ops::Param { arg, .. }) if arg.dtype.base() == scalar))
+    };
+    if native {
+        assert!(storage(dtype.base()), "{dtype:?} storage must stay fp8");
+    } else {
+        assert!(!nodes.iter().any(|u| u.dtype().base() == dtype.base()), "{dtype:?} arithmetic must be decomposed");
+        assert!(storage(ScalarDType::UInt8), "{dtype:?} storage must remain byte-addressed");
     }
+
+    let (_, rendered) = render_amd(optimized, AmdArch::Gfx1201, "matmul_fp8_gfx1201");
+    assert!(
+        rendered.code.contains("llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16"),
+        "{dtype:?} must select gfx12 f16 WMMA"
+    );
+    let converts =
+        ["llvm.amdgcn.cvt.f32.fp8", "llvm.amdgcn.cvt.f32.bf8"].iter().any(|name| rendered.code.contains(name));
+    assert_eq!(converts, native, "{dtype:?} conversion path");
+    if native {
+        assert!(rendered.code.contains(convert), "{dtype:?} must widen through {convert}");
+    }
+    assert!(!rendered.code.contains("16x16x16.fp8"), "{dtype:?} must not claim native FP8 WMMA");
+    assert!(!rendered.code.contains("16x16x16.bf8"), "{dtype:?} must not alias E5M2 to native BF8 WMMA");
 }
 
 /// Native AMD tensor-core selection, compile-only: the pinned tensor core is
@@ -668,6 +678,12 @@ struct AFragment {
     alt: Arc<UOp>,
 }
 
+/// Lanes per pinned A access: one 16-byte bf16 access, the widest fold the late
+/// coalescing makes on the LLVM GPU targets.
+const A_LANES: usize = 8;
+/// Shaped A loads per 16-wide fragment row.
+const A_LOADS: usize = 16 / A_LANES;
+
 /// The memory fragments of a padded WMMA kernel, collected from either the
 /// optimized graph or the linearized op list — both must describe the same
 /// bytes, so `assert_padded_5x16` runs against each.
@@ -704,12 +720,12 @@ impl Fragments {
                             .iter()
                             .filter_map(|extent| extent.as_const())
                             .collect::<Vec<_>>();
-                        assert_eq!(shape, [4]);
-                        assert_eq!(eval_lane(sizes, 0), 4, "each pinned A access must contain four shaped lanes");
+                        assert_eq!(shape, [A_LANES]);
+                        assert_eq!(eval_lane(sizes, 0), A_LANES as i64, "each pinned A access is one 16-byte run");
                         let alt = alt.as_ref().expect("padded A loads require a shaped zero alternative");
                         let gate = gate.as_ref().expect("padded A loads require a validity gate");
                         assert!(
-                            is_zero_stack(alt, 4),
+                            is_zero_stack(alt, A_LANES),
                             "every invalid padded A lane must contribute zero: {}",
                             alt.tree()
                         );
@@ -754,11 +770,11 @@ impl Fragments {
     /// A 5x16 operand padded into a 16x16 tile: A[0..80] and C[0..80] are real,
     /// A[80..256] and C[80..96] are the padded tails the gates must disable.
     fn assert_padded_5x16(&self, stage: &str) {
-        assert_eq!(self.a.len(), 4, "{stage}: padded WMMA A fragment must contain four shaped loads");
+        assert_eq!(self.a.len(), A_LOADS, "{stage}: padded WMMA A fragment must contain {A_LOADS} shaped loads");
         let (mut loaded_a, mut padded_a) = (BTreeSet::new(), BTreeSet::new());
         for AFragment { offsets, gate, .. } in &self.a {
             for lane in 0..32 {
-                for shaped_lane in 0..4 {
+                for shaped_lane in 0..A_LANES as i64 {
                     let index = eval_lane(offsets, lane) + shaped_lane;
                     assert!((0..256).contains(&index), "{stage}: raw padded A index escaped the 16x16 tile");
                     if eval_gate(gate, lane) {
@@ -820,7 +836,7 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
     let optimized = optimize_kernel_with_config(
         ast,
         &amd_optimizer(AmdArch::Gfx1151, None),
-        &pinned_tc_config(0, TcOptLevel::Padded),
+        &pinned_tc_config(0, TcOptLevel::Unbounded),
     )
     .expect("gfx1151 padded tensor-core optimization");
 
@@ -898,8 +914,9 @@ fn test_matmul_m5_gfx1151_padded_wmma_compile_only() {
             index_render.lines
         );
         assert!(load_render.lines.iter().any(|line| line.contains("br i1") && line.contains(&gate_name)));
-        assert!(load_render.lines.iter().any(|line| line.contains("load <4 x half>") && line.contains(&address_name)));
-        assert!(load_render.lines.iter().any(|line| line.contains("phi <4 x half>") && line.contains(&alt_name)));
+        let (load_ty, phi_ty) = (format!("load <{A_LANES} x half>"), format!("phi <{A_LANES} x half>"));
+        assert!(load_render.lines.iter().any(|line| line.contains(&load_ty) && line.contains(&address_name)));
+        assert!(load_render.lines.iter().any(|line| line.contains(&phi_ty) && line.contains(&alt_name)));
         assert_eq!(
             load_render.source_ids,
             vec![index.id, alt.id, gate.id],

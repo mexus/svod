@@ -12,6 +12,8 @@
 //! with the copy in flight under the current block's compute on CUDA sm_80+, where
 //! the LDS→register gathers are `ldmatrix.x4` (see [`crate::Group::load`]).
 
+use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use smallvec::smallvec;
@@ -65,14 +67,17 @@ fn iconst(v: i64) -> Arc<UOp> {
 }
 
 /// The GPU arch(es) the **production graph** flash-attention ([`flash_attention_with`]
-/// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), gfx1151
-/// (RDNA3.5 WMMA, wave32), CUDA sm_80+ (`mma.sync`, warp32) and Apple7+
+/// → [`build_fa_mw_rdb`]) is enabled for: gfx942 (CDNA MFMA, wave64), the wave32
+/// RDNA parts (gfx1151 gfx11 WMMA, gfx1200/gfx1201 RDNA4 WMMA), CUDA sm_80+
+/// (`mma.sync`, warp32) and Apple7+
 /// (`simdgroup_matrix`, SIMD-group 32). The launcher gates
 /// against this list; generic launch infrastructure stays architecture-agnostic.
-pub const FA_SUPPORTED_ARCHS: crate::ArchSet =
-    crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx942, svod_dtype::AmdArch::Gfx1151])
-        .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
-        .with_metal_from(svod_dtype::MetalFamily::Apple(7));
+/// gfx942 was validated on hardware before the vector LDS gathers and the single
+/// fenced K/V commit (PR #177) and has not been re-run since; its golden graph
+/// digests were re-baselined for those two changes without it.
+pub const FA_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(crate::target::CDNA_RDNA_WMMA)
+    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0))
+    .with_metal_from(svod_dtype::MetalFamily::Apple(7));
 
 /// Whether `device` can run the production graph flash-attention kernel.
 /// Uses the same architecture and toolchain gate as [`crate::launch_custom`].
@@ -90,11 +95,11 @@ fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
 }
 
 /// Tuning knobs for [`build_fa_mw_rdb`] — the structured replacement for its former
-/// positional `bool`/tile args (mirrors [`crate::kernels::matmul::MatmulCfg`]).
+/// positional `bool`/tile args (mirrors [`crate::kernels::gemm::MatmulCfg`]).
 /// [`Default`] is the production baseline: `{16,16}` per-warp tile, rolled (looped)
 /// causal compute. The shape (`b,n,h,h_kv,d`) stays a positional arg since it's
 /// derived from the input tensors, not a tuning choice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaConfig {
     /// Per-warp Q-tile height (a multiple of the WMMA edge `16`). A value not a
     /// multiple of 16 panics the builder (the divisibility assert).
@@ -112,6 +117,25 @@ pub struct FaConfig {
 impl Default for FaConfig {
     fn default() -> Self {
         Self { q_blk: Q_BLK, kv_blk: KV_BLK, unroll: false, causal: true }
+    }
+}
+
+/// The optional score masks a build binds, each a trailing global after
+/// `o, q, k, v` in this order: the `[B]` valid-key counts of
+/// [`FaOpts::key_lens`], then the `[B, N]` segment starts of
+/// [`FaOpts::seg_start`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaMask {
+    pub key_lens: bool,
+    pub seg_start: bool,
+}
+
+impl FaMask {
+    pub const NONE: Self = Self { key_lens: false, seg_start: false };
+
+    /// The masks as a bit set, the tune key's shape component.
+    pub const fn code(self) -> usize {
+        self.key_lens as usize | (self.seg_start as usize) << 1
     }
 }
 
@@ -133,11 +157,12 @@ struct FaScratch<'k> {
     att: RT<'k>,
     att_mma: RT<'k>,
     max_vec_last: RV<'k>,
-    /// RDNA-only per-warp LDS scratch (`[NUM_WARPS·kv_blk, q_blk]`) for the
-    /// `att → att_mma` accumulator→input relayout. `None` on gfx942, where the
-    /// accumulator and WMMA-input fragment layouts coincide so a register `copy`
-    /// suffices; `Some` on gfx11, where they differ and the relayout must round-trip
-    /// through LDS (store the even/odd accumulator, reload as the replicated input).
+    /// Per-warp LDS scratch (`[NUM_WARPS·kv_blk, q_blk]`) for the
+    /// `att → att_mma` accumulator→input relayout. `None` wherever
+    /// [`ArchCaps::acc_reusable_as_input`](crate::ArchCaps::acc_reusable_as_input)
+    /// holds (gfx942, CUDA, Metal) so a register `copy` suffices; `Some` on RDNA,
+    /// where the relayout must round-trip through LDS — on gfx11 because the even/odd
+    /// accumulator and the replicated input genuinely differ.
     att_smem: Option<ST>,
 }
 
@@ -153,6 +178,8 @@ struct FaCtx<'a, 'k> {
     warpid: &'a Arc<UOp>,
     causal: bool,
     valid_len: Option<Arc<UOp>>,
+    /// The `[B, N]` segment-start table and the batch index it is read at.
+    seg_start: Option<(crate::tile::GL, Arc<UOp>)>,
     /// `log2(e)/sqrt(d)` — the softmax scale, folded with the `exp2` base change.
     /// Applied to the f32 `QKᵀ` accumulator rather than to `Q`: scaling `Q` costs a
     /// second rounding to the 16-bit mma input dtype, and that error enters the
@@ -162,13 +189,14 @@ struct FaCtx<'a, 'k> {
     score_scale: f64,
 }
 
-/// Apply the FA score-mask (causal + optional padding) to the `att` tile. The
-/// causal mask zeros (via `−∞`) keys ahead of this warp's own query rows
-/// (`kv_pos > q_pos`); the padding mask zeros keys at/after the per-batch
-/// valid length (`kv_pos >= valid_len`). With neither, the tile is returned
-/// unchanged (the early-return avoids emitting any mask IR when masking is off).
-/// The per-element `(kv_pos, q_pos)` is computed arch-correctly inside
-/// [`Group::mask_where`].
+/// Apply the FA score-mask (causal + optional padding + optional segments) to
+/// the `att` tile. The causal mask zeros (via `−∞`) keys ahead of this warp's
+/// own query rows (`kv_pos > q_pos`); the padding mask zeros keys at/after the
+/// per-batch valid length (`kv_pos >= valid_len`); the segment mask zeros keys
+/// before the query's own segment (`kv_pos < seg_start[batch, q_pos]`). With
+/// none, the tile is returned unchanged (the early-return avoids emitting any
+/// mask IR when masking is off). The per-element `(kv_pos, q_pos)` is computed
+/// arch-correctly inside [`Group::mask_where`].
 fn score_mask<'k>(
     warp: &Group<'k>,
     att: RT<'k>,
@@ -176,8 +204,9 @@ fn score_mask<'k>(
     q_blk: &Arc<UOp>,
     causal: bool,
     valid_len: Option<&Arc<UOp>>,
+    seg_start: Option<&(crate::tile::GL, Arc<UOp>)>,
 ) -> RT<'k> {
-    if !causal && valid_len.is_none() {
+    if !causal && valid_len.is_none() && seg_start.is_none() {
         return att;
     }
     let row_blk = Idx::Uop(slice_idx.clone());
@@ -187,8 +216,15 @@ fn score_mask<'k>(
     } else {
         att
     };
-    if let Some(vl) = valid_len {
-        warp.mask_where(att, row_blk, col_blk, f64::NEG_INFINITY, move |kv_pos, _| kv_pos.ge(vl))
+    let att = if let Some(vl) = valid_len {
+        warp.mask_where(att, row_blk.clone(), col_blk.clone(), f64::NEG_INFINITY, move |kv_pos, _| kv_pos.ge(vl))
+    } else {
+        att
+    };
+    if let Some((table, batch)) = seg_start {
+        warp.mask_where(att, row_blk, col_blk, f64::NEG_INFINITY, move |kv_pos, q_pos| {
+            kv_pos.lt(&load_at(table.uop(), table.shape(), &[Idx::from(batch), Idx::from(q_pos)]))
+        })
     } else {
         att
     }
@@ -234,7 +270,7 @@ fn fa_qk<'k>(
     // Scale in f32, on the accumulator — see `FaCtx::score_scale`.
     let att = att * ctx.score_scale;
 
-    let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref());
+    let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref(), ctx.seg_start.as_ref());
     (att, v_reg)
 }
 
@@ -279,9 +315,9 @@ fn fa_softmax_pv<'k>(
     // fragments share a layout, so a register `copy` (with the f32→in-dtype cast)
     // suffices. On gfx11 they differ (even/odd `<8×f32>` acc vs replicated `<16×in>`
     // input), so a register copy is wrong — round-trip through this warp's LDS band:
-    // store the even/odd accumulator (matrix `(kv,q)` order), barrier, reload with
-    // the replicated-input map (`K=kv=element`, `N=q=lane%16`). Both lane maps are
-    // the matmul-validated ones, so the relayout is correct by construction.
+    // store the accumulator (matrix `(kv,q)` order), barrier, reload under the input
+    // map (on gfx11 `K=kv=element`, `N=q=lane%16`). Both lane maps are the
+    // matmul-validated ones, so the relayout is correct by construction.
     let att_mma = match att_smem {
         None => warp.copy(att_mma.after((lp.index(), &norm_vec)), &att),
         Some(att_smem) => {
@@ -292,9 +328,8 @@ fn fa_softmax_pv<'k>(
             let an = att.shape().len();
             let dims = (att.shape()[an - 3] * att.base.base.rows, att.shape()[an - 2] * att.base.base.cols);
             let band = att_smem.subtile(dims, (ctx.warpid.clone(), 0));
-            let stored = warp.store(band, att, MoveIdx::default());
-            let bar = stored.uop().barrier(smallvec![lp.index().clone(), norm_vec.uop().clone()]);
-            let stored = stored.rewrap(stored.uop().after(smallvec![bar]));
+            let deps = smallvec![lp.index().clone(), norm_vec.uop().clone()];
+            let stored = warp.store_local_fenced(band, &att, MoveIdx::default(), deps);
             warp.load(att_mma, stored, MoveIdx::default())
         }
     };
@@ -334,7 +369,7 @@ pub(crate) fn build_fa_mw_rdb(
     d: usize,
     cfg: FaConfig,
     in_dtype: DType,
-    masked: bool,
+    mask: FaMask,
 ) {
     let FaConfig { q_blk: q_blk_rows, kv_blk: kv_blk_rows, unroll, causal, .. } = cfg;
     // Flat compute (unrolled QKᵀ/softmax/A·V) is the prerequisite for the Stage-2
@@ -368,10 +403,13 @@ pub(crate) fn build_fa_mw_rdb(
     // never interleaved) so the ABI slot order stays stable; only bound when `masked`.
     // The scalar `lens[batch]` is already int32, matching the concrete SPECIAL
     // position arithmetic.
-    let valid_len = masked.then(|| {
+    let valid_len = mask.key_lens.then(|| {
         let lens = ker.gl(&[b], DType::Int32);
         load_at(lens.uop(), lens.shape(), &[Idx::from(&ker.block_idx[2])])
     });
+    // The `[B, N]` segment starts, bound after `lens`; read per query row inside
+    // the score mask at this workgroup's batch.
+    let seg_start = mask.seg_start.then(|| (ker.gl(&[b, n], DType::Int32), ker.block_idx[2].clone()));
 
     let head = ker.grid_x();
     let head_kv = head.floor_div(&iconst(group_size));
@@ -381,7 +419,6 @@ pub(crate) fn build_fa_mw_rdb(
     let q_blk = block_q_base.mul(&iconst(NUM_WARPS as i64)).add(&warpid);
 
     let in_dt = in_dtype.clone();
-    let f32 = DType::Float32;
     let (row, col) = (TileLayout::Row, TileLayout::Col);
 
     // Tiles below are declared by ROLE via the scaffold shortcuts (`ker.acc`/`operand`/
@@ -402,7 +439,6 @@ pub(crate) fn build_fa_mw_rdb(
     // Q feeds the B operand of the QKᵀ mma (K feeds A, V feeds A of the PV mma), so
     // its gather takes the B-position fragment map — a no-op off Metal, where A and B
     // share one fragment; see `FragRole::Operand`.
-    let q_reg_fl = ker.operand_b((q_blk_rows, d), f32, row);
     let q_reg = ker.operand_b((q_blk_rows, d), in_dt.clone(), row);
     let q_reg_t = ker.operand_b((d, q_blk_rows), in_dt.clone(), col);
     let o_reg_t = ker.acc_t((q_blk_rows, d), row);
@@ -424,13 +460,20 @@ pub(crate) fn build_fa_mw_rdb(
     let o_reg = ker.acc((d, q_blk_rows), col);
     let max_vec = ker.acc_vec(q_blk_rows);
     let norm_vec = ker.acc_vec(q_blk_rows);
-    let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
+    // The running max starts at the finite floor, not `-∞`: a KV block the
+    // masks hide entirely from a query row (a packed row's earlier segments)
+    // leaves the max where it was, and the rescale `exp2(prev - new)` needs a
+    // finite `prev` to be `1`, not `-∞ - (-∞) = NaN`. Against real scores the
+    // floor rescales to `exp2(-3.4e38) = 0` exactly as `-∞` did.
+    let max_floor = warp.clear_rv(max_vec, f64::from(f32::MIN));
+    let acc = FaAcc { max_vec: max_floor, norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
 
-    // Load this warp's Q tile, then transpose for the QKᵀ contraction. The softmax
-    // scale rides on the f32 accumulator instead (`FaCtx::score_scale`), so this
-    // cast round-trips the stored 16-bit value exactly.
-    let q_reg_fl = warp.load(q_reg_fl, q, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
-    let q_reg = warp.copy(q_reg, &q_reg_fl);
+    // Load this warp's Q tile, then transpose for the QKᵀ contraction. The gather
+    // lands the 16-bit operand dtype straight in registers: the softmax scale rides
+    // on the f32 accumulator instead (`FaCtx::score_scale`), so there is nothing to
+    // scale here and an f32 staging tile would only cast the stored value out and
+    // back (64 spare f32 registers per lane for a round trip).
+    let q_reg = warp.load(q_reg, q, MoveIdx::block((batch.clone(), q_blk.clone(), head.clone(), 0), 1));
     let q_reg_t = warp.transpose(q_reg_t, &q_reg);
 
     // Total KV super-blocks (the full bidirectional sweep). With `causal`, the
@@ -459,7 +502,9 @@ pub(crate) fn build_fa_mw_rdb(
     } else {
         let s0_k = g.stage_global_to_reg(&k_smem, &k, &p_kidx, 1);
         let s0_v = g.stage_global_to_reg(&v_smem, &v, &p_kidx, 1);
-        (g.commit_reg_to_local(k_smem, &s0_k, true), g.commit_reg_to_local(v_smem, &s0_v, true))
+        let landed = g.commit_regs_to_local(&[(&k_smem, &s0_k), (&v_smem, &s0_v)]).barrier(smallvec![]);
+        ker.push_store(landed.clone(), k_smem.uop().clone());
+        (k_smem.after(&landed), v_smem.after(&landed))
     };
 
     // Rolled KV loop. `kv_bound` (the dynamic per-q-block causal trip count) is the
@@ -469,6 +514,12 @@ pub(crate) fn build_fa_mw_rdb(
     // — a `WHERE` in the prefetch-address path is mis-ordered past its address-MUL
     // consumer in this kernel's linearization, leaving the renderer without its SSA
     // value; FloorMod (like the parity) lowers and orders cleanly.
+    //
+    // ONE tracked loop: splitting the causal sweep into an unmasked phase plus a
+    // masked diagonal phase (which would lift the mask off ~60% of the trips, worth
+    // ~3% here) needs two tracked ranges in one kernel, and the kernel-graph former
+    // then declines to wrap the body as an opaque CALL (its terminal `END(STORE)`
+    // lands in the outer graph and fails `spec_kernel_graph`). Measured, not assumed.
     let lp = ker.loop_dynamic(kv_bound);
     let kv_idx = lp.index().clone();
     let kvp1 = kv_idx.add(&iconst(1));
@@ -501,10 +552,8 @@ pub(crate) fn build_fa_mw_rdb(
     // drained after the loop.
     //
     // register-staged — stage block `kv+1` → VGPR, `ds_write` it into buf[nxt] (no
-    // per-commit barrier; emitted before the slice so the slice's `o_reg` A·V store
-    // stays the last terminal store on the stack), gather buf[cur], then the WAR
-    // barrier consumed by the gathers folds in the commits, gating both the
-    // cross-iteration RAW and WAR. The barrier-wrapped END (`endrange_barrier_to`)
+    // per-commit barrier: the store node is handed to the WAR barrier the gathers
+    // consume, which gates both the cross-iteration RAW and WAR), gather buf[cur]. The barrier-wrapped END (`endrange_barrier_to`)
     // is NOT used: it reorders the causal-mask WHERE past its consumer, leaving the
     // renderer without its SSA value — plain `endrange` keeps the render order.
     let (k_cur, v_cur, fence) = if async_stream {
@@ -516,9 +565,10 @@ pub(crate) fn build_fa_mw_rdb(
     } else {
         let s_k = g.stage_global_to_reg(&k_smem, &k_l, &pf_kidx, 1);
         let s_v = g.stage_global_to_reg(&v_smem, &v_l, &pf_kidx, 1);
-        let commit_k = g.commit_reg_to_local(k_nxt, &s_k, false);
-        let commit_v = g.commit_reg_to_local(v_nxt, &s_v, false);
-        (k_cur, v_cur, Some([commit_k.uop().clone(), commit_v.uop().clone()]))
+        // One store node for both strips; the gathers' WAR fence below is the
+        // barrier that covers it.
+        let committed = g.commit_regs_to_local(&[(&k_nxt, &s_k), (&v_nxt, &s_v)]);
+        (k_cur, v_cur, Some([committed]))
     };
 
     // Gather buf[cur] (counter-dependent ⇒ loop-scoped; reads the block landed last
@@ -533,6 +583,7 @@ pub(crate) fn build_fa_mw_rdb(
         warpid: &warpid,
         causal,
         valid_len,
+        seg_start,
         score_scale,
     };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
@@ -557,21 +608,24 @@ pub(crate) fn build_fa_mw_rdb(
 }
 
 /// Per-arch policy of [`flash_attention_with`]: the per-warp tile crossover and
-/// the loop-body form. The bigger `big` tile (which amortizes the softmax over
-/// more matrix-core work) is chosen once the launch grid `b·h·n/(q_blk·NUM_WARPS)`
-/// covers the device's `compute_units` and `N` divides its block; otherwise the
-/// baseline `small` tile (the bigger tile shrinks the grid, so it loses at low
-/// occupancy). [`Self::for_device`] reads the CU count off the device;
-/// [`Self::for_arch`] alone assumes the arch's flagship part (MI300X 304, Strix
-/// Halo 40, an RTX 3060's 28 SMs). `big == small` disables the crossover.
+/// the loop-body form. A [`Self::big`] tile is chosen once the launch grid
+/// `b·h·n/(q_blk·NUM_WARPS)` covers the device's `compute_units` and `N` divides
+/// its block; otherwise the baseline `small` tile, since a grid that does not
+/// cover the device wants the tile that amortizes the softmax over the most
+/// matrix-core work rather than the one that fits the most blocks per CU.
+/// [`Self::for_device`] reads the CU count off the device; [`Self::for_arch`]
+/// alone assumes the arch's flagship part (MI300X 304, Strix Halo 40, an RTX
+/// 3060's 28 SMs). A `big` entry equal to `small` disables the crossover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaPolicy {
     pub compute_units: usize,
-    pub big: (usize, usize),
-    /// The largest head dim the `big` tile is chosen at (CUDA: `{16,64}` needs
-    /// more registers than `{16,32}` above d=64, and 64 KiB of K/V double
-    /// buffers at d=128).
-    pub big_max_d: usize,
+    /// The grid-covering tiles as `(head-dim bound, tile)` pairs in increasing
+    /// bound order — the first pair whose bound covers `d` supplies the tile, and
+    /// a `d` past every bound falls back to `small`. The right tile is head-dim
+    /// dependent because the per-warp register tiles scale with `d`: the taller
+    /// KV super-block wins while the block still fits twice on a CU, and loses to
+    /// the square tile once it does not.
+    pub big: &'static [(usize, (usize, usize))],
     pub small: (usize, usize),
     /// Emit the flat (fully-unrolled) body. Every register index is then a
     /// constant, which the NVPTX backend needs to keep the accumulators in
@@ -590,44 +644,41 @@ pub struct FaPolicy {
 /// Bytes per element of the 16-bit operand dtypes the kernel accepts.
 const IN_BYTES: usize = 2;
 
+/// The per-warp tiles [`FaPolicy::tuned`] measures on first use: the table
+/// entries every policy draws from, in increasing register footprint.
+pub const FA_TILES: [(usize, usize); 4] =
+    [(Q_BLK, Q_BLK), (Q_BLK, KV_BLK), (Q_BLK, 2 * KV_BLK), (2 * Q_BLK, 2 * Q_BLK)];
+
 impl FaPolicy {
-    /// gfx942 keeps the bench-calibrated `{32,32}` crossover and gfx1151 the
-    /// baseline tile. CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
-    /// `cp.async` K/V stream): the taller KV super-block `{16,64}` (117 registers,
-    /// 32 KiB LDS at d=64 — two blocks per SM) is fastest on every grid that covers
-    /// the SMs (GigaAM b=8/h=16/n=1536: 3.20 ms vs 3.26 at `{16,32}` and 3.55 at
-    /// `{32,32}`; whisper b=1/h=6: 192 vs 198 / 272 µs), while at d=128 its double
-    /// buffers would need 64 KiB, so d=128 keeps `{16,32}` (158 registers, no
-    /// spill). Both CUDA tiles are flat: the rolled body pins the register tiles to
-    /// local memory (3-15× slower).
-    ///
-    /// # Panics
+    /// The measured crossovers: `{32,32}` on CDNA (gfx942); on RDNA (gfx1151)
+    /// `{16,32}` at d ≤ 64 and `{16,16}` at d = 128, where the wider KV block
+    /// costs occupancy (b=8/h=16/n=512 causal: 1.02 vs 1.64 ms); on CUDA (sm_86)
+    /// `{16,64}` at d ≤ 64 and `{16,16}` at d = 128 — at each head dim the widest
+    /// tile that still fits two blocks per SM. The CUDA bodies must stay flat: a
+    /// rolled body pins the register tiles to local memory (3-15× slower).
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         let small = (Q_BLK, KV_BLK);
         let att_band = !crate::ArchCaps::for_arch(arch).acc_reusable_as_input();
-        match arch {
-            svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx942) => Self {
+        match crate::arch::Family::of(arch) {
+            crate::arch::Family::Cdna => Self {
                 compute_units: 304,
-                big: (32, 32),
-                big_max_d: usize::MAX,
+                big: &[(usize::MAX, (32, 32))],
                 small,
                 unroll: false,
                 shared_max: 64 << 10,
                 att_band,
             },
-            svod_dtype::GpuArch::Amd(_) => Self {
+            crate::arch::Family::Rdna => Self {
                 compute_units: 40,
-                big: small,
-                big_max_d: usize::MAX,
+                big: &[(64, (Q_BLK, KV_BLK)), (128, (Q_BLK, Q_BLK))],
                 small,
                 unroll: false,
                 shared_max: 64 << 10,
                 att_band,
             },
-            svod_dtype::GpuArch::Cuda(_) => Self {
+            crate::arch::Family::Cuda => Self {
                 compute_units: 28,
-                big: (Q_BLK, 2 * KV_BLK),
-                big_max_d: 64,
+                big: &[(64, (Q_BLK, 2 * KV_BLK)), (128, (Q_BLK, Q_BLK))],
                 small,
                 unroll: true,
                 shared_max: 48 << 10,
@@ -637,10 +688,9 @@ impl FaPolicy {
             // `simdgroup_matrix` accumulator feeds an operand directly, so
             // `att_band` is false and the band costs nothing. The core count is not
             // reported by Metal; `for_device` leaves this default in place.
-            svod_dtype::GpuArch::Metal(_) => Self {
+            crate::arch::Family::Metal => Self {
                 compute_units: 40,
-                big: small,
-                big_max_d: usize::MAX,
+                big: &[(usize::MAX, (Q_BLK, KV_BLK))],
                 small,
                 unroll: false,
                 shared_max: 32 << 10,
@@ -670,19 +720,105 @@ impl FaPolicy {
     /// the `small` tile's buffers exceed [`Self::shared_max`].
     pub fn tile(&self, b: usize, n: usize, h: usize, d: usize) -> Option<(usize, usize)> {
         let fits = |tile| self.shared_bytes(tile, d) <= self.shared_max;
-        let big_n = self.big.0 * NUM_WARPS;
-        if d <= self.big_max_d && n.is_multiple_of(big_n) && b * h * (n / big_n) >= self.compute_units && fits(self.big)
-        {
-            Some(self.big)
-        } else {
-            fits(self.small).then_some(self.small)
-        }
+        let covers = |(q_blk, _): (usize, usize)| {
+            let big_n = q_blk * NUM_WARPS;
+            n.is_multiple_of(big_n) && b * h * (n / big_n) >= self.compute_units
+        };
+        self.big
+            .iter()
+            .find(|(max_d, _)| d <= *max_d)
+            .map(|(_, tile)| *tile)
+            .filter(|&tile| covers(tile) && fits(tile))
+            .or_else(|| fits(self.small).then_some(self.small))
     }
 
     /// The builder config for a `[b, n, h, d]` attention; `None` as [`Self::tile`].
     pub fn config(&self, b: usize, n: usize, h: usize, d: usize, causal: bool) -> Option<FaConfig> {
         let (q_blk, kv_blk) = self.tile(b, n, h, d)?;
         Some(FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
+    }
+
+    /// The config for a `[b, n, h, d]` attention over `h_kv` key heads as measured
+    /// on this device ([`crate::tune`]): every [`FA_TILES`] entry whose buffers fit
+    /// and whose block divides `n` is timed once on synthetic operands — with the
+    /// key mask when `masked` — and the fastest kept in `store`; the static
+    /// [`Self::config`] choice where only one fits or nothing measured. The body
+    /// form is the policy's. The launch entry consults [`crate::tune::enabled`]
+    /// before coming here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tuned(
+        &self,
+        store: &crate::tune::TuneStore,
+        spec: &svod_dtype::DeviceSpec,
+        arch: svod_dtype::GpuArch,
+        dtype: &DType,
+        (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
+        causal: bool,
+        mask: FaMask,
+    ) -> Option<FaConfig> {
+        let fits = |&(q_blk, kv_blk): &(usize, usize)| {
+            self.shared_bytes((q_blk, kv_blk), d) <= self.shared_max && n.is_multiple_of(q_blk * NUM_WARPS)
+        };
+        let candidates: Vec<FaConfig> = FA_TILES
+            .into_iter()
+            .filter(fits)
+            .map(|(q_blk, kv_blk)| FaConfig { q_blk, kv_blk, unroll: self.unroll, causal })
+            .collect();
+        let fallback = || self.config(b, n, h, d, causal);
+        if candidates.len() < 2 {
+            return fallback();
+        }
+        let caps = crate::ArchCaps::for_arch(arch);
+        let block = (NUM_WARPS * caps.wave_size) as i64;
+        let grid = |cfg: &FaConfig| [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
+        let build = move |ker: &Kernel, cfg: FaConfig| {
+            build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dtype.clone(), mask);
+            ker.finish(1)
+        };
+        let placeholders = || {
+            let mut bufs: Vec<Arc<UOp>> = [h, h, h_kv, h_kv]
+                .into_iter()
+                .map(|heads| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n * heads * d, dtype.clone()))
+                .collect();
+            if mask.key_lens {
+                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b, DType::Int32));
+            }
+            if mask.seg_start {
+                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, DType::Int32));
+            }
+            bufs
+        };
+        // The store line covers the candidate kernels' graphs, fingerprinted in
+        // table order; only a memo miss pays for building them.
+        let builds = || {
+            candidates
+                .iter()
+                .map(|&cfg| {
+                    let ker = Kernel::new("flash_attention", grid(&cfg), block, placeholders(), caps);
+                    crate::kernel_fingerprint(&build(&ker, cfg)).digest
+                })
+                .collect()
+        };
+        let shape = [b, n, h, h_kv, d, usize::from(causal), mask.code(), dtype.bytes()];
+        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &(&candidates, dtype));
+        let compile = |i: usize| {
+            let cfg = candidates[i];
+            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
+            let mut ins = vec![operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?];
+            if mask.key_lens {
+                ins.push(Tensor::full(&[b], ConstValue::Int(n as i64), DType::Int32).to(spec.clone()));
+            }
+            if mask.seg_start {
+                ins.push(Tensor::full(&[b, n], ConstValue::Int(0), DType::Int32).to(spec.clone()));
+            }
+            let ins: Vec<&Tensor> = ins.iter().collect();
+            let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
+            crate::launch::compile_kernel("flash_attention_tune", grid(&cfg), block, &mut [&mut o], &ins, move |ker| {
+                build(ker, cfg)
+            })
+            .ok()
+        };
+        store.select(&key, candidates.len(), builds, compile).map(|i| candidates[i]).or_else(fallback)
     }
 }
 
@@ -717,7 +853,7 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
 
     let in_dtype = q.uop().dtype();
     crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * caps.wave_size) as i64, &mut [o], &[q, k, v], |ker| {
-        build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, in_dtype.clone(), false);
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, in_dtype.clone(), FaMask::NONE);
         ker.finish(1)
     })
 }
@@ -738,11 +874,18 @@ pub struct FaOpts<'a> {
     pub causal: bool,
     /// Optional `[B]` `i32` per-batch valid-key-count padding mask (key-only).
     pub key_lens: Option<&'a Tensor>,
+    /// Optional `[B, N]` `i32` segment starts for packed sequences: query row
+    /// `q` of batch `b` attends no key before `seg_start[b, q]`, so several
+    /// sequences packed end to end in one row stay mutually invisible. Every
+    /// entry must lie in `0..=q` and leave the row at least one key `key_lens`
+    /// does not hide (a padding token pointing at itself stays finite); a row
+    /// with no visible key is `NaN`.
+    pub seg_start: Option<&'a Tensor>,
 }
 
 impl Default for FaOpts<'_> {
     fn default() -> Self {
-        Self { causal: true, key_lens: None }
+        Self { causal: true, key_lens: None, seg_start: None }
     }
 }
 
@@ -761,6 +904,8 @@ impl Default for FaOpts<'_> {
 ///   ([`FA_SUPPORTED_ARCHS`] — gfx942/gfx1151/CUDA sm_80+ with its LLVM backend), **or** the
 ///   runtime sequence length doesn't tile (`N % (q_blk·NUM_WARPS) != 0`). The caller
 ///   substitutes its own attention (e.g. [`Tensor::scaled_dot_product_attention`]).
+///   The per-warp tile is the one measured fastest on this device for the shape
+///   ([`FaPolicy::tuned`]; `SVOD_TK_TUNE=0` keeps the policy's static choice).
 /// - `Err` — *malformed request* on a supported device: a FIXED property is wrong —
 ///   `q`/`k` not a statically-shaped rank-4 tensor, operand dtype ∉ {bf16, f16},
 ///   `D % 16 != 0`, or `H % H_KV != 0` (GQA). These are
@@ -771,14 +916,30 @@ impl Default for FaOpts<'_> {
 /// use svod_tensor::Tensor;
 /// use svod_dtype::DType;
 /// use svod_tk::FaOpts;
-/// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16).unwrap();
+/// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16);
 /// let (k, v) = (q.clone(), q.clone());
 /// // `None` ⇒ the kernel doesn't apply here; the caller picks the fallback.
-/// if let Some(mut o) = svod_tk::flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None }).unwrap() {
+/// let opts = FaOpts { causal: false, key_lens: None, seg_start: None };
+/// if let Some(mut o) = svod_tk::flash_attention_with(&q, &k, &v, opts).unwrap() {
 ///     o.prepare().unwrap();
 /// }
 /// ```
 pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> crate::LaunchResult<Option<Tensor>> {
+    flash_attention_tuned(q, k, v, opts, FaPolicy::for_device)
+}
+
+/// [`flash_attention_with`] with the per-arch tile policy supplied by the caller
+/// instead of read off the device ([`FaPolicy::for_device`]) — the tile-sweep
+/// entry point (the analog of [`gemm_nt_with`](crate::gemm_nt_with)). `policy` is
+/// consulted once per launch, its config shared by the tiling predicate and the
+/// build.
+pub fn flash_attention_tuned(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    opts: FaOpts,
+    policy: impl Fn(&svod_dtype::DeviceSpec, svod_dtype::GpuArch) -> FaPolicy + Copy,
+) -> crate::LaunchResult<Option<Tensor>> {
     let qd = crate::launch::concrete_dims(q, "flash-attention", "q", 4)?;
     let kd = crate::launch::concrete_dims(k, "flash-attention", "k", 4)?;
     let vd = crate::launch::concrete_dims(v, "flash-attention", "v", 4)?;
@@ -802,6 +963,20 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
     let kv_seq_match = kd[1] == n && vd[1] == n;
     let (tiling_device, build_device) = (q.device(), q.device());
+    let tiling_dtype = dtype.clone();
+    let mask = FaMask { key_lens: opts.key_lens.is_some(), seg_start: opts.seg_start.is_some() };
+    // The policy's config, measured on first use where tuning is on. Measuring
+    // is what the first call costs, so it runs once per launch: the tiling
+    // predicate and the build share its answer.
+    let chosen = move |policy: &FaPolicy, device: &svod_dtype::DeviceSpec, arch, dtype: &DType| {
+        if !crate::tune::enabled() {
+            return policy.config(b, n, h, d, opts.causal);
+        }
+        let store = crate::tune::TuneStore::global();
+        policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, mask)
+    };
+    let cfg_cell: Rc<OnceCell<Option<FaConfig>>> = Rc::default();
+    let fit_cell = cfg_cell.clone();
 
     crate::launch_custom(
         &q.device(),
@@ -846,22 +1021,22 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
         // does a KV length that differs from q's (this kernel is self-attention only).
         move |arch| {
             kv_seq_match
-                && FaPolicy::for_device(&tiling_device, arch)
-                    .tile(b, n, h, d)
-                    .is_some_and(|(q_blk, _)| n.is_multiple_of(q_blk * NUM_WARPS))
+                && fit_cell
+                    .get_or_init(|| chosen(&policy(&tiling_device, arch), &tiling_device, arch, &tiling_dtype))
+                    .is_some_and(|cfg| n.is_multiple_of(cfg.q_blk * NUM_WARPS))
         },
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = FaPolicy::for_device(&build_device, arch)
-                .config(b, n, h, d, opts.causal)
+            let cfg = cfg_cell
+                .get_or_init(|| chosen(&policy(&build_device, arch), &build_device, arch, &dtype))
                 .expect("checked by the tiling predicate");
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
-            let masked = opts.key_lens.is_some();
             let build_dtype = dtype.clone();
-            // ABI/global order is o, q, k, v, (lens) — `out` is global[0], inputs map to
-            // global[1..] in order, so `key_lens` (the 5th global) goes last.
+            // ABI/global order is o, q, k, v, (lens), (seg_start) — `out` is global[0],
+            // inputs map to global[1..] in order, so the masks go last, `key_lens`
+            // before `seg_start`.
             //
             // Clamp key_lens to >= 1. A fully key-masked row (key_lens[b] == 0, an
             // inactive zero-padded lane) has no valid key, so the online-softmax
@@ -884,9 +1059,12 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
             if let Some(lens) = &key_lens_clamped {
                 ins.push(lens);
             }
+            if let Some(seg_start) = opts.seg_start {
+                ins.push(seg_start);
+            }
             let block = (NUM_WARPS * caps.wave_size) as i64;
             crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
-                build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), masked);
+                build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), mask);
                 ker.finish(1)
             })
         },
@@ -902,7 +1080,7 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
 /// ```no_run
 /// use svod_tensor::Tensor;
 /// use svod_dtype::DType;
-/// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16).unwrap();
+/// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16);
 /// let (k, v) = (q.clone(), q.clone());
 /// if let Some(mut o) = svod_tk::flash_attention(&q, &k, &v).unwrap() {
 ///     o.prepare().unwrap();

@@ -19,9 +19,10 @@ pub enum CounterExample {
     /// Z3 found a concrete input where expressions differ.
     #[snafu(display("Counterexample found: {message}\nModel: {model}"))]
     Found { message: String, model: String },
-    /// Z3 timed out or returned unknown.
-    #[snafu(display("Z3 timeout or unknown result"))]
-    Timeout,
+    /// Z3 gave up, with its reason (`timeout`, `memout`, or an incomplete
+    /// theory such as nonlinear integer arithmetic).
+    #[snafu(display("Z3 gave up: {reason}"))]
+    Unknown { reason: String },
     /// Conversion to Z3 failed.
     #[snafu(display("Conversion failed: {source}"))]
     ConversionFailed {
@@ -73,7 +74,7 @@ pub fn verify_equivalence(original: &Arc<UOp>, simplified: &Arc<UOp>) -> Verific
                                 model,
                             });
                         }
-                        z3::SatResult::Unknown => return TimeoutSnafu.fail(),
+                        z3::SatResult::Unknown => return Err(gave_up(solver)),
                     }
                 }
                 _ => {
@@ -109,8 +110,12 @@ pub fn verify_equivalence(original: &Arc<UOp>, simplified: &Arc<UOp>) -> Verific
                 model,
             })
         }
-        z3::SatResult::Unknown => Err(CounterExample::Timeout),
+        z3::SatResult::Unknown => Err(gave_up(solver)),
     }
+}
+
+fn gave_up(solver: &z3::Solver) -> CounterExample {
+    CounterExample::Unknown { reason: solver.get_reason_unknown().unwrap_or_else(|| "unknown".to_string()) }
 }
 
 #[cfg(test)]

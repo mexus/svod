@@ -4,28 +4,38 @@
 //! `Qwen/Qwen3-Embedding-0.6B`): token embeddings → causal RoPE decoder
 //! stack (GQA, per-head Q/K RMSNorm, SwiGLU) → final RMSNorm.
 //!
-//! The embedding model adds last-token pooling + L2 normalization.
-//! Computes in bf16 on the AMD target; f32 for CPU parity. Tokenization is
-//! out-of-band — the API takes pre-computed `input_ids`.
+//! The embedding model adds last-token pooling + L2 normalization;
+//! [`Qwen3Embedder`] runs token rows through per-length JIT plans.
+//! Tokenization is the caller's (`examples/qwen3_embed.rs` carries the
+//! reference tokenizer). Computes in [`crate::default_compute_dtype`]; f32
+//! for CPU parity.
 
 mod attention;
 mod config;
 mod decoder_layer;
+#[cfg(test)]
+pub(crate) use decoder_layer::fusable as norm_fusable;
+mod embed;
 mod embedder;
 mod error;
 mod feed_forward;
+#[cfg(test)]
+pub(crate) use feed_forward::pair_rows;
 mod jit;
+mod linear;
 mod model;
 mod reranker;
+pub(crate) mod tk;
 
 pub use attention::Qwen3Attention;
 pub use config::{Qwen3Config, qwen3_embedding_0_6b};
 pub use decoder_layer::Qwen3DecoderLayer;
+pub use embed::Qwen3Embedder;
 pub use embedder::Qwen3Embedding;
 pub use error::{Error, Result};
 pub use feed_forward::Qwen3MLP;
 pub use jit::{Qwen3EmbeddingJit, Qwen3RerankerJit};
-pub use model::Qwen3Model;
+pub use model::{Packing, Qwen3Model};
 pub use reranker::Qwen3Reranker;
 
 use std::path::PathBuf;

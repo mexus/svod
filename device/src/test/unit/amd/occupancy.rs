@@ -1,6 +1,6 @@
 //! Unit tests for static kernel-resource + occupancy decoding.
 
-use crate::amd::occupancy::decode_resources;
+use crate::amd::occupancy::{decode_resources, vgpr_limited_occupancy};
 
 #[test]
 fn decodes_vgpr_sgpr_segments_wave32() {
@@ -15,9 +15,28 @@ fn decodes_vgpr_sgpr_segments_wave32() {
     assert_eq!(r.wave_size, 32);
 }
 
+/// Wave32 occupancy steps read off `llc -mcpu=gfx1151|gfx1201` (LLVM 20): the
+/// 24-VGPR allocation granule of `FeatureGFX11FullVGPRs` puts the waves/SIMD
+/// breaks at 96, 120 and 144 VGPRs. A 16-VGPR granule would give 16/12/12/10/10/10.
+#[test_case::test_case(96 => 16; "the last count that saturates the SIMD")]
+#[test_case::test_case(97 => 12; "one past 96 rounds up to 120")]
+#[test_case::test_case(120 => 12)]
+#[test_case::test_case(121 => 10; "one past 120 rounds up to 144")]
+#[test_case::test_case(144 => 10)]
+#[test_case::test_case(145 => 9; "one past 144 rounds up to 168")]
+fn wave32_vgpr_occupancy_matches_llc(vgprs: u32) -> u32 {
+    let waves = |major| {
+        let occ = vgpr_limited_occupancy(vgprs, 32, major).expect("gfx{major} geometry known");
+        (occ * 16.0).round() as u32
+    };
+    let (gfx11, gfx12) = (waves(11), waves(12));
+    assert_eq!(gfx11, gfx12, "gfx11 and gfx12 share the wave32 register file");
+    gfx12
+}
+
 #[test]
 fn vgpr_limited_occupancy_gfx11() {
-    // 200 VGPRs on gfx11 wave32: round_up(200,16)=208, floor(1536/208)=7 waves,
+    // 200 VGPRs on gfx11 wave32: round_up(200,24)=216, floor(1536/216)=7 waves,
     // 7/16 = 0.4375.
     let r = decode_resources(24, 0, 0, 32, 11);
     let occ = r.occupancy.expect("gfx11 occupancy known");
