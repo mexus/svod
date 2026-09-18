@@ -118,6 +118,25 @@ impl Default for FaConfig {
     }
 }
 
+/// The optional score masks a build binds, each a trailing global after
+/// `o, q, k, v` in this order: the `[B]` valid-key counts of
+/// [`FaOpts::key_lens`], then the `[B, N]` segment starts of
+/// [`FaOpts::seg_start`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaMask {
+    pub key_lens: bool,
+    pub seg_start: bool,
+}
+
+impl FaMask {
+    pub const NONE: Self = Self { key_lens: false, seg_start: false };
+
+    /// The masks as a bit set, the tune key's shape component.
+    pub const fn code(self) -> usize {
+        self.key_lens as usize | (self.seg_start as usize) << 1
+    }
+}
+
 /// Online-softmax state carried *across* KV iterations (the [`build_fa_mw_rdb`]
 /// loop's back-edge re-reads the rewrapped handles each trip).
 struct FaAcc<'k> {
@@ -157,6 +176,8 @@ struct FaCtx<'a, 'k> {
     warpid: &'a Arc<UOp>,
     causal: bool,
     valid_len: Option<Arc<UOp>>,
+    /// The `[B, N]` segment-start table and the batch index it is read at.
+    seg_start: Option<(crate::tile::GL, Arc<UOp>)>,
     /// `log2(e)/sqrt(d)` — the softmax scale, folded with the `exp2` base change.
     /// Applied to the f32 `QKᵀ` accumulator rather than to `Q`: scaling `Q` costs a
     /// second rounding to the 16-bit mma input dtype, and that error enters the
@@ -166,13 +187,14 @@ struct FaCtx<'a, 'k> {
     score_scale: f64,
 }
 
-/// Apply the FA score-mask (causal + optional padding) to the `att` tile. The
-/// causal mask zeros (via `−∞`) keys ahead of this warp's own query rows
-/// (`kv_pos > q_pos`); the padding mask zeros keys at/after the per-batch
-/// valid length (`kv_pos >= valid_len`). With neither, the tile is returned
-/// unchanged (the early-return avoids emitting any mask IR when masking is off).
-/// The per-element `(kv_pos, q_pos)` is computed arch-correctly inside
-/// [`Group::mask_where`].
+/// Apply the FA score-mask (causal + optional padding + optional segments) to
+/// the `att` tile. The causal mask zeros (via `−∞`) keys ahead of this warp's
+/// own query rows (`kv_pos > q_pos`); the padding mask zeros keys at/after the
+/// per-batch valid length (`kv_pos >= valid_len`); the segment mask zeros keys
+/// before the query's own segment (`kv_pos < seg_start[batch, q_pos]`). With
+/// none, the tile is returned unchanged (the early-return avoids emitting any
+/// mask IR when masking is off). The per-element `(kv_pos, q_pos)` is computed
+/// arch-correctly inside [`Group::mask_where`].
 fn score_mask<'k>(
     warp: &Group<'k>,
     att: RT<'k>,
@@ -180,8 +202,9 @@ fn score_mask<'k>(
     q_blk: &Arc<UOp>,
     causal: bool,
     valid_len: Option<&Arc<UOp>>,
+    seg_start: Option<&(crate::tile::GL, Arc<UOp>)>,
 ) -> RT<'k> {
-    if !causal && valid_len.is_none() {
+    if !causal && valid_len.is_none() && seg_start.is_none() {
         return att;
     }
     let row_blk = Idx::Uop(slice_idx.clone());
@@ -191,8 +214,15 @@ fn score_mask<'k>(
     } else {
         att
     };
-    if let Some(vl) = valid_len {
-        warp.mask_where(att, row_blk, col_blk, f64::NEG_INFINITY, move |kv_pos, _| kv_pos.ge(vl))
+    let att = if let Some(vl) = valid_len {
+        warp.mask_where(att, row_blk.clone(), col_blk.clone(), f64::NEG_INFINITY, move |kv_pos, _| kv_pos.ge(vl))
+    } else {
+        att
+    };
+    if let Some((table, batch)) = seg_start {
+        warp.mask_where(att, row_blk, col_blk, f64::NEG_INFINITY, move |kv_pos, q_pos| {
+            kv_pos.lt(&load_at(table.uop(), table.shape(), &[Idx::from(batch), Idx::from(q_pos)]))
+        })
     } else {
         att
     }
@@ -238,7 +268,7 @@ fn fa_qk<'k>(
     // Scale in f32, on the accumulator — see `FaCtx::score_scale`.
     let att = att * ctx.score_scale;
 
-    let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref());
+    let att = score_mask(warp, att, slice_idx, ctx.q_blk, ctx.causal, ctx.valid_len.as_ref(), ctx.seg_start.as_ref());
     (att, v_reg)
 }
 
@@ -337,7 +367,7 @@ pub(crate) fn build_fa_mw_rdb(
     d: usize,
     cfg: FaConfig,
     in_dtype: DType,
-    masked: bool,
+    mask: FaMask,
 ) {
     let FaConfig { q_blk: q_blk_rows, kv_blk: kv_blk_rows, unroll, causal, .. } = cfg;
     // Flat compute (unrolled QKᵀ/softmax/A·V) is the prerequisite for the Stage-2
@@ -371,10 +401,13 @@ pub(crate) fn build_fa_mw_rdb(
     // never interleaved) so the ABI slot order stays stable; only bound when `masked`.
     // The scalar `lens[batch]` is already int32, matching the concrete SPECIAL
     // position arithmetic.
-    let valid_len = masked.then(|| {
+    let valid_len = mask.key_lens.then(|| {
         let lens = ker.gl(&[b], DType::Int32);
         load_at(lens.uop(), lens.shape(), &[Idx::from(&ker.block_idx[2])])
     });
+    // The `[B, N]` segment starts, bound after `lens`; read per query row inside
+    // the score mask at this workgroup's batch.
+    let seg_start = mask.seg_start.then(|| (ker.gl(&[b, n], DType::Int32), ker.block_idx[2].clone()));
 
     let head = ker.grid_x();
     let head_kv = head.floor_div(&iconst(group_size));
@@ -425,7 +458,13 @@ pub(crate) fn build_fa_mw_rdb(
     let o_reg = ker.acc((d, q_blk_rows), col);
     let max_vec = ker.acc_vec(q_blk_rows);
     let norm_vec = ker.acc_vec(q_blk_rows);
-    let acc = FaAcc { max_vec: warp.neg_inf_rv(max_vec), norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
+    // The running max starts at the finite floor, not `-∞`: a KV block the
+    // masks hide entirely from a query row (a packed row's earlier segments)
+    // leaves the max where it was, and the rescale `exp2(prev - new)` needs a
+    // finite `prev` to be `1`, not `-∞ - (-∞) = NaN`. Against real scores the
+    // floor rescales to `exp2(-3.4e38) = 0` exactly as `-∞` did.
+    let max_floor = warp.clear_rv(max_vec, f64::from(f32::MIN));
+    let acc = FaAcc { max_vec: max_floor, norm_vec: warp.zero_rv(norm_vec), o_reg: warp.zero(o_reg) };
 
     // Load this warp's Q tile, then transpose for the QKᵀ contraction. The gather
     // lands the 16-bit operand dtype straight in registers: the softmax scale rides
@@ -542,6 +581,7 @@ pub(crate) fn build_fa_mw_rdb(
         warpid: &warpid,
         causal,
         valid_len,
+        seg_start,
         score_scale,
     };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
@@ -725,7 +765,7 @@ impl FaPolicy {
         dtype: &DType,
         (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
         causal: bool,
-        masked: bool,
+        mask: FaMask,
     ) -> Option<FaConfig> {
         let fits = |&(q_blk, kv_blk): &(usize, usize)| {
             self.shared_bytes((q_blk, kv_blk), d) <= self.shared_max && n.is_multiple_of(q_blk * NUM_WARPS)
@@ -743,7 +783,7 @@ impl FaPolicy {
         let block = (NUM_WARPS * caps.wave_size) as i64;
         let grid = |cfg: &FaConfig| [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
         let build = move |ker: &Kernel, cfg: FaConfig| {
-            build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dtype.clone(), masked);
+            build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, dtype.clone(), mask);
             ker.finish(1)
         };
         let placeholders = || {
@@ -751,8 +791,11 @@ impl FaPolicy {
                 .into_iter()
                 .map(|heads| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n * heads * d, dtype.clone()))
                 .collect();
-            if masked {
+            if mask.key_lens {
                 bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b, DType::Int32));
+            }
+            if mask.seg_start {
+                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, DType::Int32));
             }
             bufs
         };
@@ -763,14 +806,17 @@ impl FaPolicy {
                 crate::kernel_fingerprint(&build(&ker, cfg)).digest
             })
             .collect();
-        let shape = [b, n, h, h_kv, d, usize::from(causal), usize::from(masked), dtype.bytes()];
+        let shape = [b, n, h, h_kv, d, usize::from(causal), mask.code(), dtype.bytes()];
         let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &builds);
         let compile = |i: usize| {
             let cfg = candidates[i];
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
             let mut ins = vec![operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?];
-            if masked {
+            if mask.key_lens {
                 ins.push(Tensor::full(&[b], ConstValue::Int(n as i64), DType::Int32).to(spec.clone()));
+            }
+            if mask.seg_start {
+                ins.push(Tensor::full(&[b, n], ConstValue::Int(0), DType::Int32).to(spec.clone()));
             }
             let ins: Vec<&Tensor> = ins.iter().collect();
             let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
@@ -814,7 +860,7 @@ pub fn flash_attention_forward_mw_rdb(o: &mut Tensor, q: &Tensor, k: &Tensor, v:
 
     let in_dtype = q.uop().dtype();
     crate::run_kernel("fa_mw_rdb", grid, (NUM_WARPS * caps.wave_size) as i64, &mut [o], &[q, k, v], |ker| {
-        build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, in_dtype.clone(), false);
+        build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, in_dtype.clone(), FaMask::NONE);
         ker.finish(1)
     })
 }
@@ -835,11 +881,18 @@ pub struct FaOpts<'a> {
     pub causal: bool,
     /// Optional `[B]` `i32` per-batch valid-key-count padding mask (key-only).
     pub key_lens: Option<&'a Tensor>,
+    /// Optional `[B, N]` `i32` segment starts for packed sequences: query row
+    /// `q` of batch `b` attends no key before `seg_start[b, q]`, so several
+    /// sequences packed end to end in one row stay mutually invisible. Every
+    /// entry must lie in `0..=q` and leave the row at least one key `key_lens`
+    /// does not hide (a padding token pointing at itself stays finite); a row
+    /// with no visible key is `NaN`.
+    pub seg_start: Option<&'a Tensor>,
 }
 
 impl Default for FaOpts<'_> {
     fn default() -> Self {
-        Self { causal: true, key_lens: None }
+        Self { causal: true, key_lens: None, seg_start: None }
     }
 }
 
@@ -873,7 +926,8 @@ impl Default for FaOpts<'_> {
 /// let q = Tensor::randn(&[1, 128, 16, 64]).unwrap().cast(DType::BFloat16);
 /// let (k, v) = (q.clone(), q.clone());
 /// // `None` ⇒ the kernel doesn't apply here; the caller picks the fallback.
-/// if let Some(mut o) = svod_tk::flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None }).unwrap() {
+/// let opts = FaOpts { causal: false, key_lens: None, seg_start: None };
+/// if let Some(mut o) = svod_tk::flash_attention_with(&q, &k, &v, opts).unwrap() {
 ///     o.prepare().unwrap();
 /// }
 /// ```
@@ -915,14 +969,15 @@ pub fn flash_attention_tuned(
         .map(|(operand, dims)| (operand, dims.clone(), vec![b, dims[1], h_kv, d]));
     let kv_seq_match = kd[1] == n && vd[1] == n;
     let (tiling_device, build_device) = (q.device(), q.device());
-    let (tiling_dtype, masked) = (dtype.clone(), opts.key_lens.is_some());
+    let tiling_dtype = dtype.clone();
+    let mask = FaMask { key_lens: opts.key_lens.is_some(), seg_start: opts.seg_start.is_some() };
     // The policy's config, measured on first use where tuning is on.
     let chosen = move |policy: &FaPolicy, device: &svod_dtype::DeviceSpec, arch, dtype: &DType| {
         if !crate::tune::enabled() {
             return policy.config(b, n, h, d, opts.causal);
         }
         let store = crate::tune::TuneStore::global();
-        policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, masked)
+        policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, mask)
     };
 
     crate::launch_custom(
@@ -979,8 +1034,9 @@ pub fn flash_attention_tuned(
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());
             let build_dtype = dtype.clone();
-            // ABI/global order is o, q, k, v, (lens) — `out` is global[0], inputs map to
-            // global[1..] in order, so `key_lens` (the 5th global) goes last.
+            // ABI/global order is o, q, k, v, (lens), (seg_start) — `out` is global[0],
+            // inputs map to global[1..] in order, so the masks go last, `key_lens`
+            // before `seg_start`.
             //
             // Clamp key_lens to >= 1. A fully key-masked row (key_lens[b] == 0, an
             // inactive zero-padded lane) has no valid key, so the online-softmax
@@ -1003,9 +1059,12 @@ pub fn flash_attention_tuned(
             if let Some(lens) = &key_lens_clamped {
                 ins.push(lens);
             }
+            if let Some(seg_start) = opts.seg_start {
+                ins.push(seg_start);
+            }
             let block = (NUM_WARPS * caps.wave_size) as i64;
             crate::graph_launch("flash_attention", grid, block, out, &ins, caps, move |ker| {
-                build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), masked);
+                build_fa_mw_rdb(ker, b, n, h, h_kv, d, cfg, build_dtype.clone(), mask);
                 ker.finish(1)
             })
         },

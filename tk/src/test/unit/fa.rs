@@ -9,7 +9,7 @@ use svod_ir::UOp;
 use svod_tensor::Tensor;
 
 use crate::Kernel;
-use crate::kernels::fa::{FaConfig, FaOpts, build_fa_mw_rdb, flash_attention_with};
+use crate::kernels::fa::{FaConfig, FaMask, FaOpts, build_fa_mw_rdb, flash_attention_with};
 use svod_ir::ops;
 use test_case::test_case;
 
@@ -81,7 +81,7 @@ fn test_fa_mw_rdb_renders_bounded() {
             d,
             FaConfig { q_blk: 16, kv_blk: 16, unroll, ..Default::default() },
             svod_dtype::DType::BFloat16,
-            false,
+            FaMask::NONE,
         );
         let sink = ker.finish(1);
         let pm = svod_schedule::symbolic::pm_lower_index_dtype()
@@ -151,7 +151,7 @@ fn test_fa_graph_path_renders_clean() {
         d,
         FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() },
         svod_dtype::DType::BFloat16,
-        false,
+        FaMask::NONE,
     );
     let sink = ker.finish(1);
 
@@ -217,7 +217,7 @@ fn test_fa_graph_path_renders_clean_gfx1151() {
         d,
         FaConfig { q_blk, kv_blk, causal: false, ..Default::default() },
         svod_dtype::DType::BFloat16,
-        false,
+        FaMask::NONE,
     );
     let sink = ker.finish(1);
 
@@ -282,7 +282,7 @@ fn test_fa_mw_rdb_renders_wave32() {
         d,
         FaConfig { q_blk: 16, kv_blk: 16, ..Default::default() },
         svod_dtype::DType::Float16,
-        false,
+        FaMask::NONE,
     );
     let sink = ker.finish(1);
     let pm = svod_schedule::symbolic::pm_lower_index_dtype()
@@ -389,7 +389,7 @@ fn run_fa_amd_case(b: usize, n: usize, h: usize, d: usize, path: FaPath) {
             d,
             FaConfig { q_blk, kv_blk, unroll, ..Default::default() },
             q.uop().dtype(),
-            false,
+            FaMask::NONE,
         );
         ker.finish(1)
     })
@@ -538,7 +538,7 @@ fn test_fa_noncausal_f16_amd() {
     };
     let (q, k, v) = (mk(), mk(), mk());
 
-    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None })
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None, seg_start: None })
         .expect("fa noncausal")
         .expect("FA kernel applies");
     let og_f = og.cast(DType::Float32);
@@ -589,7 +589,7 @@ fn test_fa_noncausal_f16_masked_amd() {
     let lens = Tensor::from_slice([valid; 1]);
     lens.realize().expect("realize lens");
 
-    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) })
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens), seg_start: None })
         .expect("fa masked")
         .expect("FA kernel applies");
     let og_f = og.cast(DType::Float32);
@@ -619,6 +619,66 @@ fn test_fa_noncausal_f16_masked_amd() {
     let max_abs = got.iter().zip(&expected).map(|(g, e)| (g - e).abs()).fold(0.0f32, f32::max);
     println!("fa[noncausal,f16,masked lens={valid}] B={b} N={n} H={h} D={d}: max abs error = {max_abs:e}");
     assert!(max_abs <= 2e-2, "non-causal masked f16 FA exceeds tol (max abs {max_abs:e})");
+}
+
+/// Packed rows: `SVOD_DEVICE=AMD:0 cargo test -p svod-tk --lib fa::test_fa_seg_start -- --ignored --nocapture`.
+///
+/// The causal kernel with a `[B, N]` segment-start table against SDPA with the
+/// same causal + segment mask: row 0 holds segments `[0, 100)`, `[100, 180)`
+/// and one-token pads, row 1 one segment `[0, 256)`, so the table masks keys
+/// within the causal triangle (not only beyond it), whole KV blocks ahead of a
+/// segment are hidden (the running max must start finite), and a one-token
+/// segment stays finite. Both per-warp tiles, with and without a key mask
+/// beside it (a row with no visible key at all is the caller's bug either way).
+#[test_case::test_case(16, 16, false; "square tile")]
+#[test_case::test_case(16, 32, false; "taller KV block")]
+#[test_case::test_case(16, 16, true; "with the key mask")]
+#[ignore]
+fn test_fa_seg_start(q_blk: usize, kv_blk: usize, key_mask: bool) {
+    use crate::kernels::fa::{FaPolicy, flash_attention_tuned};
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip test_fa_seg_start: unsupported device/toolchain");
+        return;
+    }
+    let (b, n, h, h_kv, d) = (2usize, 256usize, 4usize, 2usize, 128usize);
+    let mk = |h: usize| {
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::BFloat16);
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(h), mk(h_kv), mk(h_kv));
+    let mut starts = vec![0i32; b * n];
+    for (j, s) in starts[..n].iter_mut().enumerate() {
+        *s = match j {
+            0..100 => 0,
+            100..180 => 100,
+            // The key mask hides the pads' own keys: those rows start at key 0.
+            _ if key_mask => 0,
+            _ => j as i32,
+        };
+    }
+    let seg_start = Tensor::from_slice(starts.as_slice()).try_reshape([b, n]).expect("reshape");
+    let lens = key_mask.then(|| vec![180i32, 256]);
+    let lens_t = lens.as_ref().map(|l| Tensor::from_slice(l.as_slice()));
+    let opts = FaOpts { causal: true, key_lens: lens_t.as_ref(), seg_start: Some(&seg_start) };
+    let policy = move |spec: &DeviceSpec, arch| FaPolicy {
+        big: &[],
+        small: (q_blk, kv_blk),
+        ..FaPolicy::for_device(spec, arch)
+    };
+    let got = flash_attention_tuned(&q, &k, &v, opts, policy).expect("fa").expect("the kernel applies");
+    let got = got.cast(DType::Float32);
+    got.realize().expect("realize");
+    let reference = fa_reference(&q, &k, &v, true, lens.as_deref(), Some(&starts));
+    reference.realize().expect("realize reference");
+    let report = svod_tensor::testing::allclose_f32(
+        &got.as_vec::<f32>().expect("read"),
+        &reference.as_vec::<f32>().expect("read reference"),
+        2e-2,
+        2e-2,
+    );
+    println!("fa[seg_start] {q_blk}x{kv_blk} key_mask={key_mask}: {}", report.message);
+    assert!(report.ok, "{}", report.message);
 }
 
 /// A fully key-masked lane (`key_lens[b] == 0`) — the inactive-lane case the
@@ -651,7 +711,7 @@ fn test_fa_key_lens_zero_is_finite_amd() {
     let lens = Tensor::from_slice([0i32; 1]);
     lens.realize().expect("realize lens");
 
-    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens) })
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens), seg_start: None })
         .expect("fa masked")
         .expect("FA kernel applies");
     let og_f = og.cast(DType::Float32);
@@ -708,7 +768,7 @@ fn test_fa_tile_bench_cuda() {
                     &mut [&mut o],
                     &[&q, &k, &v],
                     |ker| {
-                        build_fa_mw_rdb(ker, b, n, h, h, d, cfg, DType::Float16, false);
+                        build_fa_mw_rdb(ker, b, n, h, h, d, cfg, DType::Float16, FaMask::NONE);
                         ker.finish(1)
                     },
                 )
@@ -736,7 +796,7 @@ fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, u
     let caps = crate::ArchCaps::for_arch(svod_dtype::GpuArch::Cuda(sm86));
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
     let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, FaMask::NONE);
     let sink = ker.finish(1);
     let renderer = svod_codegen::llvm::LlvmTextRenderer::nvptx(sm86);
     let opt_renderer = svod_schedule::OptimizerRenderer::for_cuda_arch(sm86).with_rewrite_capabilities(
@@ -924,9 +984,17 @@ fn fa_policy_tile(
 }
 
 /// The f32 SDPA reference of `flash_attention_with(q, k, v, opts)` in `[B,N,H,D]`:
-/// the GQA `h_kv` groups broadcast to `h`, `causal` and the `[B,1,1,N]` key mask
-/// (`kv_pos >= key_lens[b]`) applied exactly as the kernel does.
-fn fa_reference(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Option<&[i32]>) -> Tensor {
+/// the GQA `h_kv` groups broadcast to `h`, `causal`, the `[B,1,1,N]` key mask
+/// (`kv_pos >= key_lens[b]`) and the `[B,1,N,N]` segment mask
+/// (`kv_pos < seg_start[b, q_pos]`) applied exactly as the kernel does.
+fn fa_reference(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    causal: bool,
+    key_lens: Option<&[i32]>,
+    seg_start: Option<&[i32]>,
+) -> Tensor {
     let dims = |t: &Tensor| t.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>();
     let (b, n, h, d) = (dims(q)[0], dims(q)[1], dims(q)[2], dims(q)[3]);
     let h_kv = dims(k)[2];
@@ -944,10 +1012,15 @@ fn fa_reference(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool, key_lens: Opti
         };
         t.try_permute(&[0, 2, 1, 3]).unwrap()
     };
-    let mask = key_lens.map(|lens| {
-        let range = Tensor::arange(n as i64, None, None).unwrap().try_reshape([1usize, 1, 1, n]).unwrap();
-        range.try_ge(Tensor::from_slice(lens).try_reshape([b, 1, 1, 1]).unwrap()).unwrap()
-    });
+    let range = || Tensor::arange(n as i64, None, None).unwrap().try_reshape([1usize, 1, 1, n]).unwrap();
+    let padding =
+        key_lens.map(|lens| range().try_ge(Tensor::from_slice(lens).try_reshape([b, 1, 1, 1]).unwrap()).unwrap());
+    let segments =
+        seg_start.map(|starts| range().try_lt(Tensor::from_slice(starts).try_reshape([b, 1, n, 1]).unwrap()).unwrap());
+    let mask = match (padding, segments) {
+        (Some(p), Some(s)) => Some(p.try_bitor(&s).unwrap()),
+        (p, s) => p.or(s),
+    };
     perm(q)
         .scaled_dot_product_attention()
         .key(&perm(k))
@@ -992,12 +1065,12 @@ fn test_fa_cuda(b: usize, n: usize, h: usize, h_kv: usize, d: usize, dtype: DTyp
     let (q, k, v) = (mk(h), mk(h_kv), mk(h_kv));
     let lens: Option<Vec<i32>> = valid.map(|l| vec![l; b]);
     let lens_t = lens.as_ref().map(|l| Tensor::from_slice(l.as_slice()));
-    let got = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref() })
+    let got = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref(), seg_start: None })
         .expect("fa")
         .expect("the FA kernel applies on CUDA sm_80+")
         .cast(DType::Float32);
     got.realize().expect("realize");
-    let reference = fa_reference(&q, &k, &v, causal, lens.as_deref());
+    let reference = fa_reference(&q, &k, &v, causal, lens.as_deref(), None);
     reference.realize().expect("realize reference");
     let report = svod_tensor::testing::allclose_f32(
         &got.as_vec::<f32>().expect("read"),
@@ -1041,12 +1114,12 @@ fn fa_cuda_holds_away_from_unit_variance(scale: f32) {
     let (q, k, v) = (mk(), mk(), mk());
     let lens = vec![1500i32; b];
     let lens_t = Tensor::from_slice(lens.as_slice());
-    let got = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens_t) })
+    let got = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: Some(&lens_t), seg_start: None })
         .expect("fa")
         .expect("the FA kernel applies on CUDA sm_80+")
         .cast(DType::Float32);
     got.realize().expect("realize");
-    let reference = fa_reference(&q, &k, &v, false, Some(lens.as_slice()));
+    let reference = fa_reference(&q, &k, &v, false, Some(lens.as_slice()), None);
     reference.realize().expect("realize reference");
     let report = svod_tensor::testing::allclose_f32(
         &got.as_vec::<f32>().expect("read"),
@@ -1076,7 +1149,7 @@ fn fa_sink_leaves_no_range_in_scope(arch: svod_dtype::GpuArch, unroll: bool) {
     let caps = crate::ArchCaps::for_arch(arch);
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
     let ker = Kernel::new("fa", grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, FaMask::NONE);
     let sink = ker.finish(1);
     assert!(sink.in_scope_ranges().is_empty(), "RANGE {:?} still open at the SINK", sink.in_scope_ranges());
 }
@@ -1120,7 +1193,7 @@ fn render_fa_metal(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, 
     let caps = crate::ArchCaps::for_arch(svod_dtype::GpuArch::Metal(family));
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
     let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, false);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, FaMask::NONE);
     let sink = ker.finish(1);
     let renderer = svod_codegen::c::CRenderer::metal();
     let opt_renderer = svod_schedule::OptimizerRenderer::for_metal_family(family).with_rewrite_capabilities(
@@ -1184,7 +1257,7 @@ fn diag_fa_structure() {
         t
     };
     let (q, k, v) = (mk(), mk(), mk());
-    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None })
+    let og = flash_attention_with(&q, &k, &v, FaOpts { causal: false, key_lens: None, seg_start: None })
         .expect("fa")
         .expect("applies")
         .cast(DType::Float32);

@@ -28,9 +28,14 @@ fn bench_fa(c: &mut Criterion) {
         let (q, k, v) = (randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h, d]));
 
         // The model's exact call: non-causal, no key padding.
-        let fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: false, key_lens: None })
-            .expect("flash_attention_with")
-            .expect("FA kernel applies for bench shape");
+        let fa = svod_tk::flash_attention_with(
+            &q,
+            &k,
+            &v,
+            svod_tk::FaOpts { causal: false, key_lens: None, ..Default::default() },
+        )
+        .expect("flash_attention_with")
+        .expect("FA kernel applies for bench shape");
         let fa_plan = fa.prepare().expect("prepare fa");
         group.bench_with_input(BenchmarkId::new("tk", n), &n, |bencher, _| {
             bench_kernel(bencher, &fa_plan, "flash_attention")
@@ -54,9 +59,14 @@ fn bench_fa(c: &mut Criterion) {
         let id = format!("{b}x{n}");
         group.throughput(Throughput::Elements((2.0 * (b * h * d) as f64 * (n as f64).powi(2)) as u64));
         let (q, k, v) = (randn_bf16(&[b, n, h, d]), randn_bf16(&[b, n, h_kv, d]), randn_bf16(&[b, n, h_kv, d]));
-        let fa = svod_tk::flash_attention_with(&q, &k, &v, svod_tk::FaOpts { causal: true, key_lens: None })
-            .expect("flash_attention_with")
-            .expect("FA kernel applies for bench shape");
+        let fa = svod_tk::flash_attention_with(
+            &q,
+            &k,
+            &v,
+            svod_tk::FaOpts { causal: true, key_lens: None, ..Default::default() },
+        )
+        .expect("flash_attention_with")
+        .expect("FA kernel applies for bench shape");
         let fa_plan = fa.prepare().expect("prepare fa");
         group.bench_with_input(BenchmarkId::new("tk", &id), &id, |bencher, _| {
             bench_kernel(bencher, &fa_plan, "flash_attention")

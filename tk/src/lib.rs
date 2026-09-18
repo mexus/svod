@@ -77,8 +77,8 @@ const _: () = assert!(WARP_THREADS == ArchCaps::GFX942.wave_size);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{
-    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaOpts, flash_attention, flash_attention_supported, flash_attention_tuned,
-    flash_attention_with,
+    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOpts, flash_attention, flash_attention_supported,
+    flash_attention_tuned, flash_attention_with,
 };
 pub use kernels::gemm::{Epilogue, GemmCfg, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, matmul, swiglu_pair_width};
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};
