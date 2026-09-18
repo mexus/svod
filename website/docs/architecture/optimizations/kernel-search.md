@@ -118,6 +118,13 @@ SVOD_NOOPT=1 cargo run
 
 # Enable beam search with width 8
 BEAM=8 cargo run
+
+# Tensor-core level: 1 never pads a non-divisible axis, 2 (default) pads
+# when the padding adds at most a quarter to the axis, 3 pads regardless
+TC_OPT=1 cargo run
+
+# Skip the hand kernels' first-use tile tuning and take each table's static choice
+SVOD_TK_TUNE=0 cargo run
 ```
 
 Or programmatically:

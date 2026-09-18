@@ -316,15 +316,13 @@ pub struct HeuristicsConfig {
     pub tc_enabled: TcUsage,
     /// Tensor core optimization level.
     ///
-    /// Defaults to [`TcOpt::Relaxed`] (`TC_OPT=1`), one step above tinygrad's
-    /// heuristic default (`helpers.py:238`): convolutions lower to a reduce
-    /// over (channels, taps), and a scalar path there runs at 1-3 TFLOPS where
-    /// the tensor core on the channel axis with the taps as an outer loop runs
-    /// at 4-18 TFLOPS on every measured shape (RTX 3060, f16). `TC_OPT=2` is
-    /// only the *BEAM action space* default (`search.py:22`), so the heuristic
-    /// path must not inherit it — tensor cores would silently PADTO a shape the
-    /// author did not ask to pad. Benchmarks that want the padded behaviour
-    /// set it explicitly.
+    /// Defaults to [`TcOpt::Padded`] (`TC_OPT=2`): the tensor core takes any
+    /// divisible reduce axis (convolutions lower to a reduce over channels and
+    /// taps, and the scalar path there runs at a fraction of the WMMA's), and a
+    /// non-divisible M/N/K is padded when the padding adds at most a quarter
+    /// to the axis, so a 1500-row GEMM tiles at 1504
+    /// while a 5-row GEMV stays scalar. `TC_OPT=3` pads without the budget,
+    /// tinygrad's `TC_OPT=2`; `TC_OPT=1` never pads.
     pub tc_opt: TcOpt,
     /// Tensor core selection mode.
     pub tc_select: TcSelect,
