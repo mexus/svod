@@ -3,9 +3,11 @@
 use std::path::Path;
 
 use svod_dtype::DType;
+use svod_tensor::Tensor;
 
 use crate::state::{self, StateDict};
 
+use super::blocks::conv::YOLO_BN_EPS;
 use super::error::Result;
 
 /// Download `model.safetensors` from HuggingFace Hub.
@@ -38,6 +40,35 @@ pub fn cast_weights(sd: &StateDict, dtype: &DType) -> StateDict {
         .collect()
 }
 
+/// Fold every `YoloConv`'s batch norm into its convolution: `conv.weight`
+/// scales by `gamma / sqrt(var + eps)` per output channel and a `conv.bias` of
+/// `beta - mean * scale` appears beside it, which [`YoloConv`] takes as the
+/// sign that the norm is already applied. The conv kernel then reads two
+/// buffers instead of six and its epilogue is a bias and the activation, as
+/// Ultralytics' `fuse()` leaves it. Folded in f32, before any narrowing.
+///
+/// [`YoloConv`]: super::blocks::conv::YoloConv
+pub fn fold_batchnorm(sd: &StateDict) -> Result<StateDict> {
+    let mut out = sd.clone();
+    for (key, weight) in sd {
+        let Some(prefix) = key.strip_suffix("conv.weight") else { continue };
+        let bn = |name: &str| sd.get(&format!("{prefix}bn.{name}")).map(|t| t.cast(DType::Float32));
+        let (Some(gamma), Some(beta), Some(mean), Some(var)) =
+            (bn("weight"), bn("bias"), bn("running_mean"), bn("running_var"))
+        else {
+            continue;
+        };
+        let scale = var.try_add(Tensor::const_(YOLO_BN_EPS, DType::Float32))?.try_rsqrt()?.try_mul(&gamma)?;
+        let bias = beta.try_sub(&mean.try_mul(&scale)?)?;
+        let cout = weight.dim_const(0)?;
+        let scale = scale.try_reshape(vec![cout as isize, 1, 1, 1])?;
+        let folded = weight.cast(DType::Float32).try_mul(&scale)?.cast(weight.dtype());
+        out.insert(key.clone(), folded);
+        out.insert(format!("{prefix}conv.bias"), bias.cast(weight.dtype()));
+    }
+    Ok(out)
+}
+
 /// [`cast_weights`], materialised — the checkpoint path.
 ///
 /// Left lazy, every conv would re-read the checkpoint's bytes and convert per
@@ -49,10 +80,7 @@ pub fn cast_weights(sd: &StateDict, dtype: &DType) -> StateDict {
 /// saves fp16 and the converters widen it on the way in, so the f32 on disk
 /// carries no more information than the f16 it came from.
 pub fn load_weights(sd: &StateDict, dtype: &DType) -> Result<StateDict> {
-    if sd.values().all(|t| !t.dtype().is_float() || t.dtype() == *dtype) {
-        return Ok(sd.clone());
-    }
-    let cast = cast_weights(sd, dtype);
+    let cast = cast_weights(&fold_batchnorm(sd)?, dtype);
     for tensor in cast.values() {
         tensor.realize()?;
     }
