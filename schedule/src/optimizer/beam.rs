@@ -84,10 +84,13 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     actions.push(Opt::local(0, 32));
     actions.push(Opt::local(6, 2));
 
-    // TC: tensor cores. 1 default-axis action + 9 axis variants = 10 actions.
-    // Survivors after post-compile dedup are unchanged compared to a wider
-    // brute-force enumeration because `seen_libs` collapses duplicate kernels.
-    const TC_AXIS_CHOICES: usize = 9;
+    // TC: tensor cores. 1 default-axis action + 18 axis variants = 19 actions.
+    // `detect_matmul` lists every (N, M, K) with the operands one way round and
+    // then the other; a conv with two spatial axes and a three-axis reduce has
+    // twelve. Survivors after post-compile dedup are unchanged compared to a
+    // wider brute-force enumeration because `seen_libs` collapses duplicate
+    // kernels, and an out-of-range choice fails in `apply_opt` at no cost.
+    const TC_AXIS_CHOICES: usize = 18;
     const TC_OPT_DEFAULT: usize = 0;
     const TC_OPT_AXIS: usize = 2;
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1);
