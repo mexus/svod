@@ -79,7 +79,7 @@ const SUBGROUP: usize = 8;
 pub struct SqPolicy {
     pub compute_units: usize,
     /// Waves per compute unit the split aims to keep in flight; `0` keeps one
-    /// split, for a device that does not report its budget.
+    /// split, for a caller that wants the kernel unsplit.
     pub waves_per_cu: usize,
     /// Fewest keys a split may hold.
     pub min_chunk: usize,
@@ -99,6 +99,16 @@ const SQ_CANDIDATES: usize = 4;
 /// part the splits between 2 and 10 did.
 const MIN_TRIPS: usize = 15;
 
+/// The `(compute units, waves per CU)` assumed of a device that reports
+/// neither. The probe reads the KFD topology or the CUDA limits, both of which
+/// can come back empty on a part the launch otherwise supports — a node whose
+/// properties omit `simd_per_cu`, sysfs absent in a container — and keeping one
+/// split there runs large-v3's 1500-key cross attention as a single
+/// latency-bound wave per `(row, head)`. A small discrete part's budget, which
+/// puts that geometry near the split the kernel shipped before it read the
+/// device.
+const UNREPORTED_BUDGET: (usize, usize) = (16, 32);
+
 impl SqPolicy {
     /// A policy for `arch` that aims `compute_units * waves_per_cu` waves at
     /// the device; `waves_per_cu == 0` keeps one split.
@@ -108,11 +118,11 @@ impl SqPolicy {
     }
 
     /// The policy of the device behind `spec`: its compute units and the waves
-    /// each keeps resident ([`crate::target::resident_waves_per_cu`]); one
-    /// split when the backend reports neither.
+    /// each keeps resident ([`crate::target::resident_waves_per_cu`]), or
+    /// [`UNREPORTED_BUDGET`] when the backend reports neither.
     pub fn for_device(spec: &svod_dtype::DeviceSpec, arch: svod_dtype::GpuArch) -> Self {
         let budget = crate::target::compute_units(spec).zip(crate::target::resident_waves_per_cu(spec));
-        let (compute_units, waves_per_cu) = budget.unwrap_or((1, 0));
+        let (compute_units, waves_per_cu) = budget.unwrap_or(UNREPORTED_BUDGET);
         Self::with_budget(arch, compute_units, waves_per_cu)
     }
 
@@ -172,28 +182,33 @@ impl SqPolicy {
         let placeholder = |shape: &[usize], dtype: &DType| {
             UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, shape.iter().product(), dtype.clone())
         };
-        let builds: Vec<u128> = candidates
-            .iter()
-            .map(|&splits| {
-                let mut bufs = vec![
-                    placeholder(&[b, splits, h, d], &f32),
-                    placeholder(&[b, splits, h, 2], &f32),
-                    placeholder(&[b, 1, h, d], &f32),
-                    placeholder(&[geom.kv_batch, n, geom.heads.total, d], &geom.kv),
-                    placeholder(&[geom.kv_batch, n, geom.heads.total, d], &geom.kv),
-                ];
-                if cache_map {
-                    bufs.push(placeholder(&[b], &DType::Int32));
-                }
-                let ker = Kernel::new("sq_attention_partial", [h as i64, b as i64, splits as i64], block, bufs, caps);
-                build_single_query_attention_partial(&ker, geom.clone(), splits, cache_map);
-                crate::kernel_fingerprint(&ker.finish(2)).digest
-            })
-            .collect();
+        // The store line covers the candidate kernels' graphs, fingerprinted in
+        // candidate order; only a memo miss pays for building them.
+        let builds = || {
+            candidates
+                .iter()
+                .map(|&splits| {
+                    let mut bufs = vec![
+                        placeholder(&[b, splits, h, d], &f32),
+                        placeholder(&[b, splits, h, 2], &f32),
+                        placeholder(&[b, 1, h, d], &f32),
+                        placeholder(&[geom.kv_batch, n, geom.heads.total, d], &geom.kv),
+                        placeholder(&[geom.kv_batch, n, geom.heads.total, d], &geom.kv),
+                    ];
+                    if cache_map {
+                        bufs.push(placeholder(&[b], &DType::Int32));
+                    }
+                    let grid = [h as i64, b as i64, splits as i64];
+                    let ker = Kernel::new("sq_attention_partial", grid, block, bufs, caps);
+                    build_single_query_attention_partial(&ker, geom.clone(), splits, cache_map);
+                    crate::kernel_fingerprint(&ker.finish(2)).digest
+                })
+                .collect()
+        };
         let shape = [b, geom.kv_batch, n, h, geom.heads.total, d, geom.kv.bytes(), usize::from(cache_map)];
-        let key = crate::tune::TuneKey::new("sq_attention", spec, arch, &shape, &builds);
+        let key = crate::tune::TuneKey::new("sq_attention", spec, arch, &shape, &(&candidates, &geom.kv));
         store
-            .select_with(&key, candidates.len(), || {
+            .select_with(&key, candidates.len(), builds, || {
                 // The cache keeps its real strides but only the rows the kernel
                 // reads — a map of zeros names row 0 — and is filled on the
                 // device: timing does not depend on its values.

@@ -696,14 +696,14 @@ fn undivisible_head_dim_declines_instead_of_erroring() {
 // ─── Split policy ────────────────────────────────────────────────────────────
 
 /// The policy aims the split at the wave budget over divisors that keep a
-/// chunk, preferring chunks with no partial tail; a device that reports no
-/// budget keeps one split, and so does a key range too short to chunk.
+/// chunk, preferring chunks with no partial tail; an explicit zero budget
+/// keeps one split, and so does a key range too short to chunk.
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 5, 20, 1500, 15, &[5, 10, 12, 15]; "whisper large cross attention on a 40-cu rdna part")]
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 1, 6, 1500, 25, &[3, 5, 15, 25]; "tiny heads want more splits")]
 #[test_case(GpuArch::Amd(AmdArch::Gfx1151), (40, 32), 5, 20, 64, 1, &[]; "a short key range stays whole")]
 #[test_case(GpuArch::Amd(AmdArch::Gfx942), (304, 32), 5, 20, 1500, 12, &[5, 6, 10, 12]; "a 304-cu wave64 part is capped by its 120-key floor")]
 #[test_case(SM_86, (28, 16), 5, 20, 1500, 5, &[3, 4, 5, 6]; "whisper large cross attention on a 28-sm ampere part")]
-#[test_case(SM_86, (28, 0), 5, 20, 1500, 1, &[]; "no budget keeps one split")]
+#[test_case(SM_86, (28, 0), 5, 20, 1500, 1, &[]; "an explicit zero budget keeps one split")]
 fn sq_policy_splits_toward_the_wave_budget(
     arch: GpuArch,
     (compute_units, waves_per_cu): (usize, usize),
@@ -780,9 +780,26 @@ fn sq_policy_reads_the_device_budget_gpu() {
     let arch = crate::target::resolve_arch(&spec).expect("a GPU arch");
     let policy = crate::SqPolicy::for_device(&spec, arch);
     eprintln!("{policy:?}");
-    if policy.waves_per_cu == 0 {
-        return;
+    match crate::target::compute_units(&spec).zip(crate::target::resident_waves_per_cu(&spec)) {
+        Some(budget) => assert_eq!((policy.compute_units, policy.waves_per_cu), budget),
+        // A part the launch supports but the probe does not describe.
+        None => assert!(policy.split(5, 20, 1500) > 1, "the assumed budget still splits"),
     }
-    assert_eq!(Some(policy.compute_units), crate::target::compute_units(&spec));
-    assert_eq!(Some(policy.waves_per_cu), crate::target::resident_waves_per_cu(&spec));
+}
+
+/// A device whose probe reports no wave budget — the KFD node without
+/// `simd_per_cu`, the CUDA limits that failed to open — still splits a long
+/// cross attention: the assumed budget stands in, so large-v3's 1500 keys do
+/// not run as one latency-bound wave per `(row, head)`.
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151); "rdna wave32")]
+#[test_case(SM_86; "ampere")]
+fn sq_policy_falls_back_when_the_device_reports_no_budget(arch: GpuArch) {
+    // No backend probe answers for a host spec: the unreported path.
+    let policy = crate::SqPolicy::for_device(&DeviceSpec::Cpu, arch);
+    assert_ne!(policy.waves_per_cu, 0, "an unreported budget must not disable the split");
+    assert_eq!(policy.split(5, 20, 1500), 5, "whisper large-v3 cross attention");
+    assert!(!policy.candidates(5, 20, 1500).is_empty(), "the tuner still gets candidates");
+    // A short key range is still whole, and an explicit zero budget still opts out.
+    assert_eq!(policy.split(5, 20, 64), 1);
+    assert_eq!(crate::SqPolicy::with_budget(arch, 40, 0).split(5, 20, 1500), 1);
 }
