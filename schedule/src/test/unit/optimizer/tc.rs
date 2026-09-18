@@ -87,7 +87,7 @@ fn detect_matmul_matches_a_mul_under_the_reduce(fused: bool) {
     let pattern = matching::detect_matmul(&scheduler).expect("detection must not fail").expect("a matmul");
 
     assert_eq!((pattern.in0_ranges.len(), pattern.in1_ranges.len(), pattern.red_ranges.len()), (1, 1, 1));
-    assert_eq!(pattern.axis_choices.len(), 1);
+    assert_eq!(pattern.axis_choices.len(), 2, "one choice per way round");
 }
 
 /// A concat gate lands between the REDUCE and its MUL, and `matmul_operands`
@@ -117,15 +117,30 @@ fn a_concat_gate_costs_the_matmul_until_pre_optimization_lifts_it() {
 }
 
 /// The detected ranges are sorted by axis id descending, so axis choice 0 is
-/// the highest-id N.
+/// the highest-id N; the choices with the operands' roles exchanged follow.
 #[test]
 fn detect_matmul_orders_the_axis_choices_by_axis_id() {
     let scheduler = Scheduler::new(two_n_matmul(15, 16), Renderer::metal());
     let pattern = matching::detect_matmul(&scheduler).unwrap().expect("two-N matmul detected");
     let extents: Vec<_> = pattern.axis_choices.iter().map(|choice| expect_range_extent(&choice.0)).collect();
 
+    assert_eq!(pattern.axis_choices.len(), 4);
+    assert_eq!(extents[..2], [15, 16], "the highest-id N leads");
+    assert_eq!(extents[2..], [16, 16], "then in0's only range serves as N against either in1 range");
+}
+
+/// Each operand is offered on either side of the core: the swapped choices
+/// take N from in0 and M from in1.
+#[test]
+fn detect_matmul_offers_the_operands_both_ways_round() {
+    let scheduler = Scheduler::new(matmul_accum(16, 16, 16, DType::Float16, DType::Float32), Renderer::cuda());
+    let pattern = matching::detect_matmul(&scheduler).unwrap().expect("matmul detected");
+
     assert_eq!(pattern.axis_choices.len(), 2);
-    assert_eq!(extents, vec![15, 16], "the highest-id N leads");
+    let (n, m, _) = &pattern.axis_choices[0];
+    assert!(Arc::ptr_eq(n, &pattern.in1_ranges[0]) && Arc::ptr_eq(m, &pattern.in0_ranges[0]), "in1 takes N first");
+    let (n, m, _) = &pattern.axis_choices[1];
+    assert!(Arc::ptr_eq(n, &pattern.in0_ranges[0]) && Arc::ptr_eq(m, &pattern.in1_ranges[0]), "then in0 takes N");
 }
 
 /// A `None` verdict is a decline, not an error: a kernel with no REDUCE and a
@@ -328,7 +343,7 @@ fn apply_pads_non_divisible_dimensions(m: i64, n: i64, k: i64, tc_opt: usize, ma
 #[test_case(4, 16, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "4 -> 16 is a 4x work increase")]
 #[test_case(5, 16, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "a beam width of 5 never pays for a 16-row tile")]
 #[test_case(16, 12, 16, 2, "padding to the tensor-core tile would add too much work", "TC"; "12 -> 16 is a third more work")]
-#[test_case(4, 16, 16, 3, "padding would add more than 4x work", "PADTO"; "unbounded padding keeps only the 4x limit")]
+#[test_case(2, 16, 16, 3, "padding would add more than 4x work", "PADTO"; "unbounded padding keeps only the 4x limit, on either side")]
 fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize, reason: &str, op: &str) {
     let mut scheduler = Scheduler::new(matmul_accum(m, n, k, DType::Float16, DType::Float32), Renderer::cuda());
     let error = apply_with_axis_choice(&mut scheduler, 0, tc_opt, 1, None).expect_err("not divisible");
@@ -345,7 +360,7 @@ fn apply_rejects_a_non_divisible_dimension(m: i64, n: i64, k: i64, tc_opt: usize
 /// (20 -> 32, 1.6x the MACs) still leaves the core far ahead of the scalar loop
 /// it displaces; the same 20-row tail on a 16-column GEMV is only more work.
 #[test_case(768, 6912, true; "a 20x20 conv output pads past the budget")]
-#[test_case(16, 32, false; "a memory-bound kernel keeps to the budget")]
+#[test_case(12, 32, false; "a memory-bound kernel keeps to the budget on either side")]
 fn the_pad_budget_yields_to_a_compute_bound_kernel(n: i64, k: i64, pads: bool) {
     let mut scheduler = Scheduler::new(two_m_matmul(20, 20, n, k), Renderer::cuda());
     let result = apply_with_axis_choice(&mut scheduler, 0, 2, 1, None);
@@ -358,6 +373,37 @@ fn the_pad_budget_yields_to_a_compute_bound_kernel(n: i64, k: i64, pads: bool) {
             "{error:?}"
         );
     }
+}
+
+/// A conv's 20-wide spatial axis is M when the input is the MUL's first
+/// operand: 20 pads to 32 on CUDA's 16-row M side, past the budget, and the
+/// kernel lost its tensor core. With the operands the other way round the
+/// out-channel axis takes M and the spatial axis pads to 24 on the 8-wide N
+/// side. The swapped choice commutes the MUL, so A still carries M.
+#[test]
+fn a_swapped_choice_tiles_an_axis_that_only_fits_the_n_side() {
+    let sink = matmul_accum(20, 768, 64, DType::Float16, DType::Float32);
+
+    let mut direct = Scheduler::new(sink.clone(), Renderer::cuda());
+    let error = apply_with_axis_choice(&mut direct, 0, 2, 1, Some(0)).expect_err("20 -> 32 is past the budget");
+    assert!(matches!(error, OptError::ValidationFailed { reason, .. }
+        if reason == "padding to the tensor-core tile would add too much work"));
+
+    let mut swapped = Scheduler::new(sink.clone(), Renderer::cuda());
+    let [n, m, _] = apply_with_axis_choice(&mut swapped, 0, 2, 1, None).expect("the swapped choice pads 20 -> 24");
+    assert_eq!(count(swapped.ast(), |node| matches!(node.op(), Op::Ternary(svod_ir::TernaryOp::Where, ..))), 2);
+    let wmma = first_op(swapped.ast(), |op| matches!(op, Op::Wmma(..))).expect("a WMMA");
+    let Op::Wmma(ops::Wmma { a, b, .. }) = wmma.op() else { unreachable!() };
+    let axis_id = |range: &Arc<UOp>| unwrap_op!(range, Op::Range(ops::Range { axis_id, .. }) => axis_id).clone();
+    let carries = |operand: &Arc<UOp>, range: &Arc<UOp>| {
+        let want = axis_id(range);
+        operand
+            .toposort()
+            .iter()
+            .any(|node| matches!(node.op(), Op::Range(ops::Range { axis_id, .. }) if *axis_id == want))
+    };
+    assert!(carries(a, &m) && !carries(a, &n), "A carries M (the 768 out-channels), not N");
+    assert!(carries(b, &n) && !carries(b, &m), "B carries N (the padded 20 -> 24 spatial axis), not M");
 }
 
 /// `C[n,k] = Σ_d A[n,d] · B[d,k]`, optionally reduced again over `k`: the matmul's
@@ -436,7 +482,7 @@ fn apply_rejects_a_symbolic_dimension(divisible: bool, tc_opt: usize, reason: &s
 #[test_case(-1, 1, 3, None, "use_tensor_cores must be 1 or 2"; "only 1 and 2 are accepted")]
 #[test_case(-1, 4, 1, None, "tc_opt must be 0, 1, 2, or 3"; "tc_opt above three")]
 #[test_case(-1, 1, 1, Some(5), "axis choice out of bounds"; "past the last axis choice")]
-#[test_case(-1, 1, 1, Some(1), "axis choice out of bounds"; "a choice the pattern does not have")]
+#[test_case(-1, 1, 1, Some(2), "axis choice out of bounds"; "a choice the pattern does not have")]
 fn apply_validates_its_arguments(
     tc_select: i32,
     tc_opt: usize,

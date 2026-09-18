@@ -136,7 +136,7 @@ fn beam_actions_cover_every_opt_kind_in_amount_major_order() {
         padding != 0,
         "PADTO is offered iff BEAM_PADTO is set"
     );
-    assert_eq!(BEAM_ACTIONS.len(), 48 + 15 + 42 + 24 + 12 + 2 + 10 + 10 + 30 + padding, "grid size");
+    assert_eq!(BEAM_ACTIONS.len(), 48 + 15 + 42 + 24 + 12 + 2 + 19 + 10 + 30 + padding, "grid size");
     assert_eq!(BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::THREAD).count(), 30);
     let upcasts: Vec<_> = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::UPCAST).collect();
     assert_eq!(upcasts.len(), 48);
@@ -148,7 +148,7 @@ fn beam_actions_cover_every_opt_kind_in_amount_major_order() {
     let use_tc = std::env::var("TC").ok().and_then(|value| value.parse().ok()).unwrap_or(1usize);
     let tc_opt = std::env::var("TC_OPT").ok().and_then(|value| value.parse().ok()).unwrap_or(2usize);
     let tensor_cores: Vec<_> = BEAM_ACTIONS.iter().filter(|action| action.op == OptOps::TC).collect();
-    assert_eq!(tensor_cores.len(), 10);
+    assert_eq!(tensor_cores.len(), 19, "a strict default plus eighteen axis choices, both ways round");
     assert_eq!(tensor_cores.iter().filter(|action| action.arg.tc().unwrap().1 == 0).count(), 1);
     assert!(tensor_cores[1..].iter().all(|action| action.arg.tc() == Ok((-1, tc_opt, use_tc))));
 }
