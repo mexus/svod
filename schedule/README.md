@@ -61,6 +61,8 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Matvec optimization | ✅ | Specialized MV pattern |
 | CPU threading | ✅ | `core_id` split, `SVOD_THREADS` ways by default |
 | Axis reordering | ✅ | SWAP for memory access |
+| PADTO | ✅ | Pad an axis to TC alignment; `BEAM_PADTO` adds it to BEAM |
+| Kernel caching | ✅ | In-process dedup, plus a persistent compiled-object cache |
 | **RANGEIFY** | | |
 | Movement op removal | ✅ | RESHAPE, PERMUTE, EXPAND, etc. |
 | Buffer folding | ✅ | Remove noop BUFFERIZE |
@@ -70,11 +72,10 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 | Kernel splitting | ✅ | Split by STORE operations |
 | Reduce splitting | ✅ | 2-stage large reductions |
 | Buffer cost analysis | ✅ | PContig cost model |
+| Multi-device shard | ✅ | Single-axis `Op::Multi`, host-staged allreduce |
 | **Planned** | | |
 | Image float4 | ❌ | Image type vectorization |
-| Multi-device | ❌ | Ring allreduce, multi-rank |
-| Kernel caching | ❌ | Compile cache |
-| PADTO | ❌ | Axis padding for alignment |
+| Ring allreduce | ❌ | Multi-rank collectives; the shard subset above is host-staged |
 
 ## Testing
 
