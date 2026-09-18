@@ -7,7 +7,7 @@
 //! the single place those are derived from a [`GpuArch`], so the builders thread
 //! one value instead of hardcoding gfx942 (wave64) literals.
 //!
-//! Two layers of support, resolved per arch:
+//! Three layers of support, resolved per arch:
 //!
 //! - **Control path** — [`ArchCaps::wave_size`] (warp/lane math, launch block).
 //!   Defined for every arch; the shuffle-only kernels (single-query attention)
@@ -29,6 +29,9 @@
 //!   ([`FragRole::Operand`]). Unresolved (`None`) on pre-Ampere CUDA and
 //!   pre-Apple7 Metal, so an MMA kernel fails loudly at fragment resolution instead
 //!   of rendering a wrong layout.
+//! - **Scheduling** — [`ArchCaps::needs_pipeline_commit_fence`], where a backend
+//!   compiler's own reordering is named, so a kernel asks for the property it
+//!   needs rather than for the arch that has it.
 //!
 //! gfx942 is the validated/calibrated target — the register-tile fragment-layout
 //! tables ([`crate::tiles`] strides and `group::mma`'s per-lane upcast counts) and
@@ -265,5 +268,16 @@ impl ArchCaps {
             // accumulator feeds (FA's `att → att_mma`), so the handoff is a copy.
             GpuArch::Metal(_) => true,
         }
+    }
+
+    /// Whether the machine scheduler has to be fenced to keep a pipelined trip's
+    /// LDS commit *after* that trip's MMAs. True on gfx12, whose AMDGPU
+    /// scheduler otherwise hoists the whole commit — the `ds_write`s, their wait
+    /// on the prefetch, and the closing barrier — above the MMAs, leaving the
+    /// workgroup waiting on global memory with no MMA in flight to cover it.
+    /// False elsewhere: no other backend has been measured to need it, and the
+    /// fence splits the trip into two scheduling regions.
+    pub fn needs_pipeline_commit_fence(&self) -> bool {
+        self.arch.amd().is_some_and(AmdArch::is_rdna4)
     }
 }

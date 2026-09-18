@@ -9,9 +9,21 @@ use test_case::test_case;
 
 use crate::tune::{TuneKey, TuneStore};
 
-fn key(kernel: &'static str, shape: &[usize], builds: &[u128]) -> TuneKey {
+/// A key over `candidates` (the cheap identity of the candidate set the memo is
+/// keyed by) — `builds`, the candidate graphs' fingerprints, reaches the store
+/// separately, so it is supplied per call.
+fn key(kernel: &'static str, shape: &[usize], candidates: &[usize]) -> TuneKey {
     let arch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1151);
-    TuneKey::new(kernel, &DeviceSpec::Cpu, arch, shape, builds)
+    TuneKey::new(kernel, &DeviceSpec::Cpu, arch, shape, &candidates)
+}
+
+/// A fingerprint closure that records whether it ran: the memo must answer
+/// without it, since building the candidate graphs is what it costs.
+fn builds(digests: &[u128], ran: &std::cell::Cell<bool>) -> impl FnOnce() -> Vec<u128> {
+    move || {
+        ran.set(true);
+        digests.to_vec()
+    }
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -22,25 +34,25 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The first selection measures and keeps the fastest; a second store on the
-/// same directory reads it back without measuring; a different candidate list
-/// (a table or kernel change) is a different key.
+/// same directory reads it back without measuring; a different candidate set is
+/// a different key, and so is the same set built into different kernels.
 #[test]
 fn a_measured_winner_round_trips_through_the_store() {
     let dir = scratch("round-trip");
     let store = TuneStore::at(Some(dir.clone()));
-    let k = key("gemm_nt", &[1024, 1024, 6144], &[10, 20, 30]);
-    let mut measured = false;
-    let chosen = store.select_with(&k, 3, || {
+    let k = key("gemm_nt", &[1024, 1024, 6144], &[1, 2, 3]);
+    let (mut measured, fingerprinted) = (false, std::cell::Cell::new(false));
+    let chosen = store.select_with(&k, 3, builds(&[10, 20, 30], &fingerprinted), || {
         measured = true;
         vec![Some(300), Some(100), Some(200)]
     });
-    assert_eq!((chosen, measured), (Some(1), true));
+    assert_eq!((chosen, measured, fingerprinted.get()), (Some(1), true, true));
 
     let again = TuneStore::at(Some(dir.clone()));
     let mut ran = false;
-    let k2 = key("gemm_nt", &[1024, 1024, 6144], &[10, 20, 30]);
+    let k2 = key("gemm_nt", &[1024, 1024, 6144], &[1, 2, 3]);
     assert_eq!(
-        again.select_with(&k2, 3, || {
+        again.select_with(&k2, 3, builds(&[10, 20, 30], &std::cell::Cell::new(false)), || {
             ran = true;
             vec![None; 3]
         }),
@@ -48,8 +60,37 @@ fn a_measured_winner_round_trips_through_the_store() {
     );
     assert!(!ran, "a stored winner is not re-measured");
 
-    assert_ne!(key("gemm_nt", &[1024, 1024, 6144], &[10, 20, 31]), k2, "the candidate kernels are part of the key");
+    // The same candidate set built into different kernels shares the memo key
+    // but not the store line, so the store re-measures it.
+    let kernel_change = TuneStore::at(Some(dir.clone()));
+    let mut remeasured = false;
+    assert_eq!(
+        kernel_change.select_with(&k2, 3, builds(&[10, 20, 31], &std::cell::Cell::new(false)), || {
+            remeasured = true;
+            vec![Some(1), Some(2), Some(3)]
+        }),
+        Some(0)
+    );
+    assert!(remeasured, "a kernel change re-measures");
+
+    assert_ne!(key("gemm_nt", &[1024, 1024, 6144], &[1, 2, 4]), k2, "the candidate set is part of the key");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A memo hit answers without building a single candidate graph: the whole point
+/// of keying the memo by the request rather than by the built kernels, since a
+/// plan asks the same shape once per node.
+#[test]
+fn a_memoized_choice_builds_no_candidate() {
+    let store = TuneStore::at(None);
+    let k = key("gemm_nt", &[4096, 1024, 6144], &[1, 2, 3]);
+    let first = std::cell::Cell::new(false);
+    assert_eq!(store.select_with(&k, 3, builds(&[7, 8, 9], &first), || vec![Some(3), Some(1), Some(2)]), Some(1));
+    assert!(first.get(), "the first call fingerprints the candidates for the store line");
+
+    let again = std::cell::Cell::new(false);
+    assert_eq!(store.select_with(&k, 3, builds(&[7, 8, 9], &again), || panic!("a memo hit must not measure")), Some(1));
+    assert!(!again.get(), "a memo hit must not build the candidate kernels");
 }
 
 /// A candidate that cannot run is skipped, and when none can, nothing is kept:
@@ -59,8 +100,13 @@ fn unmeasured_candidates_are_never_cached() {
     let dir = scratch("unmeasured");
     let store = TuneStore::at(Some(dir.clone()));
     let k = key("fa", &[8, 512, 16, 128], &[1, 2]);
-    assert_eq!(store.select_with(&k, 2, || vec![None, None]), None);
-    assert_eq!(store.select_with(&k, 2, || vec![None, Some(5)]), Some(1), "the runnable candidate wins");
+    let seen = std::cell::Cell::new(false);
+    assert_eq!(store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![None, None]), None);
+    assert_eq!(
+        store.select_with(&k, 2, builds(&[1, 2], &seen), || vec![None, Some(5)]),
+        Some(1),
+        "the runnable candidate wins"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -71,11 +117,12 @@ fn a_stale_index_is_ignored_and_a_memory_store_memoizes() {
     let dir = scratch("stale");
     let store = TuneStore::at(Some(dir.clone()));
     let k = key("gemm_nt", &[64, 64, 192], &[7, 8, 9]);
-    assert_eq!(store.select_with(&k, 3, || vec![Some(10), Some(9), Some(8)]), Some(2));
+    let seen = std::cell::Cell::new(false);
+    assert_eq!(store.select_with(&k, 3, builds(&[7, 8, 9], &seen), || vec![Some(10), Some(9), Some(8)]), Some(2));
     let fresh = TuneStore::at(Some(dir.clone()));
     let mut measured = false;
     assert_eq!(
-        fresh.select_with(&k, 2, || {
+        fresh.select_with(&k, 2, builds(&[7, 8, 9], &seen), || {
             measured = true;
             vec![Some(1), Some(2)]
         }),
@@ -85,16 +132,17 @@ fn a_stale_index_is_ignored_and_a_memory_store_memoizes() {
 
     let memory = TuneStore::at(None);
     let k = key("norm", &[4096, 1024], &[1, 2]);
+    let seen = std::cell::Cell::new(false);
     let mut runs = 0;
     assert_eq!(
-        memory.select_with(&k, 2, || {
+        memory.select_with(&k, 2, builds(&[1, 2], &seen), || {
             runs += 1;
             vec![Some(2), Some(1)]
         }),
         Some(1)
     );
     assert_eq!(
-        memory.select_with(&k, 2, || {
+        memory.select_with(&k, 2, builds(&[1, 2], &seen), || {
             runs += 1;
             vec![Some(0), Some(0)]
         }),

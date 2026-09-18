@@ -572,4 +572,46 @@ fn staged_gemm_gfx1151_fences_each_strip_once() {
     assert!(code.contains("wmma.f32.16x16x16"), "the wave32 WMMA path");
     let narrow = code.lines().filter(|l| l.contains("addrspace(3)") && l.contains(" bfloat,")).count();
     assert_eq!(narrow, 0, "LDS is read and written in vector groups, never one element at a time");
+    assert!(!code.contains("llvm.amdgcn.sched.barrier"), "gfx1151 does not ask for the pipeline commit fence:\n{code}");
+}
+
+/// The staged pipeline's scheduling fence follows
+/// [`ArchCaps::needs_pipeline_commit_fence`](crate::ArchCaps::needs_pipeline_commit_fence),
+/// not a named arch: gfx1201 renders one `sched.barrier` call per trip, holding
+/// the commit below the trip's WMMAs, where gfx1151 (above) renders none.
+#[test]
+fn staged_gemm_rdna4_fences_the_commit() {
+    use std::sync::Arc;
+
+    use svod_dtype::{AmdArch, DeviceSpec};
+    use svod_ir::UOp;
+
+    use crate::kernels::gemm::build_gemm_nt;
+
+    let (m, k, n) = (128usize, 128usize, 128usize);
+    let cfg = RDNA4_TILES[0];
+    let caps = crate::ArchCaps::for_amd(AmdArch::Gfx1201);
+    assert!(caps.needs_pipeline_commit_fence(), "the cap this test is about");
+    let buffers: Vec<Arc<UOp>> =
+        [m * n, m * k, n * k].into_iter().map(|size| UOp::new_buffer(DeviceSpec::Cpu, size, DType::BFloat16)).collect();
+    let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), buffers, caps);
+    build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, DType::BFloat16, Epilogue::Plain);
+    let sink = ker.finish(cfg.acc_m);
+
+    let renderer = svod_codegen::llvm::LlvmTextRenderer::amd(AmdArch::Gfx1201);
+    let opt = svod_schedule::OptimizerRenderer::for_amd_arch(AmdArch::Gfx1201).with_rewrite_capabilities(
+        svod_ir::RendererOps::all(),
+        svod_codegen::traits::Renderer::decompositor(&renderer),
+        None,
+    );
+    let optimized = svod_schedule::apply_post_optimization_with_renderer(sink, &opt).expect("post optimization");
+    let program =
+        svod_codegen::program_pipeline::program_from_sink(optimized, DeviceSpec::Cpu).expect("final target graph");
+    let linearized = svod_codegen::program_pipeline::do_linearize(&program).expect("do_linearize");
+    let linear =
+        linearized.toposort().into_iter().find(|u| matches!(u.op(), svod_ir::Op::Linear(..))).expect("LINEAR present");
+    let code = svod_codegen::traits::Renderer::render(&renderer, &linear, Some("gemm_nt")).expect("render").code;
+
+    let fences = code.lines().filter(|l| l.contains("@llvm.amdgcn.sched.barrier(i32 0)") && !l.contains("declare"));
+    assert_eq!(fences.count(), 1, "one commit fence per trip:\n{code}");
 }

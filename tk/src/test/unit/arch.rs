@@ -205,6 +205,20 @@ fn rdna4_caps_resolve_gfx12_fragments(arch: AmdArch) {
     assert!(c.acc_reusable_as_input(), "one gfx12 fragment for both roles ⇒ a register copy");
 }
 
+/// The scheduling cap: only gfx12 needs the explicit fence that keeps a
+/// pipelined trip's LDS commit after its MMAs. The GEMM asks for the property,
+/// so a new arch joins by answering here — [`staged_gemm_rdna4_fences_the_commit`]
+/// pins what the answer does to the kernel.
+#[test_case(GpuArch::Amd(AmdArch::Gfx1201), true; "gfx1201")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1200), true; "gfx1200")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx1151), false; "gfx1151")]
+#[test_case(GpuArch::Amd(AmdArch::Gfx942), false; "gfx942")]
+#[test_case(SM_86, false; "sm_86")]
+#[test_case(GpuArch::Metal(svod_dtype::MetalFamily::Apple(9)), false; "metal")]
+fn pipeline_commit_fence_is_gfx12_only(arch: GpuArch, want: bool) {
+    assert_eq!(ArchCaps::for_arch(arch).needs_pipeline_commit_fence(), want);
+}
+
 /// Every kernel bar the gfx942-only direct-launch FA wrapper admits the RDNA4
 /// parts; the RDNA-only sets (norm, NT gemm) admit them without admitting CDNA.
 #[test]

@@ -12,6 +12,8 @@
 //! with the copy in flight under the current block's compute on CUDA sm_80+, where
 //! the LDS→register gathers are `ldmatrix.x4` (see [`crate::Group::load`]).
 
+use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use smallvec::smallvec;
@@ -97,7 +99,7 @@ fn fa_check_target(t: &Tensor) -> crate::LaunchResult<()> {
 /// [`Default`] is the production baseline: `{16,16}` per-warp tile, rolled (looped)
 /// causal compute. The shape (`b,n,h,h_kv,d`) stays a positional arg since it's
 /// derived from the input tensors, not a tuning choice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaConfig {
     /// Per-warp Q-tile height (a multiple of the WMMA edge `16`). A value not a
     /// multiple of 16 panics the builder (the divisibility assert).
@@ -648,25 +650,12 @@ pub const FA_TILES: [(usize, usize); 4] =
     [(Q_BLK, Q_BLK), (Q_BLK, KV_BLK), (Q_BLK, 2 * KV_BLK), (2 * Q_BLK, 2 * Q_BLK)];
 
 impl FaPolicy {
-    /// CDNA keeps the bench-calibrated `{32,32}` crossover (gfx942). RDNA (measured
-    /// on gfx1151, rolled body) keeps the baseline `{16,32}` at d ≤ 64 (b=1/h=16/
-    /// n=2048: 1.19 ms vs 1.29 at `{16,16}`) and takes `{16,16}` at d = 128, where
-    /// the wider KV block costs occupancy (b=8/h=16/n=512 causal: 1.02 ms vs 1.64;
-    /// n=2048: 12.8 vs 16.7); the flat body is within ±5% and loses at d = 64.
-    /// CUDA (measured on sm_86, 28 SMs, with the `ldmatrix` +
-    /// `cp.async` K/V stream): the taller KV super-block `{16,64}` (117 registers,
-    /// 32 KiB LDS at d=64 — two blocks per SM) is fastest on every grid that covers
-    /// the SMs (GigaAM b=8/h=16/n=1536: 3.20 ms vs 3.26 at `{16,32}` and 3.55 at
-    /// `{32,32}`; whisper b=1/h=6: 192 vs 198 / 272 µs). At d=128 that tile's double
-    /// buffers would need 64 KiB, and the two remaining candidates split on
-    /// occupancy: `{16,16}` takes 128 registers and 16 KiB of LDS — two blocks per
-    /// SM — where `{16,32}` takes 155 and 32 KiB, so only one fits (Qwen3-Embedding
-    /// b=8/h=16/n=512 causal: 550 µs vs 589; n=2048: 6.67 ms vs 6.95). A grid that
-    /// does not cover the SMs has no second block to fit and keeps `{16,32}`
-    /// (b=1/n=128: 17.4 µs vs 19.5). Every CUDA tile is flat: the rolled body pins
-    /// the register tiles to local memory (3-15× slower).
-    ///
-    /// # Panics
+    /// The measured crossovers: `{32,32}` on CDNA (gfx942); on RDNA (gfx1151)
+    /// `{16,32}` at d ≤ 64 and `{16,16}` at d = 128, where the wider KV block
+    /// costs occupancy (b=8/h=16/n=512 causal: 1.02 vs 1.64 ms); on CUDA (sm_86)
+    /// `{16,64}` at d ≤ 64 and `{16,16}` at d = 128 — at each head dim the widest
+    /// tile that still fits two blocks per SM. The CUDA bodies must stay flat: a
+    /// rolled body pins the register tiles to local memory (3-15× slower).
     pub fn for_arch(arch: svod_dtype::GpuArch) -> Self {
         let small = (Q_BLK, KV_BLK);
         let att_band = !crate::ArchCaps::for_arch(arch).acc_reusable_as_input();
@@ -799,15 +788,19 @@ impl FaPolicy {
             }
             bufs
         };
-        let builds: Vec<u128> = candidates
-            .iter()
-            .map(|&cfg| {
-                let ker = Kernel::new("flash_attention", grid(&cfg), block, placeholders(), caps);
-                crate::kernel_fingerprint(&build(&ker, cfg)).digest
-            })
-            .collect();
+        // The store line covers the candidate kernels' graphs, fingerprinted in
+        // table order; only a memo miss pays for building them.
+        let builds = || {
+            candidates
+                .iter()
+                .map(|&cfg| {
+                    let ker = Kernel::new("flash_attention", grid(&cfg), block, placeholders(), caps);
+                    crate::kernel_fingerprint(&build(&ker, cfg)).digest
+                })
+                .collect()
+        };
         let shape = [b, n, h, h_kv, d, usize::from(causal), mask.code(), dtype.bytes()];
-        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &builds);
+        let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &(&candidates, dtype));
         let compile = |i: usize| {
             let cfg = candidates[i];
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
@@ -825,7 +818,7 @@ impl FaPolicy {
             })
             .ok()
         };
-        store.select(&key, candidates.len(), compile).map(|i| candidates[i]).or_else(fallback)
+        store.select(&key, candidates.len(), builds, compile).map(|i| candidates[i]).or_else(fallback)
     }
 }
 
@@ -938,7 +931,8 @@ pub fn flash_attention_with(q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) ->
 /// [`flash_attention_with`] with the per-arch tile policy supplied by the caller
 /// instead of read off the device ([`FaPolicy::for_device`]) — the tile-sweep
 /// entry point (the analog of [`gemm_nt_with`](crate::gemm_nt_with)). `policy` is
-/// consulted twice (the tiling predicate and the build), so it must be pure.
+/// consulted once per launch, its config shared by the tiling predicate and the
+/// build.
 pub fn flash_attention_tuned(
     q: &Tensor,
     k: &Tensor,
@@ -971,7 +965,9 @@ pub fn flash_attention_tuned(
     let (tiling_device, build_device) = (q.device(), q.device());
     let tiling_dtype = dtype.clone();
     let mask = FaMask { key_lens: opts.key_lens.is_some(), seg_start: opts.seg_start.is_some() };
-    // The policy's config, measured on first use where tuning is on.
+    // The policy's config, measured on first use where tuning is on. Measuring
+    // is what the first call costs, so it runs once per launch: the tiling
+    // predicate and the build share its answer.
     let chosen = move |policy: &FaPolicy, device: &svod_dtype::DeviceSpec, arch, dtype: &DType| {
         if !crate::tune::enabled() {
             return policy.config(b, n, h, d, opts.causal);
@@ -979,6 +975,8 @@ pub fn flash_attention_tuned(
         let store = crate::tune::TuneStore::global();
         policy.tuned(store, device, arch, dtype, (b, n, h, h_kv, d), opts.causal, mask)
     };
+    let cfg_cell: Rc<OnceCell<Option<FaConfig>>> = Rc::default();
+    let fit_cell = cfg_cell.clone();
 
     crate::launch_custom(
         &q.device(),
@@ -1023,13 +1021,15 @@ pub fn flash_attention_tuned(
         // does a KV length that differs from q's (this kernel is self-attention only).
         move |arch| {
             kv_seq_match
-                && chosen(&policy(&tiling_device, arch), &tiling_device, arch, &tiling_dtype)
+                && fit_cell
+                    .get_or_init(|| chosen(&policy(&tiling_device, arch), &tiling_device, arch, &tiling_dtype))
                     .is_some_and(|cfg| n.is_multiple_of(cfg.q_blk * NUM_WARPS))
         },
         // Build for the resolved arch — caps track the real wave width.
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = chosen(&policy(&build_device, arch), &build_device, arch, &dtype)
+            let cfg = cfg_cell
+                .get_or_init(|| chosen(&policy(&build_device, arch), &build_device, arch, &dtype))
                 .expect("checked by the tiling predicate");
             let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
             let out = Tensor::empty(&[b, n, h, d], dtype.clone());

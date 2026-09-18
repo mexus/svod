@@ -27,6 +27,8 @@
 //! a whole extra pass over memory for costs the GEMM nothing but the operand it
 //! reads.
 
+use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
@@ -41,7 +43,7 @@ use crate::tiles::TileLayout;
 use crate::{GL, GlSpec, Group, Kernel, Loop, MoveIdx, RT, RegTile, ST};
 
 /// Where the B operand's K axis lives in global memory.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BOrder {
     /// `B[k, n]` — the K-major operand of the square `A·B` matmul.
     Kn,
@@ -104,7 +106,7 @@ impl<T> Epilogue<T> {
 /// computes a `block_m × block_n` C tile; each wave owns `acc_m` col-major
 /// `reg_m × reg_n` f32 accumulators (`reg_m = block_m / (warps_m·acc_m)`,
 /// `reg_n = block_n / warps_n`) reduced over K in `k_step`-wide strips.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GemmCfg {
     pub block_m: usize,
     pub block_n: usize,
@@ -375,7 +377,7 @@ pub fn gemm_core(
             // MMAs in flight to cover it, so every wave's stall becomes the whole
             // group's. The `mask = 0` fence forbids the move, leaving the trip's
             // MMAs between the prefetch issue and the wait that consumes it.
-            let after_mma = if ker.caps.amd().is_some_and(svod_dtype::AmdArch::is_rdna4) {
+            let after_mma = if ker.caps.needs_pipeline_commit_fence() {
                 crate::asm::sched_barrier(0, after_mma)
             } else {
                 after_mma
@@ -682,50 +684,35 @@ pub const NT_128X64: GemmCfg = GemmCfg {
 pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 
 /// The split-K tile: [`NT_128X64`] over two K-slabs, writing `[2, M, N]` f32
-/// partials that a second pass sums.
-///
-/// **Not selected by [`GemmPolicy`]** — measured a net loss on this card at every
-/// shape tried. On the batch-1 `[128, 1024] · [6144, 1024]ᵀ` it does shorten the
-/// GEMM itself, exactly as intended (88.3 → 81.9 µs: twice the workgroups over a
-/// grid that covered only 96 of the 112 resident-block slots), but the f32 partials
-/// it writes and the reduction reads cost 40 µs — 122 µs end to end against 98 µs
-/// unsplit. The RTX 3060's 360 GB/s does not pay for an `M·N·split_k` f32 round
-/// trip at these sizes; `split_k = 4` is worse still (149 µs). Kept as a measured
-/// configuration: a device with more bandwidth per FLOP, or a much smaller `M·N`,
-/// flips the sign.
+/// partials that a second pass sums. **Never selected by [`GemmPolicy`]**: the
+/// partials' round trip costs more than the wider grid saves (122 vs 98 µs on a
+/// batch-1 `[128, 1024]·[6144, 1024]ᵀ` on an RTX 3060, and `split_k = 4` is worse
+/// still). Kept for a device with more bandwidth per FLOP, which flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
 /// The CUDA sm_80+ tiles, widest first.
 pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
 
-/// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles on the
-/// register-staged pipeline without the L2 swizzle (single-XCD parts; ±3%
-/// either way), and the fine tile on a 64-deep strip, which halves the barriers
+/// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
+/// L2 swizzle, plus the fine tile on a 64-deep strip, which halves the barriers
 /// per K and wins once the grid is short (batch-1 down projection 12.3 vs 7.1
-/// TFLOP/s). A 32-deep 64×64 tile keeps a `K` of 64 or 96 servable. 128×128
-/// trailed by 10-15% and `k_step = 64` on the wide tile halved its throughput
-/// (48 KiB of LDS), so neither is a candidate.
+/// TFLOP/s); the 32-deep 64×64 keeps a `K` of 64 or 96 servable. Not candidates:
+/// 128×128 (10-15% behind) and `k_step = 64` on the wide tile (48 KiB of LDS,
+/// half the throughput).
 pub const RDNA_TILES: [GemmCfg; 3] = [
     GemmCfg { l2_swizzle: false, ..NT_128X64 },
     GemmCfg { l2_swizzle: false, k_step: 64, ..NT_64X64 },
     GemmCfg { l2_swizzle: false, ..NT_64X64 },
 ];
 
-/// The RDNA4 (gfx12) tiles, measured on gfx1201 (64 CUs) — every one a 4-row
-/// wave grid with one 64-wide accumulator per wave (`reg_n` 64, so the gate/up
-/// pair width is 32; the tuner picks among them per shape, and the fused
-/// SwiGLU weight is laid out for the width they share):
-///
-/// - 128×128, 4×2 waves (256 threads, 32 KiB of LDS), with and without the
-///   L2 swizzle: the wide tile for the long GEMMs — gate/up at `M = 4096`
-///   453/468 µs against 537 on the 128×64 tile and 493 on a 2×4 grid of two
-///   32×32 accumulators; the swizzle wins the wide-`N` shapes (512×1024×6144
-///   65 vs 72 µs) and loses the narrow ones (2048×3072×1024 130 vs 123).
-/// - 128×64, 4×1 waves: the short grids the wide tile starves on
-///   (128×1024×6144 24.2 µs against 26.5).
-/// - 64×64, 2×1 and 4×1 waves on the 32-deep strip: the narrow-`N` short-`M`
-///   projections (512×2048×1024 28.5 µs against 42 on the wide tile) and the
-///   `M`s the others do not divide. The 64-deep strip lost on every shape here.
+/// The RDNA4 (gfx12) tiles, measured on gfx1201 (64 CUs): every one a 4-row wave
+/// grid with one 64-wide accumulator per wave, so they share the `reg_n/2`
+/// SwiGLU pair width the fused weight is laid out for, and [`GemmPolicy::tuned`]
+/// picks among them per shape. The 128×128 4×2 leads on the long GEMMs (gate/up
+/// at `M = 4096`: 453 µs against 537 on 128×64), the narrower ones cover the
+/// short grids it starves on (128×1024×6144: 24.2 vs 26.5 µs) and the `M`s it
+/// does not divide; the L2 swizzle splits by `N`, so both forms are candidates.
+/// The 64-deep strip lost on every shape here.
 pub const NT_128X128_RDNA4: GemmCfg = GemmCfg { block_n: 128, warps_m: 4, warps_n: 2, acc_m: 1, ..NT_128X64 };
 pub const RDNA4_TILES: [GemmCfg; 5] = [
     NT_128X128_RDNA4,
@@ -827,25 +814,28 @@ impl GemmPolicy {
             build_gemm_nt(ker, (m, k, n), cfg, dtype.clone(), dtype.clone(), epi);
             ker.finish(cfg.acc_m)
         };
-        // The key covers the candidate kernels themselves: their graphs, built
-        // against placeholder buffers, fingerprinted in table order.
-        let placeholders = || {
-            let mut sizes = vec![m * cols, m * k, n * k];
-            if let Epilogue::Add(()) = epi {
-                sizes.push(m * cols);
-            }
-            sizes.into_iter().map(|size| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dtype.clone())).collect()
+        // The store line covers the candidate kernels themselves: their graphs,
+        // built against placeholder buffers, fingerprinted in table order. Only
+        // a memo miss pays for them.
+        let builds = || {
+            let placeholders = || {
+                let mut sizes = vec![m * cols, m * k, n * k];
+                if let Epilogue::Add(()) = epi {
+                    sizes.push(m * cols);
+                }
+                sizes.into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dtype.clone())).collect()
+            };
+            candidates
+                .iter()
+                .map(|&cfg| {
+                    let ker =
+                        Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), placeholders(), caps);
+                    crate::kernel_fingerprint(&build(&ker, cfg)).digest
+                })
+                .collect()
         };
-        let builds: Vec<u128> = candidates
-            .iter()
-            .map(|&cfg| {
-                let ker =
-                    Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), placeholders(), caps);
-                crate::kernel_fingerprint(&build(&ker, cfg)).digest
-            })
-            .collect();
         let shape = [m, k, n, dtype.bytes(), epi.code()];
-        let key = crate::tune::TuneKey::new("gemm_nt", spec, arch, &shape, &builds);
+        let key = crate::tune::TuneKey::new("gemm_nt", spec, arch, &shape, &(&candidates, dtype));
         let compile = |i: usize| {
             let cfg = candidates[i];
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
@@ -860,7 +850,7 @@ impl GemmPolicy {
             crate::launch::compile_kernel("gemm_nt_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, cfg))
                 .ok()
         };
-        store.select(&key, candidates.len(), compile).map(|i| candidates[i]).or_else(fallback)
+        store.select(&key, candidates.len(), builds, compile).map(|i| candidates[i]).or_else(fallback)
     }
 
     /// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be
@@ -1010,6 +1000,10 @@ fn build_gemm(
         _ => None,
     };
     let want_res = y_shape.clone();
+    // The chooser measures on first use, so it runs once per launch: the tiling
+    // predicate and the build share its answer.
+    let chosen: Rc<OnceCell<Option<GemmCfg>>> = Rc::default();
+    let fit_chosen = chosen.clone();
 
     crate::launch_custom(
         &x.device(),
@@ -1056,11 +1050,11 @@ fn build_gemm(
         },
         move |arch| {
             let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            cfg(arch, m, k, n).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
+            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
         },
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
-            let cfg = cfg(arch, m, k, n).expect("checked by the tiling predicate");
+            let cfg = chosen.get_or_init(|| cfg(arch, m, k, n)).expect("checked by the tiling predicate");
             let (grid, block) = (cfg.grid_dims(m, n), cfg.threads(caps.wave_size));
             let (in_dt, split) = (dtype.clone(), cfg.split_k);
             let out_dt = if split > 1 { DType::Float32 } else { dtype.clone() };

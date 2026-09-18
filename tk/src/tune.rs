@@ -15,9 +15,13 @@
 //!
 //! The store is one line per entry (`key index ns`) in `$SVOD_TK_TUNE_DIR`
 //! (else `$XDG_CACHE_HOME/svod/tk_tune`, else `$HOME/.cache/svod/tk_tune`), one
-//! file per device and crate version. The key carries a fingerprint of the
+//! file per device and crate version. The line carries a fingerprint of the
 //! candidate kernels' graphs, so a kernel change re-measures; an unreadable or
-//! unwritable store is a miss, never an error.
+//! unwritable store is a miss, never an error. Building those graphs is what a
+//! fingerprint costs, so it happens only on the way to the store: the
+//! process-wide memo in front of it is keyed by [`TuneKey`] alone, which every
+//! caller has in hand, and a warm memo answers a launch without touching a
+//! kernel.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -34,36 +38,46 @@ use crate::launch::CompiledLaunch;
 /// Timed rounds over the candidates after the warm-up.
 pub(crate) const ROUNDS: usize = 3;
 
+fn digest(value: &impl Hash) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// What a measurement is keyed by: the device (arch and compute units), the
-/// kernel, its shape, and the candidate kernels themselves (their graph
-/// fingerprints, so a table or kernel change re-measures).
+/// kernel, its shape, and the candidate set it chooses among (`config`: a digest
+/// of the candidates' configs and of anything else the built graphs vary with
+/// that `shape` does not spell out, such as the operand dtype). Every field is
+/// cheap, so the memo answers without building a kernel; what the graphs
+/// themselves fingerprint to joins the key only in [`Self::line`], the store's
+/// form.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TuneKey {
     pub kernel: &'static str,
     pub device: String,
     pub shape: Vec<usize>,
-    pub builds: u64,
+    pub config: u64,
 }
 
 impl TuneKey {
-    /// The key for `kernel` at `shape` on the device behind `spec`, over the
-    /// candidates whose built graphs have the [`crate::kernel_fingerprint`]
-    /// digests `builds` (in table order).
-    pub fn new(kernel: &'static str, spec: &DeviceSpec, arch: GpuArch, shape: &[usize], builds: &[u128]) -> Self {
-        let mut hasher = std::hash::DefaultHasher::new();
-        builds.hash(&mut hasher);
+    /// The key for `kernel` at `shape` on the device behind `spec`, choosing
+    /// among `config`.
+    pub fn new(kernel: &'static str, spec: &DeviceSpec, arch: GpuArch, shape: &[usize], config: &impl Hash) -> Self {
         let units = crate::target::compute_units(spec).unwrap_or(0);
         Self {
             kernel,
             device: format!("{}-{units}cu", arch.target_name()),
             shape: shape.to_vec(),
-            builds: hasher.finish(),
+            config: digest(config),
         }
     }
 
-    fn line(&self) -> String {
+    /// The store line for this key over the candidates whose built graphs have
+    /// the [`crate::kernel_fingerprint`] digests `builds` (in table order), so a
+    /// kernel change re-measures.
+    fn line(&self, builds: &[u128]) -> String {
         let shape: Vec<String> = self.shape.iter().map(usize::to_string).collect();
-        format!("{}|{}|{}|{:016x}", self.kernel, self.device, shape.join("x"), self.builds)
+        format!("{}|{}|{}|{:016x}", self.kernel, self.device, shape.join("x"), digest(&builds))
     }
 }
 
@@ -113,17 +127,17 @@ impl TuneStore {
             .collect()
     }
 
-    fn get(&self, key: &TuneKey) -> Option<usize> {
-        self.read(key).remove(&key.line()).map(|(index, _)| index)
+    fn get(&self, key: &TuneKey, line: &str) -> Option<usize> {
+        self.read(key).remove(line).map(|(index, _)| index)
     }
 
-    /// Record `index` (measured at `ns`) for `key`: re-read, merge, and replace
+    /// Record `index` (measured at `ns`) for `line`: re-read, merge, and replace
     /// the file atomically, so concurrent writers lose at most each other's
     /// newest line, never the file.
-    fn put(&self, key: &TuneKey, index: usize, ns: u64) {
+    fn put(&self, key: &TuneKey, line: String, index: usize, ns: u64) {
         let Some(path) = self.path(key) else { return };
         let mut entries = self.read(key);
-        entries.insert(key.line(), (index, ns));
+        entries.insert(line, (index, ns));
         let mut lines: Vec<String> = entries.iter().map(|(line, (i, ns))| format!("{line} {i} {ns}")).collect();
         lines.sort();
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -133,22 +147,26 @@ impl TuneStore {
     }
 
     /// The winning candidate index for `key` among `count` candidates: the
-    /// memo, then the store, else `measure` times them all (each candidate's
-    /// device ns, `None` where it cannot run) and the fastest is kept. `None`
-    /// when nothing measured — the caller keeps its static choice.
+    /// memo, then the store under the line `builds` fingerprints the candidate
+    /// graphs into, else `measure` times them all (each candidate's device ns,
+    /// `None` where it cannot run) and the fastest is kept. `None` when nothing
+    /// measured — the caller keeps its static choice. `builds` runs only on a
+    /// memo miss, so a repeated launch of the same shape builds no kernel.
     pub fn select_with(
         &self,
         key: &TuneKey,
         count: usize,
+        builds: impl FnOnce() -> Vec<u128>,
         measure: impl FnOnce() -> Vec<Option<u64>>,
     ) -> Option<usize> {
         if let Some(i) = self.memo.lock().expect("tune memo").get(key) {
             return Some(*i);
         }
-        let cached = self.get(key).filter(|i| *i < count);
+        let line = key.line(&builds());
+        let cached = self.get(key, &line).filter(|i| *i < count);
         let chosen = cached.or_else(|| {
             let (ns, i) = measure().into_iter().enumerate().filter_map(|(i, ns)| ns.map(|ns| (ns, i))).min()?;
-            self.put(key, i, ns);
+            self.put(key, line, i, ns);
             Some(i)
         })?;
         self.memo.lock().expect("tune memo").insert(key.clone(), chosen);
@@ -163,9 +181,10 @@ impl TuneStore {
         &self,
         key: &TuneKey,
         count: usize,
+        builds: impl FnOnce() -> Vec<u128>,
         compile: impl FnMut(usize) -> Option<CompiledLaunch>,
     ) -> Option<usize> {
-        self.select_with(key, count, || {
+        self.select_with(key, count, builds, || {
             let launches: Vec<Option<CompiledLaunch>> = (0..count).map(compile).collect();
             if let Some(first) = launches.iter().flatten().next() {
                 // SAFETY: the launch's buffers live in `first` for the whole loop.
