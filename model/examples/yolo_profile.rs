@@ -281,8 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input: Vec<f32> = match &args.input {
         Some(path) => {
             let bytes = std::fs::read(path).map_err(|e| format!("--input {}: {e}", path.display()))?;
-            let floats: Vec<f32> =
-                bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let floats: Vec<f32> = bytes.as_chunks::<4>().0.iter().copied().map(f32::from_le_bytes).collect();
             let want = args.batch * 3 * args.size * args.size;
             if floats.len() != want {
                 return Err(format!(
