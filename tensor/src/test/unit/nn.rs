@@ -4,11 +4,40 @@ use ndarray::{Array2, Array4, array};
 use svod_dtype::DType;
 
 use crate::Tensor;
-use crate::nn::{Conv1d, LSTMCell, Layer, Reduction, ResizeMode};
+use crate::nn::{Conv1d, LSTMCell, Layer, Linear, Module, Reduction, ResizeMode};
 use crate::test::helpers::RealizeTestExt;
 
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
     tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+}
+
+/// A per-output-channel `weight.weight_scale` loads next to the weight and
+/// multiplies the accumulated product before the bias, so scaling the
+/// accumulator matches scaling the weight.
+#[test]
+fn linear_weight_scale_loads_and_scales_the_product() {
+    use std::collections::HashMap;
+    let (out, inp) = (3usize, 4usize);
+    let weight: Vec<f32> = (0..out * inp).map(|v| v as f32 * 0.5 - 2.0).collect();
+    let scale = [2.0f32, 0.5, 4.0];
+    let bias = [1.0f32, -1.0, 0.25];
+    let mut sd: HashMap<String, Tensor> = HashMap::new();
+    sd.insert("proj.weight".into(), Tensor::from_slice(weight.clone()).try_reshape([out, inp]).unwrap());
+    sd.insert("proj.bias".into(), Tensor::from_slice(bias));
+    sd.insert("proj.weight.weight_scale".into(), Tensor::from_slice(scale).try_reshape([out, 1]).unwrap());
+    let mut layer = Linear::with_dims(inp, out, true, DType::Float32);
+    layer.load_state_dict(&sd, "proj").unwrap();
+    assert!(layer.weight_scale.is_some(), "the scale is a field of the layer");
+    assert_eq!(layer.state_dict("proj").len(), 3, "the scale round-trips through the state dict");
+
+    let x =
+        Tensor::from_slice((0..2 * inp).map(|v| v as f32 * 0.25).collect::<Vec<_>>()).try_reshape([2, inp]).unwrap();
+    let actual = layer.forward(&x).unwrap().to_vec::<f32>().unwrap();
+    let scaled: Vec<f32> = weight.iter().enumerate().map(|(i, w)| w * scale[i / inp]).collect();
+    let reference =
+        Linear::new(Tensor::from_slice(scaled).try_reshape([out, inp]).unwrap(), Some(Tensor::from_slice(bias)));
+    let expected = reference.forward(&x).unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(actual, expected);
 }
 
 #[test]
