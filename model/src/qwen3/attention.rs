@@ -133,10 +133,11 @@ impl Qwen3Attention {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (cos, sin) = rope;
         let geom = tk::Heads { h: self.num_heads, h_kv: self.num_kv_heads, dh: self.head_dim };
-        let concrete = qkv.shape()?.iter().all(|d| d.as_const().is_some());
-        if matches!(qkv.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
-            && concrete
-            && self.q_norm.eps == self.k_norm.eps
+        // Every operand the kernel treats as structural, not just the activation:
+        // a weight or a rope table off its dtype or shape is an `Err`, and this
+        // split / norm / rope graph is the fallback it would have skipped.
+        if self.q_norm.eps == self.k_norm.eps
+            && tk::fusable(qkv, &self.q_norm.weight, &self.k_norm.weight, cos, sin, geom)
             && let Some(out) =
                 tk::qkv_norm_rope(qkv, &self.q_norm.weight, &self.k_norm.weight, cos, sin, self.q_norm.eps, geom)
                     .context(TkSnafu)?

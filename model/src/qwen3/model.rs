@@ -18,6 +18,7 @@
 
 use std::path::Path;
 
+use snafu::ensure;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
@@ -27,7 +28,7 @@ use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
 use super::decoder_layer::{Qwen3DecoderLayer, Residual};
-use super::error::Result;
+use super::error::{ContextLengthSnafu, Result};
 
 #[derive(Clone, Module)]
 pub struct Qwen3Model {
@@ -46,6 +47,14 @@ pub struct Qwen3Model {
     /// rows' tokens at their own positions.
     #[module(skip)]
     inv_freq: Tensor,
+}
+
+/// Positions the rope cache holds: the context rounded up to the attention
+/// tile, because [`Qwen3Model::forward`] pads a sequence to that tile and
+/// narrows the cache to the padded length. The rows past the context are only
+/// ever read by that padding, which is causal-invisible.
+fn rope_positions(config: &Qwen3Config) -> usize {
+    config.max_position_embeddings.max(1).next_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE)
 }
 
 /// Sequence-major `(cos, sin)` for `positions` positions, realized.
@@ -68,9 +77,18 @@ pub(crate) fn gather_tokens(hidden: &Tensor, index: &Tensor) -> Result<Tensor> {
 
 /// The hidden state of each row's last real token: `[B, L, D]` gathered at
 /// `lengths - 1` → `[B, D]`.
+///
+/// **`lengths` `[B]` is the caller's contract: each entry in `1..=L`.** The
+/// values live on the device — a JIT plan binds them long after this graph is
+/// built — so the range cannot be checked here without a sync, and the gather
+/// would answer an entry outside it with a row of zeros (an all-zero embedding,
+/// a flat `sigmoid(0)` score). The index saturates into the row instead, so a
+/// degenerate length pools a real token: the same rule [`super::Qwen3Embedder`]
+/// applies when it embeds an empty row as one pad token.
 pub(crate) fn last_token(hidden: &Tensor, lengths: &Tensor) -> Result<Tensor> {
-    let b = hidden.dim(0)?;
-    let index = lengths.try_sub(1)?.try_reshape([b, SInt::Const(1)])?;
+    let (b, l) = (hidden.dim(0)?, hidden.dim_const(1)?);
+    let last = l.saturating_sub(1) as isize;
+    let index = lengths.try_sub(1)?.clamp().min(0isize).max(last).call()?.try_reshape([b, SInt::Const(1)])?;
     Ok(gather_tokens(hidden, &index)?.try_squeeze(Some(1))?)
 }
 
@@ -91,7 +109,7 @@ impl Qwen3Model {
         let embeddings = crate::init::embedding(config.vocab_size, config.hidden_size, dtype.clone());
         let layers = (0..config.num_hidden_layers).map(|_| Qwen3DecoderLayer::empty(&config)).collect();
         let norm = RmsNorm::with_dims(config.hidden_size, config.rms_norm_eps, dtype);
-        let rope = rope_cache(&config, config.max_position_embeddings).expect("even head_dim, positive context");
+        let rope = rope_cache(&config, rope_positions(&config)).expect("even head_dim, positive context");
         let inv_freq = Tensor::rope_inv_freq(config.rope_theta, config.head_dim).expect("even head_dim");
         inv_freq.realize().expect("a [Dh/2] constant");
         Self { config, embeddings, layers, norm, rope, inv_freq }
@@ -129,9 +147,12 @@ impl Qwen3Model {
         }
     }
 
-    /// Right-padded `input_ids` `(B, L)` → last-hidden-state `(B, L, D)`.
+    /// Right-padded `input_ids` `(B, L)` → last-hidden-state `(B, L, D)`, for
+    /// any `L` within the config's context.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let seq_len = input_ids.dim_const(1)?;
+        let max_position_embeddings = self.config.max_position_embeddings;
+        ensure!(seq_len <= max_position_embeddings, ContextLengthSnafu { seq_len, max_position_embeddings });
         let padded = self.padded_len(seq_len);
         // Any id is a valid pad under the causal mask; zero is the cheapest.
         let ids = if padded > seq_len {

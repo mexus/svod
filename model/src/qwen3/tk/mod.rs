@@ -224,6 +224,90 @@ fn build_qkv_norm_rope(ker: &Kernel, rows: usize, rope_rows: usize, heads: Heads
     ker.push_store(UOp::group(v_stores), v_gl.uop().clone());
 }
 
+/// The kernel name its operand errors carry.
+const K: &str = "qkv-norm-rope";
+
+/// One operand of the prologue ABI: its name, the flat dims it has, its dtype,
+/// and the flat dims the head geometry says it must have.
+type Operand = (&'static str, Vec<usize>, DType, Vec<usize>);
+
+/// The operand table [`qkv_norm_rope`] validates, with `(b, seq)` and the rope
+/// layout it resolved. Built eagerly — a rank or a symbolic dim is a caller bug
+/// whatever the device — so [`fusable`] can ask the same question without a launch.
+fn qkv_operands(
+    qkv: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    heads: Heads,
+) -> svod_tk::LaunchResult<(usize, usize, usize, Vec<Operand>)> {
+    let qd = svod_tk::launch::concrete_dims(qkv, K, "qkv", 3)?;
+    let (b, seq) = (qd[0], qd[1]);
+    let (rows, half) = (b * seq, heads.dh / 2);
+
+    let mut operands = Vec::with_capacity(5);
+    operands.push(("qkv", qd, qkv.uop().dtype(), vec![b, seq, heads.row()]));
+    for (name, w) in [("q_weight", q_weight), ("k_weight", k_weight)] {
+        let d = svod_tk::launch::concrete_dims(w, K, name, 1)?;
+        operands.push((name, d, w.uop().dtype(), vec![heads.dh]));
+    }
+    // The rope tables are `[L, dh/2]` (one row per position) or `[B·L, dh/2]`
+    // (one per token) however the caller spells the unit axes: the element
+    // count and the innermost dim are what the flat addressing uses.
+    let rope_rows = if cos.numel().is_ok_and(|n| n == rows * half) { rows } else { seq };
+    for (name, t) in [("cos", cos), ("sin", sin)] {
+        let d = svod_tk::launch::concrete_dims_at_least(t, K, name, 1)?;
+        let flat = vec![d.iter().product::<usize>(), *d.last().expect("rank >= 1")];
+        operands.push((name, flat, t.uop().dtype(), vec![rope_rows * half, half]));
+    }
+    Ok((b, seq, rope_rows, operands))
+}
+
+/// Every operand in `dtype`, at the shape the ABI declares.
+fn check_qkv_operands(dtype: &DType, operands: &[Operand]) -> svod_tk::LaunchResult<()> {
+    ensure!(
+        *dtype == DType::BFloat16 || *dtype == DType::Float16,
+        svod_tk::launch::DtypeSnafu { kernel: K, got: dtype.clone(), expected: "bf16 or f16" }
+    );
+    for (operand, got, got_dt, expected) in operands {
+        ensure!(
+            got_dt == dtype,
+            svod_tk::launch::DtypeSnafu { kernel: K, got: got_dt.clone(), expected: "the dtype of qkv" }
+        );
+        ensure!(
+            got == expected,
+            svod_tk::launch::OperandShapeSnafu {
+                kernel: K,
+                operand: *operand,
+                expected: expected.clone(),
+                got: got.clone()
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Whether [`qkv_norm_rope`] can take these operands at all — every one 16-bit
+/// in `qkv`'s dtype, concretely shaped, the norm weights `[dh]` and the rope
+/// tables `dh/2`-wide over one row per position or per token.
+///
+/// The kernel calls each of those structural and answers a violation with `Err`,
+/// which would sink the forward; the head geometry and the arch are its own call
+/// (`Ok(None)`) and stay out of here. So a caller gates on this and keeps the
+/// graph fallback for everything the kernel merely declines.
+pub(crate) fn fusable(
+    qkv: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    heads: Heads,
+) -> bool {
+    qkv_operands(qkv, q_weight, k_weight, cos, sin, heads)
+        .is_ok_and(|(_, _, _, operands)| check_qkv_operands(&qkv.uop().dtype(), &operands).is_ok())
+}
+
 /// **Graph-native** fused-QKV attention prologue: one read of the realized
 /// `[B, L, (h + 2·h_kv)·dh]` GEMM output yields the three contiguous tensors the
 /// flash kernel consumes — `q` `[B, L, h, dh]` and `k` `[B, L, h_kv, dh]`,
@@ -262,45 +346,13 @@ pub fn qkv_norm_rope(
     eps: f64,
     heads: Heads,
 ) -> svod_tk::LaunchResult<Option<(Tensor, Tensor, Tensor)>> {
-    const K: &str = "qkv-norm-rope";
-    let qd = svod_tk::launch::concrete_dims(qkv, K, "qkv", 3)?;
-    let (b, seq) = (qd[0], qd[1]);
-    let (rows, half) = (b * seq, heads.dh / 2);
-    let dtype = qkv.uop().dtype();
-
-    let mut operands: Vec<(&'static str, Vec<usize>, DType, Vec<usize>)> = Vec::with_capacity(5);
-    operands.push(("qkv", qd.clone(), dtype.clone(), vec![b, seq, heads.row()]));
-    for (name, w) in [("q_weight", q_weight), ("k_weight", k_weight)] {
-        let d = svod_tk::launch::concrete_dims(w, K, name, 1)?;
-        operands.push((name, d, w.uop().dtype(), vec![heads.dh]));
-    }
-    // The rope tables are `[L, dh/2]` (one row per position) or `[B·L, dh/2]`
-    // (one per token) however the caller spells the unit axes: the element
-    // count and the innermost dim are what the flat addressing uses.
-    let rope_rows = if cos.numel().is_ok_and(|n| n == rows * half) { rows } else { seq };
-    for (name, t) in [("cos", cos), ("sin", sin)] {
-        let d = svod_tk::launch::concrete_dims_at_least(t, K, name, 1)?;
-        let flat = vec![d.iter().product::<usize>(), *d.last().expect("rank >= 1")];
-        operands.push((name, flat, t.uop().dtype(), vec![rope_rows * half, half]));
-    }
+    let (b, seq, rope_rows, operands) = qkv_operands(qkv, q_weight, k_weight, cos, sin, heads)?;
+    let (rows, dtype) = (b * seq, qkv.uop().dtype());
 
     svod_tk::launch_custom(
         &qkv.device(),
         NORM_SUPPORTED_ARCHS,
-        move |_arch| {
-            ensure!(
-                dtype == DType::BFloat16 || dtype == DType::Float16,
-                svod_tk::launch::DtypeSnafu { kernel: K, got: dtype.clone(), expected: "bf16 or f16" }
-            );
-            for (operand, got, got_dt, expected) in operands {
-                ensure!(
-                    got_dt == dtype,
-                    svod_tk::launch::DtypeSnafu { kernel: K, got: got_dt, expected: "the dtype of qkv" }
-                );
-                ensure!(got == expected, svod_tk::launch::OperandShapeSnafu { kernel: K, operand, expected, got });
-            }
-            Ok(())
-        },
+        move |_arch| check_qkv_operands(&dtype, &operands),
         move |arch| heads.dh > 0 && select_qkv_cfg(heads, svod_tk::ArchCaps::for_arch(arch).wave_size).is_some(),
         move |arch| {
             let caps = svod_tk::ArchCaps::for_arch(arch);

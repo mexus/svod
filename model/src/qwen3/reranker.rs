@@ -51,7 +51,9 @@ impl Qwen3Reranker {
     }
 
     /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → `(B,)` relevance
-    /// scores.
+    /// scores. Each length is the row's real token count and must be in
+    /// `1..=L`; the values are the device's, so the range goes unchecked and a
+    /// row outside it saturates into itself.
     pub fn forward(&self, input_ids: &Tensor, lengths: &Tensor) -> Result<Tensor> {
         // Only the last token's logits are scored, so the LM head runs on
         // `(B, D)`, not `(B, L, D)`.

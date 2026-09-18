@@ -40,10 +40,24 @@ impl From<Tensor> for Residual {
     }
 }
 
-/// Whether the hand kernels can take this activation: 16-bit at a concrete shape.
-fn fusable(x: &Tensor) -> bool {
+/// Whether [`svod_tk::rms_norm`] can take this activation and weight: both
+/// 16-bit in one dtype, `x` concretely shaped at rank ≥ 2 and `weight` `[D]`
+/// over its last axis.
+///
+/// The kernel calls each of those structural and answers a violation with `Err`
+/// (`check_norm_operands`), which would sink the forward rather than fall back,
+/// so the gate mirrors them. The row count and `D` are its own call (`Ok(None)`)
+/// and stay out of here.
+pub(crate) fn fusable(x: &Tensor, weight: &Tensor) -> bool {
     matches!(x.dtype().base(), ScalarDType::BFloat16 | ScalarDType::Float16)
-        && x.shape().is_ok_and(|s| s.iter().all(|d| d.as_const().is_some()))
+        && weight.dtype() == x.dtype()
+        && x.dims().is_ok_and(|d| d.len() >= 2 && weight.dims().is_ok_and(|w| w == d[d.len() - 1..]))
+}
+
+/// Whether `a` and `b` are one operand shape and dtype — [`svod_tk::add_rms_norm`]
+/// takes no residual that is not exactly its `x`.
+fn alike(a: &Tensor, b: &Tensor) -> bool {
+    a.dtype() == b.dtype() && a.dims().is_ok_and(|d| b.dims().is_ok_and(|e| e == d))
 }
 
 impl Residual {
@@ -69,9 +83,12 @@ impl Residual {
     /// it applies, else the lazy add plus `RmsNorm::forward`.
     pub(crate) fn norm(self, norm: &RmsNorm) -> Result<(Tensor, Tensor)> {
         let Residual { stream, pending } = self;
-        if fusable(&stream) {
+        if fusable(&stream, &norm.weight) {
             let fused = match &pending {
-                Some(p) => svod_tk::add_rms_norm(p, &stream, &norm.weight, norm.eps).context(TkSnafu)?,
+                Some(p) if alike(p, &stream) => {
+                    svod_tk::add_rms_norm(p, &stream, &norm.weight, norm.eps).context(TkSnafu)?
+                }
+                Some(_) => None,
                 None => {
                     svod_tk::rms_norm(&stream, &norm.weight, norm.eps).context(TkSnafu)?.map(|y| (stream.clone(), y))
                 }

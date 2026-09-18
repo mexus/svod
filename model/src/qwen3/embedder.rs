@@ -31,7 +31,9 @@ impl Qwen3Embedding {
     }
 
     /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → f32 embeddings
-    /// `(B, D)`.
+    /// `(B, D)`. Each length is the row's real token count and must be in
+    /// `1..=L`; the values are the device's, so the range goes unchecked and a
+    /// row outside it saturates into itself.
     pub fn encode(&self, input_ids: &Tensor, lengths: &Tensor) -> Result<Tensor> {
         self.pool(last_token(&self.model.forward(input_ids)?, lengths)?)
     }

@@ -13,6 +13,8 @@
 mod attention;
 mod config;
 mod decoder_layer;
+#[cfg(test)]
+pub(crate) use decoder_layer::fusable as norm_fusable;
 mod embed;
 mod embedder;
 mod error;
