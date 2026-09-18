@@ -18,7 +18,7 @@ use crate::optimizer::renderer::TcTilePolicy;
 use crate::optimizer::{Opt, OptArg, OptOps, Renderer, Scheduler, apply_opt};
 use crate::test::support::prelude::*;
 use crate::test::unit::optimizer::kernels::{
-    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, times, two_n_matmul,
+    Ranged, matmul_accum, matmul_with, plus, row_major, row_reduce, taps_conv, times, two_n_matmul,
 };
 
 // THE KERNEL SHAPES THIS PASS IS RANKED AGAINST
@@ -138,6 +138,39 @@ fn opt(op: OptOps, axis: usize, arg: usize) -> (OptOps, Option<usize>, OptArg) {
     (op, Some(axis), OptArg::Int(arg))
 }
 
+/// The 192->192 3x3 convolution over a 40x40 image the layout probe measures.
+const PROBE_CONV: (i64, i64, i64, i64, i64) = (40, 40, 192, 192, 9);
+
+/// Tensor-core tiles one warp's output covers under `plan`: every UPCAST
+/// multiplies it, and a lane holds an accumulator per element of each tile.
+fn warp_tiles(plan: &[(OptOps, Option<usize>, OptArg)]) -> usize {
+    plan.iter()
+        .filter_map(|(op, _, arg)| match (op, arg) {
+            (OptOps::UPCAST, OptArg::Int(amount)) => Some(*amount),
+            _ => None,
+        })
+        .product()
+}
+
+/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets on the
+/// RDNA4 WMMA for operands laid out `channels_last`; `None` when the shape
+/// declines the tensor core.
+fn conv_plan(
+    shape: (i64, i64, i64, i64, i64),
+    channels_last: (bool, bool),
+) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
+    let (m1, m2, n, k, taps) = shape;
+    let mut scheduler = Scheduler::new(taps_conv(m1, m2, n, k, taps, channels_last), Renderer::amd_rdna4());
+    try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()).then(|| {
+        scheduler
+            .applied_opts
+            .iter()
+            .filter(|opt| opt.op != OptOps::TC)
+            .map(|opt| (opt.op, opt.axis, opt.arg.clone()))
+            .collect()
+    })
+}
+
 /// `(axis type, constant extent)` of a RANGE; `None` when it is not a RANGE.
 fn range_axis(range: &Arc<UOp>) -> Option<(AxisType, i64)> {
     matches!(range.op(), Op::Range(..)).then(|| (range_axis_type(range), expect_range_extent(range)))
@@ -243,6 +276,43 @@ fn non_cuda_tiling_matches_the_shipped_fixed_step(renderer: Renderer, dims: (usi
             let expected: Vec<_> = plan.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
             for k in FIXED_STEP_GRID_K {
                 assert_eq!(tc_plan(m, n, k, renderer.clone()), expected, "{m}x{n}x{k}");
+            }
+        }
+    }
+}
+
+const PLAIN_STEP: &[(OptOps, usize, usize)] = &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 4)];
+
+#[test_case((false, false), PLAIN_STEP; "both channels-first keeps the plain step")]
+#[test_case((true, true), PLAIN_STEP; "both channels-last keeps the plain step")]
+#[test_case((false, true), PLAIN_STEP; "a strided activation is already what N holds")]
+#[test_case((true, false), &[(OptOps::UPCAST, 1, 3), (OptOps::LOCAL, 0, 4)]; "a strided weight is stacked over the second spatial axis")]
+fn conv_warp_tile_grows_where_the_pricier_fragment_is_reused(
+    channels_last: (bool, bool),
+    expected: &[(OptOps, usize, usize)],
+) {
+    let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
+    assert_eq!(conv_plan(PROBE_CONV, channels_last), Some(expected));
+}
+
+// Growing the tile along the axis that reuses the pricier operand fragment is a
+// choice of direction and not of size: whatever the operands' layouts, one warp
+// still holds at most the accumulators the plain step would give it, and every
+// UPCAST the plan records stays replayable.
+proptest! {
+    #![proptest_config(cheap())]
+    #[test]
+    fn conv_warp_tile_never_outgrows_the_plain_step(m1 in 8i64..=64, m2 in 8i64..=64, n in 1i64..=8, taps in 1i64..=9) {
+        let shape = (m1, m2, n * 16, 192, taps);
+        let Some(plain) = conv_plan(shape, (false, false)).map(|plan| warp_tiles(&plan)) else { return Ok(()) };
+        for channels_last in [(true, false), (false, true), (true, true)] {
+            let Some(plan) = conv_plan(shape, channels_last) else { continue };
+            let tiles = warp_tiles(&plan);
+            prop_assert!(tiles <= plain, "{channels_last:?} grows to {tiles} over the plain step's {plain}");
+            prop_assert_eq!(conv_plan(shape, channels_last), Some(plan.clone()), "the plan is a function of the shape");
+            for (op, _, arg) in plan {
+                let OptArg::Int(amount) = arg else { continue };
+                prop_assert!(op != OptOps::UPCAST || amount <= Renderer::amd_rdna4().upcast_max);
             }
         }
     }
