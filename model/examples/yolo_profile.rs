@@ -25,6 +25,7 @@ use svod_model::yolo::{Yolo26Detect, Yolo26DetectJit, YoloConfig, YoloScale, pos
 use svod_runtime::{
     KernelProfile, OriginView, RunProfile, StageProfile, aggregate_origins, has_origins, render_histogram,
 };
+use svod_tensor::PrepareConfig;
 use svod_tensor::set_default_device;
 
 const MAX_DET: usize = 300;
@@ -158,7 +159,7 @@ struct Args {
     #[arg(long)]
     stage_detail: bool,
 
-    /// Device to run on: `cpu`, `cuda`, `cuda:N`. Exported as SVOD_DEVICE
+    /// Device to run on: `cpu`, `cuda`, `cuda:N`, `amd`, `amd:N`. Exported as SVOD_DEVICE
     /// before runtime init; CPU is the default so the GPU is never probed.
     #[arg(long, default_value = "cpu")]
     device: String,
@@ -173,7 +174,8 @@ fn parse_device(spec: &str) -> Result<DeviceSpec, Box<dyn std::error::Error>> {
     match name {
         "cpu" => Ok(DeviceSpec::Cpu),
         "cuda" | "gpu" => Ok(DeviceSpec::Cuda { device_id: index.unwrap_or(0) }),
-        _ => Err(format!("unsupported --device {spec:?}; expected cpu, cuda or cuda:N").into()),
+        "amd" => Ok(DeviceSpec::Amd { device_id: index.unwrap_or(0) }),
+        _ => Err(format!("unsupported --device {spec:?}; expected cpu, cuda, cuda:N, amd or amd:N").into()),
     }
 }
 
@@ -227,6 +229,7 @@ fn print_origin_section(kernels: &[KernelProfile], depth: Option<usize>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
     if args.iters == 0 {
         return Err("--iters must be non-zero".into());
@@ -275,7 +278,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- prepare: graph build + first compile ------------------------------
     let t_prepare = Instant::now();
     let mut jit = Yolo26DetectJit::new(model);
-    jit.prepare(InputSpec::f32(&[args.batch, 3, args.size, args.size]))?;
+    jit.prepare_with_config(
+        InputSpec::f32(&[args.batch, 3, args.size, args.size]).device_local(),
+        &PrepareConfig::device_local(),
+    )?;
     let dt_prepare = t_prepare.elapsed();
 
     let input: Vec<f32> = match &args.input {

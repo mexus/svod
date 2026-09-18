@@ -152,7 +152,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // batch dimension is a symbolic variable bound at runtime via
     // `execute_bound`, so the same plan handles any batch ≤ max_batch_size.
     let mut jit = Yolo26DetectJit::new(model);
-    jit.prepare(InputSpec::new(&[1, 3, side, side], DType::Float32))?;
+    jit.prepare_with_config(
+        InputSpec::new(&[1, 3, side, side], DType::Float32).device_local(),
+        &svod_tensor::PrepareConfig::device_local(),
+    )?;
 
     // Copy the NCHW image into the JIT-managed input buffer.
     jit.images_mut()?.copyin(cast_slice(&input))?;
