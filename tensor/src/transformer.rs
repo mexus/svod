@@ -143,16 +143,24 @@ impl Tensor {
             ParamRangeSnafu { op: "rope_table", param: "seq_len", value: seq_len.to_string(), constraint: "≥ 1" }
         );
 
-        // inv_freq: [head_dim/2], the per-pair angular frequency.
-        let exponent =
-            Tensor::arange_f64(0.0, (head_dim / 2) as f64, 1.0, DType::Float32)?.try_mul(-2.0 / head_dim as f64)?;
-        let inv_freq = Tensor::const_(theta, DType::Float32).try_pow(&exponent)?;
-
         // angles: [seq_len, 1] × [head_dim/2] → [seq_len, head_dim/2].
-        let angles =
-            Tensor::arange_f64(0.0, seq_len as f64, 1.0, DType::Float32)?.try_unsqueeze(-1)?.try_mul(&inv_freq)?;
+        let angles = Tensor::arange_f64(0.0, seq_len as f64, 1.0, DType::Float32)?
+            .try_unsqueeze(-1)?
+            .try_mul(&Self::rope_inv_freq(theta, head_dim)?)?;
         let table = |t: Tensor| -> Result<Tensor> { Ok(t.try_unsqueeze(0)?.try_unsqueeze(0)?.cast(dtype.clone())) };
         Ok((table(angles.cos()?)?, table(angles.sin()?)?))
+    }
+
+    /// The per-pair angular frequencies of [`Self::rope_table`], `[head_dim/2]`
+    /// f32: `theta^(-2i/head_dim)`. A position's table row is
+    /// `cos/sin(position · inv_freq)` in f32, so rotating a token at an
+    /// arbitrary position from these matches the table bit for bit.
+    #[track_caller]
+    pub fn rope_inv_freq(theta: f64, head_dim: usize) -> Result<Tensor> {
+        origin_call!("rope_inv_freq");
+        let exponent =
+            Tensor::arange_f64(0.0, (head_dim / 2) as f64, 1.0, DType::Float32)?.try_mul(-2.0 / head_dim as f64)?;
+        Tensor::const_(theta, DType::Float32).try_pow(&exponent)
     }
 
     /// `[B, L, H * D] → [B, H, L, D]`: split the feature axis into `n_heads`

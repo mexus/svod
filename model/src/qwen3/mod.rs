@@ -33,7 +33,7 @@ pub use embedder::Qwen3Embedding;
 pub use error::{Error, Result};
 pub use feed_forward::Qwen3MLP;
 pub use jit::{Qwen3EmbeddingJit, Qwen3RerankerJit};
-pub use model::Qwen3Model;
+pub use model::{Packing, Qwen3Model};
 pub use reranker::Qwen3Reranker;
 
 use std::path::PathBuf;

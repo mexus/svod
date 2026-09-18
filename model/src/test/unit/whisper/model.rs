@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::mem::size_of;
 
-use svod_dtype::DType;
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::{AxisType, ConstValue, Op};
 use svod_macros::jit_wrapper;
 use svod_tensor::Tensor;
@@ -16,7 +16,7 @@ use crate::whisper::{
     WhisperDecoderStepJit, WhisperPlan, WhisperPrefillJit, WhisperSize,
 };
 use svod_ir::ops;
-use svod_tensor::nn::{Layer, Module};
+use svod_tensor::nn::{Layer, Linear, Module};
 
 // The cross projection has no wrapper of its own any more -- prefill owns it --
 // but the shape of the graph it emits is still worth pinning, so the tests
@@ -213,25 +213,49 @@ fn low_precision_load_preserves_openai_fp32_parameters(compute: DType) {
     assert_eq!(model.decoder.ln.weight.dtype(), DType::Float32);
 }
 
+/// A quantized linear keeps its fp8 weight and per-output-channel scale as
+/// loaded, and its forward applies the scale to the f32 accumulator: the same
+/// result as multiplying the scale into a dequantized weight, with the kernel
+/// reading one byte per weight.
 #[test]
-fn quantized_weight_scale_scales_output_channels() {
-    // The per-output-channel scale must be reshaped to `[out, 1]` before it is
-    // multiplied into a `[out, in]` weight; a bare `[out]` scale either fails to
-    // broadcast or (when out == in) scales the input axis.
+fn quantized_weight_stays_fp8_and_scales_the_accumulator() {
     let dims = small_decoder_dims();
     let mut sd = Whisper::empty(dims.clone()).state_dict("");
     let key = "decoder.blocks.0.mlp.0.weight";
     let (out, inp) = (dims.n_text_state * 4, dims.n_text_state);
-    let weight: Vec<f32> = (0..out * inp).map(|value| value as f32 * 0.25).collect();
-    let scale: Vec<f32> = (0..out).map(|row| 1.0 + row as f32).collect();
-    sd.insert(key.into(), Tensor::from_slice(weight.clone()).try_reshape([out, inp]).unwrap());
-    sd.insert(format!("{key}.weight_scale"), Tensor::from_slice(scale.clone()));
+    let quantized: Vec<u8> = (0..out * inp)
+        .map(|index| svod_dtype::cast::float_to_fp8(((index % 13) as f64 - 6.0) * 0.5, ScalarDType::FP8E4M3).unwrap())
+        .collect();
+    let scale: Vec<f32> = (0..out).map(|row| 0.5 + row as f32 * 0.125).collect();
+    sd.insert(key.into(), Tensor::from_raw_bytes(&quantized, &[out, inp], DType::FP8E4M3).unwrap());
+    sd.insert(format!("{key}.weight_scale"), Tensor::from_slice(scale.clone()).try_reshape([out, 1]).unwrap());
 
     let model = Whisper::from_state_dict(&sd, dims).unwrap();
-    let loaded = model.decoder.blocks[0].mlp0.weight.contiguous();
-    assert_eq!(loaded.dims().unwrap(), [out, inp]);
-    let expected: Vec<f32> = weight.iter().enumerate().map(|(index, value)| value * scale[index / inp]).collect();
-    assert_eq!(loaded.to_vec::<f32>().unwrap(), expected);
+    let layer = &model.decoder.blocks[0].mlp0;
+    assert_eq!(layer.weight.dtype(), DType::FP8E4M3, "the weight is read as stored");
+    assert_eq!(layer.weight_scale.as_ref().map(|scale| scale.dims().unwrap()), Some(vec![out, 1]));
+
+    let x = Tensor::from_slice((0..2 * inp).map(|value| (value % 7) as f32 * 0.25 - 0.5).collect::<Vec<_>>())
+        .try_reshape([2, inp])
+        .unwrap()
+        .cast(DType::Float16);
+    let actual = linear_forward(layer, &x).unwrap().cast(DType::Float32).to_vec::<f32>().unwrap();
+    let dequantized: Vec<f32> = quantized
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| {
+            svod_dtype::cast::fp8_to_float(byte, ScalarDType::FP8E4M3).unwrap() as f32 * scale[index / inp]
+        })
+        .collect();
+    let reference = Tensor::from_slice(dequantized).try_reshape([out, inp]).unwrap().cast(DType::Float16);
+    let expected = linear_forward(&Linear::new(reference, layer.bias.clone()), &x)
+        .unwrap()
+        .cast(DType::Float32)
+        .to_vec::<f32>()
+        .unwrap();
+    for (a, e) in actual.iter().zip(&expected) {
+        assert!((a - e).abs() <= 1e-2 * e.abs().max(1.0), "fp8 linear {a} vs dequantized {e}");
+    }
 }
 
 /// Prefill owns the cross projection now, so the cache dtype is a property of

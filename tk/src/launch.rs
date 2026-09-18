@@ -428,12 +428,12 @@ pub fn compile(device: &Device, sink: Arc<UOp>, buffers: &[Buffer]) -> Result<Co
 /// use svod_tensor::Tensor;
 /// use svod_dtype::{AmdArch, DType};
 /// use svod_tk::{ArchCaps, run_kernel};
-/// use svod_tk::kernels::gemm::{GFX1151_CFG, build_matmul_cfg};
+/// use svod_tk::kernels::gemm::{RDNA_CFG, build_matmul_cfg};
 /// let n = 256usize;
 /// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let mut c = Tensor::empty(&[n, n], DType::Float32);
-/// let cfg = GFX1151_CFG;
+/// let cfg = RDNA_CFG;
 /// let block = cfg.threads(ArchCaps::for_amd(AmdArch::Gfx1151).wave_size);
 /// run_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],
 ///     move |ker| { build_matmul_cfg(ker, n, cfg); ker.finish(cfg.n_accum) }).unwrap();
@@ -477,12 +477,12 @@ where
 /// use svod_tensor::Tensor;
 /// use svod_dtype::{AmdArch, DType};
 /// use svod_tk::{ArchCaps, graph_launch};
-/// use svod_tk::kernels::gemm::{GFX1151_CFG, build_matmul_cfg};
+/// use svod_tk::kernels::gemm::{RDNA_CFG, build_matmul_cfg};
 /// let n = 256usize;
 /// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let out = Tensor::empty(&[n, n], DType::Float32);
-/// let cfg = GFX1151_CFG;
+/// let cfg = RDNA_CFG;
 /// let caps = ArchCaps::for_amd(AmdArch::Gfx1151);
 /// // Wrap the hand-built SINK as a lazy graph node — composes + `prepare()`s like
 /// // any tensor op (`build_matmul_cfg` is the worked kernel body).
@@ -615,12 +615,12 @@ pub fn launch_custom<T>(
 /// use svod_tensor::Tensor;
 /// use svod_dtype::{AmdArch, DType};
 /// use svod_tk::{ArchCaps, compile_kernel};
-/// use svod_tk::kernels::gemm::{GFX1151_CFG, build_matmul_cfg};
+/// use svod_tk::kernels::gemm::{RDNA_CFG, build_matmul_cfg};
 /// let n = 256usize;
 /// let a = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let b = Tensor::randn(&[n, n]).unwrap().cast(DType::BFloat16);
 /// let mut c = Tensor::empty(&[n, n], DType::Float32);
-/// let cfg = GFX1151_CFG;
+/// let cfg = RDNA_CFG;
 /// let block = cfg.threads(ArchCaps::for_amd(AmdArch::Gfx1151).wave_size);
 /// // Render + compile ONCE …
 /// let compiled = compile_kernel("matmul", cfg.grid_dims(n), block, &mut [&mut c], &[&a, &b],

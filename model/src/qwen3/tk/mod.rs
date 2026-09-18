@@ -149,7 +149,7 @@ fn norm_rope_head(
 
 /// The prologue body. ABI is `[q, k, v]` out, `[qkv, q_weight, k_weight, cos,
 /// sin]` in.
-fn build_qkv_norm_rope(ker: &Kernel, rows: usize, seq: usize, heads: Heads, dt: DType, eps: f64, cfg: QkvCfg) {
+fn build_qkv_norm_rope(ker: &Kernel, rows: usize, rope_rows: usize, heads: Heads, dt: DType, eps: f64, cfg: QkvCfg) {
     let lanes = ker.caps.wave_size;
     let (half, dh) = (heads.dh / 2, heads.dh);
     let (vec_v, chunks_v) = plan(dh, lanes).expect("checked by the applicability predicate");
@@ -164,8 +164,8 @@ fn build_qkv_norm_rope(ker: &Kernel, rows: usize, seq: usize, heads: Heads, dt: 
             GlSpec::new(&[rows, heads.row()], dt.clone()),
             GlSpec::new(&[dh], dt.clone()),
             GlSpec::new(&[dh], dt.clone()),
-            GlSpec::new(&[seq, half], dt.clone()),
-            GlSpec::new(&[seq, half], dt.clone()),
+            GlSpec::new(&[rope_rows, half], dt.clone()),
+            GlSpec::new(&[rope_rows, half], dt.clone()),
         ],
     );
     let (q_gl, k_gl, v_gl) = (outs[0].clone(), outs[1].clone(), outs[2].clone());
@@ -176,9 +176,9 @@ fn build_qkv_norm_rope(ker: &Kernel, rows: usize, seq: usize, heads: Heads, dt: 
     let row = ker.grid_x();
     let wave = ker.warpid();
     let src_row = imul(&row, heads.row() as i64);
-    // The rope table is indexed by position within the sequence; a single-row
-    // batch folds the modulo away.
-    let pos = if rows == seq { row.clone() } else { imod(&row, seq as i64) };
+    // The rope table is one row per token, or one per position within the
+    // sequence (`rope_rows` divides `rows` into the batch's sequences).
+    let pos = if rows == rope_rows { row.clone() } else { imod(&row, rope_rows as i64) };
     let rope_base = imul(&pos, half as i64);
 
     let (mut q_stores, mut k_stores, mut v_stores) = (Vec::new(), Vec::new(), Vec::new());
@@ -236,8 +236,10 @@ fn build_qkv_norm_rope(ker: &Kernel, rows: usize, seq: usize, heads: Heads, dt: 
 /// `imag = x1·sin + x2·cos`, in the operand dtype.
 ///
 /// **`cos` and `sin` are the half-width tables laid out row-major as
-/// `[L, dh/2]`** — any shape with that element count whose last dim is `dh/2`,
-/// so the model's `[1, L, 1, dh/2]` sequence-major cache passes unchanged.
+/// `[L, dh/2]`, one row per position, or `[B·L, dh/2]`, one per token** — any
+/// shape with that element count whose last dim is `dh/2`, so the model's
+/// `[1, L, 1, dh/2]` sequence-major cache and its `[B, L, 1, dh/2]` per-token
+/// gather pass unchanged.
 ///
 /// The outcome is three-way (via [`svod_tk::launch_custom`]):
 ///
@@ -248,7 +250,8 @@ fn build_qkv_norm_rope(ker: &Kernel, rows: usize, seq: usize, heads: Heads, dt: 
 ///   both `h` and `h_kv`. The caller substitutes the split / norm / rope graph.
 /// - `Err` — *malformed request:* a symbolic dim, `qkv` not rank 3, a last dim
 ///   that is not `(h + 2·h_kv)·dh`, a weight that is not `[dh]`, a rope table
-///   that is not `[L, dh/2]`, a dtype outside {bf16, f16}, or a dtype mismatch.
+///   that is neither `[L, dh/2]` nor `[B·L, dh/2]`, a dtype outside {bf16, f16},
+///   or a dtype mismatch.
 /// - `Ok(Some((q, k, v)))` — it ran.
 pub fn qkv_norm_rope(
     qkv: &Tensor,
@@ -271,12 +274,14 @@ pub fn qkv_norm_rope(
         let d = svod_tk::launch::concrete_dims(w, K, name, 1)?;
         operands.push((name, d, w.uop().dtype(), vec![heads.dh]));
     }
-    // The rope tables are `[L, dh/2]` however the caller spells the unit axes:
-    // the element count and the innermost dim are what the flat addressing uses.
+    // The rope tables are `[L, dh/2]` (one row per position) or `[B·L, dh/2]`
+    // (one per token) however the caller spells the unit axes: the element
+    // count and the innermost dim are what the flat addressing uses.
+    let rope_rows = if cos.numel().is_ok_and(|n| n == rows * half) { rows } else { seq };
     for (name, t) in [("cos", cos), ("sin", sin)] {
         let d = svod_tk::launch::concrete_dims_at_least(t, K, name, 1)?;
         let flat = vec![d.iter().product::<usize>(), *d.last().expect("rank >= 1")];
-        operands.push((name, flat, t.uop().dtype(), vec![seq * half, half]));
+        operands.push((name, flat, t.uop().dtype(), vec![rope_rows * half, half]));
     }
 
     svod_tk::launch_custom(
@@ -316,7 +321,7 @@ pub fn qkv_norm_rope(
                 &[qkv, q_weight, k_weight, cos, sin],
                 caps,
                 move |ker| {
-                    build_qkv_norm_rope(ker, rows, seq, heads, build_dt, eps, cfg);
+                    build_qkv_norm_rope(ker, rows, rope_rows, heads, build_dt, eps, cfg);
                     ker.finish(3)
                 },
             )?;

@@ -319,7 +319,7 @@ fn try_tensor_cores_default_matches_strict_on_plain_matmul() {
             scheduler.rngs().iter().map(range_axis).collect::<Vec<_>>(),
         )
     };
-    assert_eq!(HeuristicsConfig::default().tc_opt, TcOpt::Relaxed);
+    assert_eq!(HeuristicsConfig::default().tc_opt, TcOpt::Padded);
     assert_eq!(plan(TcOpt::default()), plan(TcOpt::Strict));
 }
 

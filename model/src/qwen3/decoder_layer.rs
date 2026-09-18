@@ -114,14 +114,20 @@ impl Qwen3DecoderLayer {
     }
 
     pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor)) -> Result<Tensor> {
-        self.forward_residual(Residual::from(x.clone()), rope)?.join()
+        self.forward_residual(Residual::from(x.clone()), rope, None)?.join()
     }
 
     /// The layer over the unsummed stream: the incoming add is consumed by the
     /// input norm, and the outgoing mlp add is left pending for the next layer.
-    pub(crate) fn forward_residual(&self, x: Residual, rope: &(Tensor, Tensor)) -> Result<Residual> {
+    /// `seg_start` is the packed rows' segment table (see [`super::Packing`]).
+    pub(crate) fn forward_residual(
+        &self,
+        x: Residual,
+        rope: &(Tensor, Tensor),
+        seg_start: Option<&Tensor>,
+    ) -> Result<Residual> {
         let (x, x_norm) = x.norm(&self.input_layernorm)?;
-        let attn = self.attention.forward_into(&x_norm, rope, Some(&x))?;
+        let attn = self.attention.forward_into(&x_norm, rope, Some(&x), seg_start)?;
         let (h, h_norm) = Residual::advance(x, attn).norm(&self.post_attention_layernorm)?;
         let mlp = self.mlp.forward_into(&h_norm, Some(&h))?;
         Ok(Residual::advance(h, mlp))

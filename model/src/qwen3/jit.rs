@@ -10,12 +10,14 @@ use super::reranker::Qwen3Reranker;
 jit_wrapper! {
     Qwen3EmbeddingJit(Qwen3Embedding) {
         input_ids: Tensor,
-        lengths: Tensor,
+        positions: Tensor,
+        seg_start: Tensor,
+        pool_idx: Tensor,
 
         outputs { embeddings }
 
-        build(input_ids, lengths) {
-            model.encode(input_ids, lengths)
+        build(input_ids, positions, seg_start, pool_idx) {
+            model.encode_packed(input_ids, &super::model::Packing { positions, seg_start }, pool_idx)
         }
     }
 }

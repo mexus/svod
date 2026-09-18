@@ -131,7 +131,7 @@ fn prop_fa_vs_sdpa_amd() {
             t
         });
 
-        let Some(got_t) = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref() })
+        let Some(got_t) = flash_attention_with(&q, &k, &v, FaOpts { causal, key_lens: lens_t.as_ref(), ..Default::default() })
             .expect("fa build")
         else {
             return Ok(()); // shapes chosen to tile; the guard prevents an ineligible device

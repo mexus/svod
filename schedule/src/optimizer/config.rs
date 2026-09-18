@@ -107,12 +107,19 @@ pub enum TcOpt {
     Strict,
 
     /// Any reduce-axis count: the tensor core takes one divisible reduce axis
-    /// and the others stay loops around the WMMA (TC_OPT=1, default).
-    #[default]
+    /// and the others stay loops around the WMMA (TC_OPT=1).
     Relaxed,
 
-    /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2).
+    /// [`Self::Relaxed`] plus PADTO on non-divisible M/N/K (TC_OPT=2, default)
+    /// inside the tensor-core padding budget, so a 1500-row GEMM still tiles
+    /// at 1504 while a 5-row GEMV never pays for 16.
+    #[default]
     Padded,
+
+    /// [`Self::Padded`] with only PADTO's own 4x work limit, tinygrad's
+    /// TC_OPT=2 (TC_OPT=3): a partial tile is worth having even at a beam
+    /// width of 5, as the padded-fragment codegen tests need.
+    Unbounded,
 }
 
 impl TcOpt {
@@ -122,6 +129,7 @@ impl TcOpt {
             Self::Strict => 0,
             Self::Relaxed => 1,
             Self::Padded => 2,
+            Self::Unbounded => 3,
         }
     }
 }
@@ -395,7 +403,7 @@ impl HeuristicsConfig {
     /// * `SVOD_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     /// * `SVOD_NOLOCALS` - Disable LOCAL axis selection after grouped-reduction matching
     /// * `SVOD_TC` - Tensor-core usage: `0` disables, `2` shape-only, else enabled
-    /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), or padded (`2`)
+    /// * `TC_OPT` / `SVOD_TC_OPT` - Strict (`0`), relaxed (`1`), padded within budget (`2`), or padded up to 4x work (`3`)
     /// * `TC_SELECT` / `SVOD_TC_SELECT` - Auto (`-1`) or a tensor-core index
     pub fn from_env() -> Self {
         let parse_usize = |keys: &[&str], default: usize| {
@@ -421,10 +429,11 @@ impl HeuristicsConfig {
             Some("2") => TcUsage::ShapeOnly,
             _ => TcUsage::Enabled,
         };
-        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 1) {
+        let tc_opt = match parse_usize(&["SVOD_TC_OPT", "TC_OPT"], 2) {
             0 => TcOpt::Strict,
+            1 => TcOpt::Relaxed,
             2 => TcOpt::Padded,
-            _ => TcOpt::Relaxed,
+            _ => TcOpt::Unbounded,
         };
         let tc_select = ["SVOD_TC_SELECT", "TC_SELECT"]
             .iter()
@@ -454,7 +463,7 @@ impl Default for HeuristicsConfig {
     fn default() -> Self {
         Self {
             tc_enabled: TcUsage::Enabled,
-            tc_opt: TcOpt::Relaxed,
+            tc_opt: TcOpt::Padded,
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
             matvec_blocksize: None,

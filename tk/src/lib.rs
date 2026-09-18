@@ -29,7 +29,11 @@
 //!
 //! # Supported targets
 //! - **gfx942** (CDNA3) — wave64, MFMA.
-//! - **gfx1151** (RDNA3.5) — wave32, WMMA.
+//! - **gfx1151** (RDNA3.5) — wave32, gfx11 WMMA (replicated inputs, even/odd
+//!   accumulator — the `_W32_*` shapes).
+//! - **gfx1200 / gfx1201** (RDNA4) — wave32, gfx12 WMMA (one strided 8/lane
+//!   [`tiles::RT_16X16_GFX12`] for every role). Every kernel bar the direct-launch
+//!   flash-attention wrapper, which builds a wave64 block and stays gfx942-only.
 //! - **CUDA sm_80+** — warp32, `mma.sync.m16n8k16` (a 16×16 tile as two m16n8
 //!   halves, [`layout::LaneMap::MmaSync`]); [`matmul`], [`flash_attention`] and the
 //!   shuffle-only [`single_query_attention`].
@@ -73,8 +77,8 @@ const _: () = assert!(WARP_THREADS == ArchCaps::GFX942.wave_size);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
 pub use kernels::fa::{
-    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaOpts, flash_attention, flash_attention_supported, flash_attention_tuned,
-    flash_attention_with,
+    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOpts, flash_attention, flash_attention_supported,
+    flash_attention_tuned, flash_attention_with,
 };
 pub use kernels::gemm::{Epilogue, GemmCfg, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, matmul, swiglu_pair_width};
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};

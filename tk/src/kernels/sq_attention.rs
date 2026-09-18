@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use smallvec::smallvec;
 use snafu::ensure;
-use svod_dtype::{AmdArch, CudaArch, DType};
+use svod_dtype::{CudaArch, DType};
 use svod_ir::{ConstValue, UOp};
 use svod_tensor::Tensor;
 
@@ -18,19 +18,35 @@ use crate::index::{Idx, flat_index, flat_offset, index_off_gated, load_at};
 use crate::scaffold::GlSpec;
 use crate::{ArchCaps, ArchSet, Kernel};
 
-/// Architectures on which the scalar shuffle implementation is supported: the AMD
-/// pair plus CUDA from Ampere up (the kernel needs only `shfl.sync` and `ex2`).
+/// Architectures on which the scalar shuffle implementation is supported: the CDNA
+/// and RDNA parts plus CUDA from Ampere up (the kernel needs only `shfl.sync` and
+/// `ex2`).
 pub const SQ_ATTENTION_SUPPORTED_ARCHS: ArchSet =
-    ArchSet::amd(&[AmdArch::Gfx942, AmdArch::Gfx1151]).with_cuda_from(CudaArch::from_compute_capability(8, 0));
+    ArchSet::amd(crate::target::CDNA_RDNA_WMMA).with_cuda_from(CudaArch::from_compute_capability(8, 0));
 
 /// Compile-time masking options for [`single_query_attention`].
 #[derive(Clone, Copy, Default)]
 pub struct SqAttentionOpts<'a> {
     /// Optional `[B]` i32 valid-key counts. Keys `0..key_lens[b]` are valid.
+    ///
+    /// Entries must be in `0..=N`: the count is the loop's trip bound and the
+    /// renderer compares it unsigned, so a negative one runs the loop four
+    /// billion times rather than none.
     pub key_lens: Option<&'a Tensor>,
-    /// Also include key `N-1`. Required when `key_lens` is present; this is the
-    /// Whisper self-cache layout where the current token occupies the final slot.
+    /// Also include key `N-1`: the Whisper self-cache layout where the current
+    /// token occupies the final slot. Exactly one of this and [`Self::appended`]
+    /// is required when `key_lens` is present.
     pub include_last: bool,
+    /// The current token's `[B,1,H,D]` key/value, scored after the prefix the
+    /// cache holds instead of being read from it.
+    ///
+    /// A decoder step projects one K/V row per layer and must attend to it
+    /// alongside the cache. Splicing it into the cache first copies the whole
+    /// cache slice every layer; handing it over separately costs one peeled
+    /// online-softmax update. Dtype matches K/V and `H` is the selected head
+    /// count, so the appended row is indexed by the *selected* head, not the
+    /// packed one. Requires `key_lens`, which then names the prefix alone.
+    pub appended: Option<(&'a Tensor, &'a Tensor)>,
     /// Number of contiguous K/V chunks; `None` takes the device's
     /// [`SqPolicy`] choice, measured on first use when tuning is on. Values
     /// above one are supported only for unmasked attention when `N` is
@@ -287,29 +303,34 @@ pub(crate) struct HeadSelection {
     pub(crate) offset: usize,
 }
 
+/// Which keys a kernel scores, and where the current token's key lives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SqMask {
+    /// Every key `0..N`; no `key_lens` is bound.
+    Whole,
+    /// Keys `0..key_lens[b]` plus slot `N-1` of the same cache.
+    PrefixAndLast,
+    /// Keys `0..key_lens[b]` plus a separately bound `[B,1,H,D]` key/value pair.
+    PrefixAndAppended,
+}
+
 /// Build the one-wave single-query attention kernel.
 ///
-/// ABI is `out, q, k, v, [key_lens]`, with sequence-major `[B,S,H,D]` Q/output
-/// and `[B,S,H_total,D]` K/V globals.
+/// ABI is `out, q, k, v, [key_lens], [appended_k, appended_v], [cache_map]`, with
+/// sequence-major `[B,S,H,D]` Q/output and `[B,S,H_total,D]` K/V globals.
 /// `kv_batch` is `b`, or `1` when one K/V cache serves every batch row. Beam
 /// search decodes each hypothesis against the *same* audio, so the cross
 /// attention cache is identical across rows; binding it once and indexing row 0
 /// turns a `b`-fold re-read of the largest tensor in the step into a single one.
-/// `cache_map` binds a trailing `[b]` i32 global (after `key_lens`, when present)
-/// giving the K/V row each query row reads; without it every row reads its own,
-/// or row 0 when `kv_batch` is 1.
-pub(crate) fn build_single_query_attention(
-    ker: &Kernel,
-    geom: SqGeom,
-    masked: bool,
-    include_last: bool,
-    cache_map: bool,
-) {
+/// [`SqMask::PrefixAndAppended`] binds the current token's `[B,1,H,D]` K/V
+/// separately and peels one online-softmax update for it after the prefix loop.
+/// `cache_map` binds the trailing `[b]` i32 global giving the K/V row each query
+/// row reads; without it every row reads its own, or row 0 when `kv_batch` is 1.
+pub(crate) fn build_single_query_attention(ker: &Kernel, geom: SqGeom, mask: SqMask, cache_map: bool) {
     let SqGeom { b, kv_batch, n, heads, d, kv: kv_dt } = geom;
     let wave = ker.caps.wave_size;
     Kernel::assert_divisible(d, wave, "single-query attention D");
     assert!(n > 0, "single-query attention N must be > 0");
-    assert!(!masked || include_last, "masked single-query attention must include the appended key");
     let ept = d / wave;
     let warp = ker.warp();
     let f32 = DType::Float32;
@@ -327,9 +348,13 @@ pub(crate) fn build_single_query_attention(
     let head = ker.grid_x();
     let packed_head = head.add(&cidx(heads.offset as i64));
     let lane = ker.laneid();
-    let prefix = masked.then(|| {
+    let prefix = (mask != SqMask::Whole).then(|| {
         let lens = ker.gl(&[b], DType::Int32);
         load_at(lens.uop(), lens.shape(), &[Idx::from(&batch)])
+    });
+    let appended = (mask == SqMask::PrefixAndAppended).then(|| {
+        let shape = [b, 1, heads.count, d];
+        (ker.gl(&shape, kv_dt.clone()), ker.gl(&shape, kv_dt.clone()))
     });
     let kv_row = kv_row_index(ker, b, kv_batch, cache_map, &batch);
 
@@ -355,18 +380,21 @@ pub(crate) fn build_single_query_attention(
     let max_reg = max_reg.after(smallvec![initialized.clone()]);
     let norm_reg = norm_reg.after(smallvec![initialized]);
 
-    let lp = match &prefix {
-        Some(prefix) => ker.loop_dynamic(prefix.add(&cidx(1))),
-        None => ker.loop_static(n as i64),
+    // A masked launch streams only the valid prefix. Where the current token sits
+    // in the cache's final slot the loop runs one trip longer and maps it there;
+    // where it arrives in its own global the prefix is the whole loop, which is
+    // empty for a row that has decoded nothing yet.
+    let lp = match (&prefix, mask) {
+        (Some(prefix), SqMask::PrefixAndLast) => ker.loop_dynamic(prefix.add(&cidx(1))),
+        (Some(prefix), _) => ker.loop_dynamic(prefix.clone()),
+        (None, _) => ker.loop_static(n as i64),
     };
     let loop_index = lp.index().clone();
-    // Whisper keeps the current token after the fixed cache. A masked launch
-    // streams only the valid prefix, then maps its final iteration to that slot.
-    let key = match &prefix {
-        Some(prefix) => {
+    let key = match (&prefix, mask) {
+        (Some(prefix), SqMask::PrefixAndLast) => {
             UOp::try_where(loop_index.lt(prefix), loop_index.clone(), cidx(n as i64 - 1)).expect("select appended key")
         }
-        None => loop_index,
+        _ => loop_index,
     };
     let q_loop = q_reg.after(smallvec![key.clone()]);
     let o_loop = o_reg.after(smallvec![key.clone()]);
@@ -409,17 +437,46 @@ pub(crate) fn build_single_query_attention(
     let ended = lp.close();
 
     let final_o = o_reg.after(smallvec![ended.clone()]);
-    let final_norm = norm_reg.after(smallvec![ended]);
-    let denom = load_at(&final_norm, &[1], &[Idx::Const(0)]);
-    let mut stores = Vec::with_capacity(ept);
-    for j in 0..ept {
-        let dim = lane.add(&cidx((j * wave) as i64));
-        let value = load_at(&final_o, &[ept], &[Idx::Const(j as i64)]).try_div(&denom).expect("normalize");
-        stores.push(
+    let final_max = max_reg.after(smallvec![ended.clone()]);
+    let final_norm = norm_reg.after(smallvec![ended.clone()]);
+    let streamed = |j: usize| load_at(&final_o, &[ept], &[Idx::Const(j as i64)]);
+    let dim_at = |j: usize| lane.add(&cidx((j * wave) as i64));
+    let appended_at = |g: &crate::tile::GL, dim: Arc<UOp>| {
+        load_at(g.uop(), g.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
+            .cast(f32.clone())
+    };
+    // One peeled online-softmax update folds the current token's key into the
+    // state the prefix loop left. An empty prefix leaves `max` at -infinity, so
+    // `alpha` is zero and the zeroed accumulator drops out: the appended key
+    // alone normalizes to one.
+    let (values, denom): (Vec<Arc<UOp>>, Arc<UOp>) = match &appended {
+        None => ((0..ept).map(streamed).collect(), load_at(&final_norm, &[1], &[Idx::Const(0)])),
+        Some((append_k, append_v)) => {
+            let q_final = q_reg.after(smallvec![ended]);
+            let mut dot = f32c(0.0);
+            for j in 0..ept {
+                let qv = load_at(&q_final, &[ept], &[Idx::Const(j as i64)]);
+                dot = dot.add(&qv.mul(&appended_at(append_k, dim_at(j))));
+            }
+            let score = warp.wave_reduce_scalar(dot, |a, p| a.add(p));
+            let old_max = load_at(&final_max, &[1], &[Idx::Const(0)]);
+            let next_max = old_max.max(&score);
+            let alpha = old_max.sub(&next_max).try_exp2().expect("exp2 appended alpha");
+            let beta = score.sub(&next_max).try_exp2().expect("exp2 appended beta");
+            let denom = load_at(&final_norm, &[1], &[Idx::Const(0)]).mul(&alpha).add(&beta);
+            let fold = |j: usize| streamed(j).mul(&alpha).add(&appended_at(append_v, dim_at(j)).mul(&beta));
+            ((0..ept).map(fold).collect(), denom)
+        }
+    };
+    let stores: Vec<Arc<UOp>> = values
+        .into_iter()
+        .enumerate()
+        .map(|(j, value)| {
+            let dim = dim_at(j);
             flat_index(out.uop(), out.shape(), &[Idx::from(&batch), Idx::Const(0), Idx::from(&head), Idx::from(dim)])
-                .store(value),
-        );
-    }
+                .store(value.try_div(&denom).expect("normalize"))
+        })
+        .collect();
     ker.push_store(UOp::group(stores), out.uop().clone());
 }
 
@@ -697,6 +754,11 @@ pub fn single_query_attention_packed(
     let dtype = q.uop().dtype();
     let masked = opts.key_lens.is_some();
     let has_map = opts.cache_map.is_some();
+    let mask = match (masked, opts.appended.is_some()) {
+        (false, _) => SqMask::Whole,
+        (true, false) => SqMask::PrefixAndLast,
+        (true, true) => SqMask::PrefixAndAppended,
+    };
     let kv_dtype = k.uop().dtype();
     let heads = HeadSelection { count: h, total: h_total, offset: head_offset };
 
@@ -770,15 +832,39 @@ pub fn single_query_attention_packed(
             multiple: 1usize
         }
     );
+    // The current token's key is either the cache's final slot or its own pair of
+    // globals; a masked launch must name exactly one, and an unmasked one neither.
     ensure!(
-        !masked || opts.include_last,
+        masked == (opts.include_last || opts.appended.is_some()) && !(opts.include_last && opts.appended.is_some()),
         crate::launch::DimMultipleSnafu {
             kernel: "single-query attention",
-            dim: "include_last (required with key_lens)",
-            value: opts.include_last as usize,
+            dim: "key_lens with exactly one of include_last and appended",
+            value: usize::from(opts.include_last) + usize::from(opts.appended.is_some()),
             multiple: 1usize
         }
     );
+    if let Some((append_k, append_v)) = opts.appended {
+        for (operand, t) in [("appended k", append_k), ("appended v", append_v)] {
+            let ad = crate::launch::concrete_dims(t, "single-query attention", operand, 4)?;
+            ensure!(
+                ad == [b, 1, h, d],
+                crate::launch::OperandShapeSnafu {
+                    kernel: "single-query attention",
+                    operand,
+                    expected: vec![b, 1, h, d],
+                    got: ad
+                }
+            );
+            ensure!(
+                t.uop().dtype() == kv_dtype,
+                crate::launch::DtypeSnafu {
+                    kernel: "single-query attention",
+                    got: t.uop().dtype(),
+                    expected: "the K/V cache dtype"
+                }
+            );
+        }
+    }
     if let Some(splits) = opts.split {
         ensure!(
             splits > 0 && (!masked || splits == 1) && (masked || n.is_multiple_of(splits)),
@@ -869,6 +955,9 @@ pub fn single_query_attention_packed(
                 if let Some(lens) = opts.key_lens {
                     inputs.push(lens);
                 }
+                if let Some((append_k, append_v)) = opts.appended {
+                    inputs.extend([append_k, append_v]);
+                }
                 if let Some(map) = opts.cache_map {
                     inputs.push(map);
                 }
@@ -880,7 +969,7 @@ pub fn single_query_attention_packed(
                     &inputs,
                     caps,
                     move |ker| {
-                        build_single_query_attention(ker, geom.clone(), masked, opts.include_last, has_map);
+                        build_single_query_attention(ker, geom.clone(), mask, has_map);
                         ker.finish(1)
                     },
                 )

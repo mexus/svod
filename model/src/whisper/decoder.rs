@@ -429,21 +429,20 @@ impl TextDecoder {
                     let q = heads(linear_forward(&block.attn.query, h)?)?;
                     let new_k = heads(linear_forward(&block.attn.key, h)?)?.cast(self.cache_dtype.clone());
                     let new_v = heads(linear_forward(&block.attn.value, h)?)?.cast(self.cache_dtype.clone());
-                    let full_k = Tensor::cat(&[&self_k_cache.narrow(2, lh_start, n_head)?, &new_k], 1)?;
-                    let full_v = Tensor::cat(&[&self_v_cache.narrow(2, lh_start, n_head)?, &new_v], 1)?;
-                    new_ks.push(new_k);
-                    new_vs.push(new_v);
 
+                    // The kernel scores this layer's packed cache prefix and the
+                    // row just projected, so nothing is spliced: the concatenation
+                    // the generic path needs copies the whole slice every layer.
                     let direct = if attention.custom_self {
-                        svod_tk::single_query_attention(
+                        svod_tk::single_query_attention_packed(
                             &q.cast(DType::Float32),
-                            &full_k,
-                            &full_v,
+                            self_k_cache,
+                            self_v_cache,
+                            lh_start,
                             svod_tk::SqAttentionOpts {
                                 key_lens: Some(self_key_lens),
-                                include_last: true,
-                                split: None,
-                                cache_map: None,
+                                appended: Some((&new_k, &new_v)),
+                                ..Default::default()
                             },
                         )
                         .map_err(tk_launch_error)?
@@ -453,17 +452,23 @@ impl TextDecoder {
                     let out = match direct {
                         Some(out) => act(out.try_reshape([batch, 1, self.n_state])?),
                         None => {
+                            let full = |cache: &Tensor, new: &Tensor| -> Result<Tensor> {
+                                let layer = cache.narrow(2, lh_start, n_head)?;
+                                Ok(act(Tensor::cat(&[&layer, new], 1)?).try_permute(&[0, 2, 1, 3])?)
+                            };
                             let valid = cached_step_mask(self_key_lens, self_key_count)?;
                             q.try_permute(&[0, 2, 1, 3])?
                                 .scaled_dot_product_attention()
-                                .key(&act(full_k).try_permute(&[0, 2, 1, 3])?)
-                                .value(&act(full_v).try_permute(&[0, 2, 1, 3])?)
+                                .key(&full(self_k_cache, &new_k)?)
+                                .value(&full(self_v_cache, &new_v)?)
                                 .key_padding_mask(&valid)
                                 .is_causal(false)
                                 .call()?
                                 .merge_heads()?
                         }
                     };
+                    new_ks.push(new_k);
+                    new_vs.push(new_v);
                     linear_forward(&block.attn.out, &out)
                 },
                 |h| {

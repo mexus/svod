@@ -40,12 +40,30 @@ fn bench_sq_attention(c: &mut Criterion) {
                 key_lens: lens.as_ref(),
                 include_last: mode.starts_with("self"),
                 split: Some(split),
-                cache_map: None,
+                ..Default::default()
             };
             let tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("sq attention").expect("supported");
             let tk_plan = tk.prepare().expect("prepare tk");
             group.bench_with_input(BenchmarkId::new(format!("tk/{mode}/split_{split}"), n), &n, |bencher, _| {
                 bench_plan(bencher, &tk_plan)
+            });
+        }
+
+        // The decoder step never splices its fresh K/V into the cache: the row it
+        // just projected arrives in its own global, which is the same arithmetic
+        // over one fewer cached key and none of the copy the splice costs.
+        if let Some(lens) = &lens {
+            let (ak, av) = (randn_f32(&[b, 1, h, d]), randn_f32(&[b, 1, h, d]));
+            let opts = svod_tk::SqAttentionOpts {
+                key_lens: Some(lens),
+                appended: Some((&ak, &av)),
+                split: Some(1),
+                ..Default::default()
+            };
+            let tk = svod_tk::single_query_attention(&q, &k, &v, opts).expect("appended").expect("supported");
+            let plan = tk.prepare().expect("prepare appended");
+            group.bench_with_input(BenchmarkId::new(format!("tk/{mode}_appended/split_1"), n), &n, |bencher, _| {
+                bench_plan(bencher, &plan)
             });
         }
 
@@ -58,12 +76,7 @@ fn bench_sq_attention(c: &mut Criterion) {
             let kk = randn_f32(&[b, n, h_total, d]);
             let vv = randn_f32(&[b, n, h_total, d]);
             for &split in &[1usize, 4, 10] {
-                let opts = svod_tk::SqAttentionOpts {
-                    key_lens: None,
-                    include_last: false,
-                    split: Some(split),
-                    cache_map: None,
-                };
+                let opts = svod_tk::SqAttentionOpts { split: Some(split), ..Default::default() };
                 let tk = svod_tk::single_query_attention_packed(&q, &kk, &vv, 0, opts)
                     .expect("packed sq attention")
                     .expect("supported");

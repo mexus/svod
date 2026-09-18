@@ -129,12 +129,12 @@ fn cached_step_key_lengths_admit_only_prefix_and_appended_key() {
 #[test]
 #[ignore = "GPU: custom single-query self/cross attention vs generic SDPA on a supported AMD device"]
 fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
-    let Some(arch) = svod_tensor::config::amd_test_arch() else {
-        eprintln!("skip: no AMD device");
-        return;
-    };
-    if !matches!(arch, svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx1151) {
-        eprintln!("skip: {arch:?} is not supported by single-query attention");
+    // The kernel's own arch set, not a hand-kept list: a part it supports must
+    // run here the day it is added.
+    let device = Tensor::empty(&[1], DType::Float32).device();
+    let archs = svod_tk::kernels::sq_attention::SQ_ATTENTION_SUPPORTED_ARCHS;
+    if let Err(why) = svod_tk::target::check_target(&device, archs) {
+        eprintln!("skip: {device:?} does not run single-query attention ({why})");
         return;
     }
 
@@ -151,11 +151,14 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
     let self_v = Tensor::randn(&[batch, dims.n_text_ctx, layer_heads, d_head]).unwrap();
     let cross_k = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
     let cross_v = Tensor::randn(&[batch, dims.n_audio_ctx, layer_heads, d_head]).unwrap();
-    let key_lens = Tensor::from_slice([2i32, 5]);
     // Identity gives each row its own cross cache; `[0, 0]` is one beam attempt
     // whose lanes share the owner's. The tile kernel resolves the row with an
     // index load and the generic path with a gather, so both maps must agree.
-    for map in [vec![0i32, 1], vec![0i32, 0]] {
+    // The self-attention kernel reads the prefix each row filled and scores the
+    // row this step projected separately, so the lengths span a row that has
+    // decoded nothing and one whose prefix fills the cache.
+    for (map, lens) in [(vec![0i32, 1], [2i32, 5]), (vec![0i32, 0], [2i32, 5]), (vec![0i32, 1], [0i32, 7])] {
+        let key_lens = Tensor::from_slice(lens);
         let cross_map = Tensor::from_slice(map.clone());
         let outputs = [
             StepAttentionMode::Generic,
@@ -188,7 +191,10 @@ fn decoder_step_attention_modes_match_generic_gpu_sdpa() {
         {
             let got = output.as_vec::<f32>().unwrap();
             let max_abs = got.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            assert!(max_abs < 3e-4, "{mode:?} logits differ from generic SDPA by {max_abs:e} under map {map:?}");
+            assert!(
+                max_abs < 3e-4,
+                "{mode:?} logits differ from generic SDPA by {max_abs:e} under map {map:?} and lengths {lens:?}"
+            );
         }
     }
 }

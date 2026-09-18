@@ -51,15 +51,16 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // Seed the pool onto the device core so `PoolQueue::new_with_resources`
     // can acquire its PM4 counter signal.
     device_handle.core().install_signal_pool(signal_pool);
-    // Bring up SDMA on CDNA so buffers can be device-local. Svod's direct KFD
-    // SDMA queue is not safe alongside its PM4 queue on RDNA yet, so RDNA uses
-    // the existing host-visible memmove path. Must decide before any _alloc,
-    // which reads has_sdma_queue to select buffer visibility.
-    let copy_queue = if !arch.is_cdna() || std::env::var_os("AMD_DISABLE_SDMA").is_some() {
-        None
-    } else {
-        Some(AmdCopyQueue::create(&amd_alloc))
-    };
+    // Bring up SDMA so buffers can be device-local. Without it every buffer is
+    // forced host-visible and each readback is a memcpy out of the VRAM BAR,
+    // whose uncached reads run at ~50 MB/s on a discrete card (GigaAM on an
+    // RX 9070 XT spent 11 s of a 13 s transcription there). The queue used to
+    // be CDNA-only over a stability worry on RDNA that traced back to the
+    // all-bits HDP flush handshake, fixed in `pm4::hdp_flush`; it now measures
+    // 48 GB/s each way on gfx1201. Must decide before any _alloc, which reads
+    // has_sdma_queue to select buffer visibility.
+    let copy_queue =
+        if std::env::var_os("AMD_DISABLE_SDMA").is_some() { None } else { Some(AmdCopyQueue::create(&amd_alloc)) };
     match copy_queue {
         Some(Ok(copy_queue)) => {
             device_handle.core().install_copy_queue(copy_queue);

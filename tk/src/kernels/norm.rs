@@ -38,8 +38,8 @@ use crate::{Group, Kernel};
 /// measured on sm_86 and gfx1151 (both wave32: 585 GB/s cache-resident and 90%
 /// of the DRAM copy rate once the working set spills), and a wave64 part joins
 /// by measuring its own.
-pub const NORM_SUPPORTED_ARCHS: crate::ArchSet = crate::ArchSet::amd(&[svod_dtype::AmdArch::Gfx1151])
-    .with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
+pub const NORM_SUPPORTED_ARCHS: crate::ArchSet =
+    crate::ArchSet::amd(crate::target::RDNA_WMMA).with_cuda_from(svod_dtype::CudaArch::from_compute_capability(8, 0));
 
 /// Per-lane global-access widths, widest first: 8 bf16 is the 128-bit vector
 /// load, and a wave issuing it covers `32 × 16 = 512` contiguous bytes.

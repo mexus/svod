@@ -22,36 +22,30 @@ impl Whisper {
     /// LayerNorm affine parameters retain checkpoint precision to match
     /// OpenAI's mixed-precision forward pass. Pre-converted checkpoints should
     /// already use these storage dtypes so loading does not create lazy cast
-    /// graphs.
+    /// graphs. fp8 linear weights are kept as stored, with their
+    /// `weight_scale` loaded next to them.
     pub fn from_state_dict(sd: &StateDict, dims: ModelDimensions) -> Result<Self> {
         let dtype = dims.dtype.clone();
-        let mut remapped = remap_hf_keys(sd);
-        let scales: Vec<_> = remapped
-            .keys()
-            .filter_map(|key| key.strip_suffix(".weight_scale").map(|weight_key| (key.clone(), weight_key.to_string())))
-            .collect();
-        for (scale_key, weight_key) in scales {
-            let scale = remapped.remove(&scale_key).expect("scale key came from the state dict");
-            let weight = remapped
-                .get(&weight_key)
-                .ok_or_else(|| Error::State { source: state::Error::MissingKey { key: weight_key.clone() } })?;
-            // The scale is per output channel: reshape to `[out, 1, ..]` so it
-            // broadcasts along the weight's input (and kernel) axes.
-            let shape = weight.shape()?;
-            let mut scale_shape = vec![1isize; shape.len()];
-            scale_shape[0] = shape[0].as_const().ok_or_else(|| Error::Checkpoint {
-                msg: format!("quantized weight {weight_key} has a symbolic output dimension"),
-            })? as isize;
-            let scale = scale.cast(dtype.clone()).try_reshape(scale_shape)?;
-            let dequantized = weight.cast(dtype.clone()).try_mul(&scale)?;
-            remapped.insert(weight_key, dequantized);
-        }
-        let mut sd = state::cast_all(&remapped, dtype);
-        for (key, tensor) in &remapped {
-            if keeps_checkpoint_dtype(key) {
-                sd.insert(key.clone(), tensor.clone());
+        let remapped = remap_hf_keys(sd);
+        for key in remapped.keys().filter(|key| key.ends_with(".weight_scale")) {
+            let weight_key = key.strip_suffix(".weight_scale").expect("filtered on the suffix");
+            if !remapped.contains_key(weight_key) {
+                return Err(Error::State { source: state::Error::MissingKey { key: weight_key.to_string() } });
             }
         }
+        // A quantized weight stays in its checkpoint dtype with its
+        // per-output-channel scale alongside it; `Linear` applies the scale to
+        // the accumulated product, so the kernels read the narrow weight.
+        let sd: StateDict = remapped
+            .iter()
+            .map(|(key, tensor)| {
+                let keep = keeps_checkpoint_dtype(key)
+                    || key.ends_with(".weight_scale")
+                    || tensor.dtype().is_fp8()
+                    || tensor.dtype() == dtype;
+                (key.clone(), if keep { tensor.clone() } else { tensor.cast(dtype.clone()) })
+            })
+            .collect();
         let mut model = Self::empty(dims);
         model.load_state_dict(&sd, "")?;
         Ok(model)

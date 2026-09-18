@@ -11,8 +11,8 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use crate::kernels::gemm::{
-    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_SPLIT_K, RDNA_TILES,
-    gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
+    CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_128X128_RDNA4,
+    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
 };
 
 use super::device_supported;
@@ -30,6 +30,7 @@ const FRAG_COLS: usize = 16;
 const SM86: GpuArch = GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6));
 /// An RDNA part: the table is keyed by the family, not the part.
 const RDNA: GpuArch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1151);
+const RDNA4: GpuArch = GpuArch::Amd(svod_dtype::AmdArch::Gfx1201);
 
 /// The static shared-memory a CUDA block may take without the opt-in dynamic
 /// allocation (48 KiB).
@@ -102,6 +103,30 @@ fn rdna_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) 
     assert_eq!(cdna.swiglu_pair_width(), None);
 }
 
+/// The RDNA4 table: the 128×128 wide tile kept from one block per CU
+/// (`resident` 1 against the measured 64), the finer tiles behind it for the
+/// short grids and the `M`s it does not divide; every tile a 64-wide wave N
+/// tile, so the gate/up pair width is 32 on every candidate.
+#[test_case(4096, 1024, 6144, Some(0); "gate_up takes the wide tile")]
+#[test_case(4096, 2048, 1024, Some(0); "256 blocks take the wide tile")]
+#[test_case(1024, 3072, 1024, Some(0); "64 blocks still take the wide tile")]
+#[test_case(128, 1024, 6144, Some(2); "batch-1 prefill falls back to 128x64")]
+#[test_case(128, 1024, 1024, Some(2); "an 8-block grid falls back to 128x64")]
+#[test_case(64, 64, 192, Some(3); "M of 64 takes the two-wave 64x64 tile")]
+#[test_case(100, 1024, 1024, None; "M not a multiple of 64")]
+fn rdna4_policy_applicability(m: usize, k: usize, n: usize, want: Option<usize>) {
+    let policy = GemmPolicy::for_arch(RDNA4);
+    assert_eq!((policy.compute_units, policy.resident), (64, 1));
+    assert_eq!(policy.cfg(m, k, n), want.map(|i| RDNA4_TILES[i]), "rdna4 cfg({m}, {k}, {n})");
+    assert_eq!(RDNA4_TILES[0], NT_128X128_RDNA4);
+    assert_eq!(NT_128X128_RDNA4.threads(32), 256);
+    assert_eq!(NT_128X128_RDNA4.shared_bytes(2), 32 * 1024);
+    for cfg in &RDNA4_TILES {
+        assert_eq!((cfg.reg_n(), cfg.reg_m() % 16, cfg.split_k), (64, 0, 1), "{cfg:?}");
+    }
+    assert_eq!(policy.swiglu_pair_width(), Some(32));
+}
+
 /// A rank-1 operand is a structured `Err`, not a panic — the shape preconditions
 /// resolve before any device dispatch, so this runs GPU-free.
 #[test]
@@ -157,6 +182,7 @@ proptest! {
 /// table.
 #[test_case(SM86, &CUDA_TILES; "cuda")]
 #[test_case(RDNA, &RDNA_TILES; "rdna")]
+#[test_case(RDNA4, &RDNA4_TILES; "rdna4")]
 fn swiglu_pair_width_is_common_to_every_tile(arch: GpuArch, table: &[GemmCfg]) {
     let policy = GemmPolicy::for_arch(arch);
     assert_eq!(policy.tiles, table);
@@ -281,6 +307,35 @@ fn gemm_nt_matches_linear_gpu(m: usize, k: usize, n: usize) {
     let err = rel_err(&to_f32_vec(&y), &want);
     println!("gemm_nt {m}x{k}x{n}: relative error {err:e}");
     assert!(err < BF16_REL_TOL, "{m}x{k}x{n}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
+}
+
+/// Every tile of the device's table, forced through `gemm_nt_with`, against
+/// `Tensor::linear` on a shape they all tile — the tuner may pick any of them
+/// for a shape, so each one's numerics are pinned, not just the static choice's.
+#[test_case(0; "tile 0")]
+#[test_case(1; "tile 1")]
+#[test_case(2; "tile 2")]
+#[test_case(3; "tile 3")]
+#[test_case(4; "tile 4")]
+#[ignore]
+fn every_table_tile_matches_linear_gpu(index: usize) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip every_table_tile_matches_linear_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (512usize, 192usize, 384usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    let Some(&cfg) = GemmPolicy::for_arch(arch).tiles.get(index) else {
+        eprintln!("skip every_table_tile_matches_linear_gpu: the table has no tile {index}");
+        return;
+    };
+    assert!(cfg.tiles(m, k, n), "{cfg:?} must tile {m}x{k}x{n}");
+    let y = gemm_nt_with(&x, &w, move |_, _, _| Some(cfg)).expect("gemm_nt build").expect("the tile applies");
+    let want = to_f32_vec(&x.linear().weight(&w).call().expect("reference linear"));
+    let err = rel_err(&to_f32_vec(&y), &want);
+    println!("gemm_nt tile {index} {cfg:?}: relative error {err:e}");
+    assert!(err < BF16_REL_TOL, "tile {index}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
 }
 
 /// A `[B, L, K]` activation is `B·L` rows: the output is `[B, L, N]` and equals

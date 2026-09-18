@@ -8,8 +8,9 @@
 //! or failing deep in compile.
 //!
 //! The gate is generic over the supported set: a kernel passes its own [`ArchSet`]
-//! (k-means and k-NN declare the AMD pair; flash-attention, matmul and
-//! single-query attention add `sm_80+`).
+//! (k-means and k-NN declare [`CDNA_RDNA_WMMA`]; flash-attention, matmul and
+//! single-query attention add `sm_80+`; norm and the NT GEMM are wave32-only and
+//! declare [`RDNA_WMMA`]).
 //! Adding a GPU is "declare it here (and supply its arch-specific kernel bits)",
 //! not "rewrite this"; the generic launch infra (`compile`/`run_kernel`/
 //! `graph_launch`) stays arch-agnostic — only the per-kernel launcher invokes this.
@@ -35,6 +36,17 @@ pub struct ArchSet {
     pub cuda_min: Option<CudaArch>,
     pub metal_min: Option<MetalFamily>,
 }
+
+/// The wave32 WMMA parts tk carries validated fragment tables for: RDNA3.5
+/// (gfx11 shapes — replicated inputs, even/odd accumulator) and RDNA4 (the
+/// strided 8/lane gfx12 fragment). One family, one config table
+/// ([`crate::arch::Family::Rdna`]), so a kernel names the family's parts rather
+/// than a single measured card.
+pub const RDNA_WMMA: &[AmdArch] = &[AmdArch::Gfx1151, AmdArch::Gfx1200, AmdArch::Gfx1201];
+
+/// [`RDNA_WMMA`] plus the validated CDNA part (gfx942, MFMA wave64) — the AMD
+/// list of a kernel whose body is arch-generic across both families.
+pub const CDNA_RDNA_WMMA: &[AmdArch] = &[AmdArch::Gfx942, AmdArch::Gfx1151, AmdArch::Gfx1200, AmdArch::Gfx1201];
 
 impl ArchSet {
     /// AMD-only support.

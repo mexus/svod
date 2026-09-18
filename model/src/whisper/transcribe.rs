@@ -161,7 +161,12 @@ impl WhisperRecognizer {
         let (layer_heads, d_head) = (dims.n_text_layer * dims.n_text_head, dims.n_text_state / dims.n_text_head);
         let (feature_dtype, cache_dtype) = (dims.dtype.clone(), dims.cache_dtype());
         let (max_batch, max_lanes) = (plan.encoder_batch, plan.decoder_slots);
-        let prepare_config = PrepareConfig::from_env();
+        // Device-local outputs everywhere: the prefill and step logits are read
+        // with one copyout per row and the caches move on-device. Reading the
+        // step logits through the host mapping instead costs a BAR read per
+        // row per token — 4 ms each on a discrete AMD card, 97 s of a 10-minute
+        // clip.
+        let prepare_config = PrepareConfig::device_local();
 
         let mut mel_jit = WhisperMelJit::new(WhisperMel::new(n_mels));
         mel_jit.prepare_with_config(
