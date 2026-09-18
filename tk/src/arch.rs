@@ -230,6 +230,17 @@ impl ArchCaps {
                     ST_16X16
                 }
             }
+            // gfx12 gathers an operand as `row = L%16, col = 8·(L/16)+j` — each
+            // lane's eight bf16 are one 16-byte chunk of a row, the unit
+            // [`Swizzle::Sw16x16Mma`] keeps contiguous and the HipKittens XOR
+            // (8-byte granular) splits in two. With the chunk swizzle the gather
+            // is one `ds_read_b128` per fragment landing straight in the WMMA's
+            // register quad, instead of two `ds_read_b64` the compiler pairs
+            // across fragments and then reassembles with `v_mov`s. It is the same
+            // 8-rows × 16-byte phase `mma.sync` reads, so it is conflict-free
+            // here too. Only the swizzled strip moves: the plain one is flash
+            // attention's, which does not swizzle its LDS and is left as it was.
+            GpuArch::Amd(amd) if amd.is_rdna4() && swizzled => ST_16X16_MMA,
             GpuArch::Amd(_) => ST_16X16_SWIZZLED_W32,
         })
     }

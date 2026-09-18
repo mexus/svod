@@ -183,8 +183,10 @@ fn frag_roles_resolve_to_canonical_constants() {
 /// accumulator, so operand, B operand, accumulator and the N-major `AccumulatorT`
 /// store are one fragment, as on CDNA. Hardware-verified on gfx1201; a regression
 /// back onto the `RT_16X16_W32_*` shapes is what made the matmul compute garbage.
-/// The LDS strip is unchanged (the wave32 swizzled ept-8 strip serves both gfx11
-/// and gfx12).
+/// The *swizzled* strip is gfx12's own: its gather reads one 16-byte chunk of a
+/// row per lane, so the chunk-granular [`ST_16X16_MMA`] keeps the fragment one
+/// `ds_read_b128` where gfx11's 8-byte-granular XOR would split it in two. The
+/// plain strip (flash attention, which does not swizzle) stays the gfx11 one.
 /// Sharing one fragment across the roles is also what licenses the register
 /// acc→input handoff (hardware-verified on gfx1201), which drops FA's per-warp
 /// LDS relayout band.
@@ -198,7 +200,8 @@ fn rdna4_caps_resolve_gfx12_fragments(arch: AmdArch) {
         assert_eq!(c.frag(role), Some(RT_16X16_GFX12), "{role:?}");
     }
     assert_eq!(c.shared_default(), Some(ST_16X16_SWIZZLED_W32));
-    assert_eq!(c.shared_swizzled(), Some(ST_16X16_SWIZZLED_W32));
+    assert_eq!(c.shared_swizzled(), Some(ST_16X16_MMA));
+    assert!(c.shared_swizzled().is_some_and(|st| st.swizzle.keeps_16b_chunks()), "gfx12 gathers 16-byte chunks");
     assert!(c.acc_reusable_as_input(), "one gfx12 fragment for both roles ⇒ a register copy");
 }
 

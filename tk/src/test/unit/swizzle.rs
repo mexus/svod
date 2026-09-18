@@ -68,6 +68,9 @@ fn test_sw16x16_row_distinct_banks() {
 /// chunk, lanes `(g, t)` reading 2-byte words `2t, 2t+1` of chunk `j/4`) and for an
 /// `ldmatrix`/`cp.async` phase (8 rows × one chunk) the 32 4-byte words hit 32
 /// distinct banks; 8-byte (`vec4` bf16) groups stay contiguous for the vec fill.
+/// The gfx12 `ds_read_b128` gather (lane `L` reads row `L%16`, chunk `L/16`; the
+/// LDS serves eight such lanes per cycle) is the same 8-rows × one-chunk phase,
+/// so the swizzled strip RDNA4 takes is conflict-free by the same check.
 #[test]
 fn test_sw16x16_mma_conflict_free() {
     let cidx = |v: usize| UOp::index_const(v as i64);
