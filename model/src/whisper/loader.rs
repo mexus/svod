@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use svod_dtype::DType;
+use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
 use crate::state::{self, StateDict};
@@ -23,11 +25,13 @@ impl Whisper {
     /// OpenAI's mixed-precision forward pass. Pre-converted checkpoints should
     /// already use these storage dtypes so loading does not create lazy cast
     /// graphs. fp8 linear weights are kept as stored, with their
-    /// `weight_scale` loaded next to them.
+    /// `weight_scale` loaded next to them; a scale on any other kind of module
+    /// is folded into its weight instead, since only `Linear` can apply one.
     pub fn from_state_dict(sd: &StateDict, dims: ModelDimensions) -> Result<Self> {
         let dtype = dims.dtype.clone();
         let remapped = remap_hf_keys(sd);
-        for key in remapped.keys().filter(|key| key.ends_with(".weight_scale")) {
+        let scales: Vec<String> = remapped.keys().filter(|key| key.ends_with(".weight_scale")).cloned().collect();
+        for key in &scales {
             let weight_key = key.strip_suffix(".weight_scale").expect("filtered on the suffix");
             if !remapped.contains_key(weight_key) {
                 return Err(Error::State { source: state::Error::MissingKey { key: weight_key.to_string() } });
@@ -36,7 +40,7 @@ impl Whisper {
         // A quantized weight stays in its checkpoint dtype with its
         // per-output-channel scale alongside it; `Linear` applies the scale to
         // the accumulated product, so the kernels read the narrow weight.
-        let sd: StateDict = remapped
+        let mut sd: StateDict = remapped
             .iter()
             .map(|(key, tensor)| {
                 let keep = keeps_checkpoint_dtype(key)
@@ -46,6 +50,27 @@ impl Whisper {
                 (key.clone(), if keep { tensor.clone() } else { tensor.cast(dtype.clone()) })
             })
             .collect();
+        let mut model = Self::empty(dims.clone());
+        model.load_state_dict(&sd, "")?;
+        if scales.is_empty() {
+            return Ok(model);
+        }
+        // `Linear` is the only module with a field to hold a scale, and it
+        // writes the one it took back out under the same key. A scale that does
+        // not survive that round trip reached a module that cannot apply it —
+        // a convolution or an embedding — so its weight absorbs it rather than
+        // loading narrow with the scale silently dropped.
+        let applied = model.state_dict("");
+        let orphans: Vec<&String> = scales.iter().filter(|key| !applied.contains_key(*key)).collect();
+        if orphans.is_empty() {
+            return Ok(model);
+        }
+        for key in orphans {
+            let weight_key = key.strip_suffix(".weight_scale").expect("filtered on the suffix");
+            let weight = sd.remove(weight_key).expect("the scale's weight key was checked above");
+            let scale = sd.remove(key).expect("the scale key came from the state dict");
+            sd.insert(weight_key.to_string(), fold_scale(&weight, &scale, &dtype, weight_key)?);
+        }
         let mut model = Self::empty(dims);
         model.load_state_dict(&sd, "")?;
         Ok(model)
@@ -87,6 +112,20 @@ impl Whisper {
         let repo = format!("openai/whisper-{}", size.name());
         Self::from_hub(&repo, "main", dims)
     }
+}
+
+/// Dequantize `weight` into `dtype` by its per-output-channel `scale`, which
+/// reshapes to `[out, 1, ..]` so it broadcasts along the input (and kernel) axes.
+fn fold_scale(weight: &Tensor, scale: &Tensor, dtype: &DType, key: &str) -> Result<Tensor> {
+    let shape = weight.shape()?;
+    let out = shape
+        .first()
+        .and_then(|dim| dim.as_const())
+        .ok_or_else(|| Error::Checkpoint { msg: format!("quantized weight {key} has no constant output dimension") })?;
+    let mut scale_shape = vec![1isize; shape.len()];
+    scale_shape[0] = out as isize;
+    let scale = scale.cast(dtype.clone()).try_reshape(scale_shape)?;
+    Ok(weight.cast(dtype.clone()).try_mul(&scale)?)
 }
 
 fn keeps_checkpoint_dtype(key: &str) -> bool {

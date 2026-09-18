@@ -258,6 +258,66 @@ fn quantized_weight_stays_fp8_and_scales_the_accumulator() {
     }
 }
 
+/// Only `Linear` has a field for a `weight_scale`. A checkpoint that quantizes
+/// anything else -- a convolution, the token embedding -- must have the scale
+/// folded into its weight, or the module would load raw fp8 codes with the
+/// scale silently dropped. Quantized linears in the same checkpoint still stay
+/// narrow with their scale beside them.
+#[test_case("encoder.conv1.weight"; "conv1d weight")]
+#[test_case("decoder.token_embedding.weight"; "token embedding")]
+fn scale_on_a_non_linear_weight_folds_into_the_weight(key: &str) {
+    let mut dims = small_decoder_dims();
+    dims.dtype = DType::Float16;
+    let mut sd = Whisper::empty(dims.clone()).state_dict("");
+    let shape = sd[key].dims().unwrap();
+    let (weight, scale, dequantized) = quantize_rows(&shape);
+    sd.insert(key.into(), weight);
+    sd.insert(format!("{key}.weight_scale"), scale);
+
+    // A genuinely quantized linear in the same checkpoint, which must stay narrow.
+    let linear_key = "decoder.blocks.0.mlp.0.weight";
+    let (weight, scale, _) = quantize_rows(&[dims.n_text_state * 4, dims.n_text_state]);
+    sd.insert(linear_key.into(), weight);
+    sd.insert(format!("{linear_key}.weight_scale"), scale);
+
+    let model = Whisper::from_state_dict(&sd, dims.clone()).unwrap();
+    let loaded = match key {
+        "encoder.conv1.weight" => &model.encoder.conv1.weight,
+        "decoder.token_embedding.weight" => &model.decoder.token_embedding,
+        other => unreachable!("unhandled fixture key {other}"),
+    };
+    assert_eq!(loaded.dtype(), dims.dtype, "a weight no module can scale must widen to the compute dtype");
+    assert_eq!(loaded.dims().unwrap(), shape, "folding preserves the weight's shape");
+    let actual = loaded.cast(DType::Float32).to_vec::<f32>().unwrap();
+    for (index, (a, e)) in actual.iter().zip(&dequantized).enumerate() {
+        assert!((a - e).abs() <= 1e-2 * e.abs().max(1.0), "{key}[{index}] folded {a} vs dequantized {e}");
+    }
+
+    let quantized = &model.decoder.blocks[0].mlp0;
+    assert_eq!(quantized.weight.dtype(), DType::FP8E4M3, "a linear weight still reaches the kernel as stored");
+    assert!(quantized.weight_scale.is_some(), "and keeps its scale to apply to the accumulator");
+}
+
+/// An fp8 weight of `shape`, its `[out, 1]` per-output-channel scale, and the
+/// row-major dequantized product the two stand for.
+fn quantize_rows(shape: &[usize]) -> (Tensor, Tensor, Vec<f32>) {
+    let (out, inner) = (shape[0], shape[1..].iter().product::<usize>());
+    let codes: Vec<u8> = (0..out * inner)
+        .map(|index| svod_dtype::cast::float_to_fp8(((index % 13) as f64 - 6.0) * 0.5, ScalarDType::FP8E4M3).unwrap())
+        .collect();
+    let scale: Vec<f32> = (0..out).map(|row| 0.5 + row as f32 * 0.125).collect();
+    let dequantized = codes
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| {
+            svod_dtype::cast::fp8_to_float(byte, ScalarDType::FP8E4M3).unwrap() as f32 * scale[index / inner]
+        })
+        .collect();
+    let weight = Tensor::from_raw_bytes(&codes, shape, DType::FP8E4M3).unwrap();
+    let scale = Tensor::from_slice(scale).try_reshape([out, 1]).unwrap();
+    (weight, scale, dequantized)
+}
+
 /// Prefill owns the cross projection now, so the cache dtype is a property of
 /// what it hands back rather than of what it is handed. Storage must be the
 /// declared cache dtype, must not re-round what `project_cross_kv` produced,
