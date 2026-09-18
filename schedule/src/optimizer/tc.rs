@@ -37,10 +37,17 @@ pub struct MatmulPattern {
 pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, OptError> {
     let reduce_op = match scheduler.reduceop() {
         Some(op) => op,
-        None => return Ok(None),
+        None => {
+            tracing::debug!("no matmul: the kernel has no REDUCE");
+            return Ok(None);
+        }
     };
 
     let Some((in0, in1)) = matmul_operands(&reduce_op) else {
+        tracing::debug!(
+            src = reduce_op.op().sources().first().map(|s| AsRef::<str>::as_ref(s.op())),
+            "no matmul: the REDUCE is not an ADD over a MUL, modulo casts"
+        );
         return Ok(None);
     };
     let in0_all_ranges = get_ranges(&in0);
@@ -78,6 +85,15 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
     }
 
     if axis_choices.is_empty() {
+        // M and N are the ranges exclusive to one operand; K comes from the
+        // REDUCE itself. A fused producer that makes both operands reach the
+        // same ranges empties one of these and the matmul disappears.
+        tracing::debug!(
+            m = in0_ranges.len(),
+            n = in1_ranges.len(),
+            k = red_ranges.len(),
+            "no matmul: no (N, M, K) triple, so an operand has no exclusive range"
+        );
         return Ok(None);
     }
 

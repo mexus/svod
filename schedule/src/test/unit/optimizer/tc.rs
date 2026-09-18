@@ -11,7 +11,7 @@ use test_case::test_case;
 use crate::optimizer::error::OptError;
 use crate::optimizer::renderer::{AMD_CDNA_161632, CUDA_81616, METAL_888, SwizzleAxis, TcTilePolicy, TensorCore};
 use crate::optimizer::tc::{TcSelection, apply, apply_with_axis_choice, matching, selection, swizzle, tc_operand};
-use crate::optimizer::{Opt, Renderer, Scheduler};
+use crate::optimizer::{Opt, Renderer, Scheduler, prepare_scheduler};
 use crate::test::support::prelude::*;
 use crate::test::unit::optimizer::kernels::{Ranged, matmul_accum, matmul_with, plus, times, two_n_matmul};
 
@@ -86,6 +86,32 @@ fn detect_matmul_matches_a_mul_under_the_reduce(fused: bool) {
 
     assert_eq!((pattern.in0_ranges.len(), pattern.in1_ranges.len(), pattern.red_ranges.len()), (1, 1, 1));
     assert_eq!(pattern.axis_choices.len(), 1);
+}
+
+/// A concat gate lands between the REDUCE and its MUL, and `matmul_operands`
+/// sees through casts and nothing else, so the matmul disappears and every
+/// tensor-core opt is declined with no log line to say why. Pre-optimization
+/// lifts a gate no reduce range can move back out, which is what keeps a conv
+/// fused into a concat eligible.
+#[test]
+fn a_concat_gate_costs_the_matmul_until_pre_optimization_lifts_it() {
+    let kernel = Ranged::new(&[(16, AxisType::Global), (16, AxisType::Global), (16, AxisType::Reduce)]);
+    let a = kernel.index(&DType::Float16, 256, plus(times(&kernel.range(0), 16), kernel.range(2)));
+    let b = kernel.index(&DType::Float16, 256, plus(times(&kernel.range(2), 16), kernel.range(1)));
+    let product = a.try_mul(&b).expect("mul").cast(DType::Float32);
+    // Reads the output range, never a reduce range — the concat's own gate.
+    let gate = kernel.range(0).lt(&UOp::index_const(8));
+    let gated = UOp::try_where(gate, product, UOp::invalid_marker()).expect("gate should build");
+    let sink = kernel.sink(gated.reduce(vec![kernel.range(2)].into(), ReduceOp::Add), &[0, 1]);
+
+    let unlifted = Scheduler::new(sink.clone(), Renderer::cuda());
+    assert!(matching::detect_matmul(&unlifted).expect("detection must not fail").is_none());
+
+    let lifted = prepare_scheduler(sink, &Renderer::cuda()).expect("pre-optimization");
+    assert!(
+        matching::detect_matmul(&lifted).expect("detection must not fail").is_some(),
+        "lifting the gate should give the matmul back"
+    );
 }
 
 /// The detected ranges are sorted by axis id descending, so axis choice 0 is
