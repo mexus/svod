@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use svod_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
-use svod_ir::{AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp, ops};
+use svod_ir::{AxisId, AxisType, ConstValue, Op, ParamArg, ReduceOp, UOp, ops};
 use test_case::test_case;
 
 use crate::optimizer::error::OptError;
@@ -358,6 +358,43 @@ fn the_pad_budget_yields_to_a_compute_bound_kernel(n: i64, k: i64, pads: bool) {
             "{error:?}"
         );
     }
+}
+
+/// `C[n,k] = Σ_d A[n,d] · B[d,k]`, optionally reduced again over `k`: the matmul's
+/// own output axis is then a REDUCE axis of the same kernel.
+fn reduce_after_matmul(n: i64, k: i64, d: i64, fused: bool) -> Arc<UOp> {
+    let axis = |end, id, ty| UOp::range_axis(UOp::index_const(end), AxisId::Renumbered(id), ty);
+    let k_type = if fused { AxisType::Reduce } else { AxisType::Global };
+    let (n_r, k_r, d_r) = (axis(n, 0, AxisType::Global), axis(k, 1, k_type), axis(d, 2, AxisType::Reduce));
+    let half = |r: &Arc<UOp>| r.cast(DType::Float16);
+    let product = half(&n_r).try_add(&half(&d_r)).unwrap().try_mul(&half(&d_r).try_add(&half(&k_r)).unwrap()).unwrap();
+    let matmul = product.cast(DType::Float32).reduce(smallvec::smallvec![d_r], ReduceOp::Add);
+    if fused {
+        UOp::sink(vec![matmul.reduce(smallvec::smallvec![k_r], ReduceOp::Add), n_r])
+    } else {
+        UOp::sink(vec![matmul, n_r, k_r])
+    }
+}
+
+/// A matmul whose output axis a downstream reduce still sums over gets no tensor
+/// core from any caller: the WMMA would spread that axis over the warp's lanes and
+/// the outer sum would never cross them (the YOLO26 class tail fused with its 1x1
+/// summed a quarter of its channels under a BEAM plan). The heuristics used to
+/// decline this shape on their own; a replayed plan went straight to the core.
+#[test_case(Some(0); "the beam's default axis choice")]
+#[test_case(None; "every axis choice")]
+fn a_reduced_matmul_output_refuses_the_tensor_core(axis_choice: Option<usize>) {
+    let mut fused = Scheduler::new(reduce_after_matmul(64, 384, 384, true), Renderer::cuda());
+    let error = apply_with_axis_choice(&mut fused, -1, 2, 1, axis_choice).expect_err("refused");
+    assert!(
+        matches!(&error, OptError::ValidationFailed { reason, .. } if *reason == "a matmul output axis is a reduce axis"),
+        "{error:?}"
+    );
+    assert!(!has_op(fused.ast(), |op| matches!(op, Op::Wmma(..))));
+
+    let mut plain = Scheduler::new(reduce_after_matmul(64, 384, 384, false), Renderer::cuda());
+    apply_with_axis_choice(&mut plain, -1, 2, 1, axis_choice).expect("the same matmul unfused takes the core");
+    assert!(has_op(plain.ast(), |op| matches!(op, Op::Wmma(..))));
 }
 
 /// Automatic core selection trials every core; the cores whose dtypes cannot

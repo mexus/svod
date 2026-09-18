@@ -1502,25 +1502,6 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         _ => return false,
     };
 
-    // The WMMA needs clean M/N *output* ranges: a tensor core tiles the matmul's
-    // own M/N/K, splitting M/N into Warp/Local/Upcast. If the matmul output is
-    // consumed by a downstream reduce (e.g. `min_over_K(x@cᵀ)`), that output axis
-    // is itself a Reduce axis — tiling it makes the downstream reduce span the
-    // tensor-core Warp/Local axes and share the matmul's reduce loops, so one
-    // physical loop ends up closed by two ENDs (invalid LLVM phi). Decline TC in
-    // that case and let the generic reduce path handle the fused kernel.
-    let output_is_reduce = pattern
-        .in0_ranges
-        .iter()
-        .chain(pattern.in1_ranges.iter())
-        .any(|r| matches!(r.op(), Op::Range(ops::Range { axis_type: AxisType::Reduce, .. })));
-    if output_is_reduce {
-        tracing::debug!(
-            "try_tensor_cores: matmul output axis is a reduce axis (fused reduce-after-matmul); skipping TC"
-        );
-        return false;
-    }
-
     let axis_choice_count = pattern.axis_choices.len();
 
     let mut rejections = Vec::new();

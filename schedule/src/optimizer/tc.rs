@@ -684,6 +684,21 @@ pub fn apply_with_axis_choice(
     let pattern = detect_matmul(scheduler)?
         .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no matmul pattern detected" }.build())?;
 
+    // A tensor core splits M and N into warp, local and upcast fragments. An
+    // output axis a downstream REDUCE still sums over (`min_over_K(x @ cᵀ)`, a
+    // 1x1 conv fused into the conv it feeds) is then only partly summed: each
+    // lane keeps its own fragment columns and the group's lanes race onto one
+    // element, or the shared loop closes twice (an invalid LLVM phi). The
+    // generic reduce path takes the fused kernel, whoever asks for the core.
+    if pattern
+        .in0_ranges
+        .iter()
+        .chain(&pattern.in1_ranges)
+        .any(|r| matches!(r.op(), Op::Range(svod_ir::ops::Range { axis_type: AxisType::Reduce, .. })))
+    {
+        return ValidationFailedSnafu { op: "TC", reason: "a matmul output axis is a reduce axis" }.fail();
+    }
+
     let choices: Vec<usize> = if let Some(choice) = axis_choice {
         if choice >= pattern.axis_choices.len() {
             return ValidationFailedSnafu { op: "TC", reason: "axis choice out of bounds" }.fail();
