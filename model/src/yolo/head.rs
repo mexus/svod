@@ -10,17 +10,19 @@ use super::error::Result;
 use crate::state::scoped;
 
 /// The dtype every head decodes in, whatever the backbone computed in.
+///
+/// A box branch emits ltrb as *distances in stride units*, so [`dist2bbox`] sees
+/// values up to ~80 — where f16's ulp is 0.0625, an order of magnitude past the
+/// 0.05 px the parity tests allow, and the rounding would land *before* the
+/// `× stride` multiply that would otherwise hide it. [`super::detect::Detect`]'s
+/// branches run their convs at the backbone's dtype and have each final
+/// `Conv2d` accumulate and emit at this width instead ([`BoxBranch`],
+/// [`ClsBranch`]); the other heads still bring their features here at the
+/// boundary ([`in_head_dtypes`]).
 pub(crate) const HEAD_DTYPE: svod_dtype::DType = svod_dtype::DType::Float32;
 
-/// Bring a backbone's feature maps back to [`HEAD_DTYPE`] at the head boundary.
-///
-/// The heads stay f32 even when the rest of the network does not. A box branch
-/// emits ltrb as *distances in stride units*, so [`dist2bbox`] sees values up to
-/// ~80 — where f16's ulp is 0.0625, an order of magnitude past the 0.05 px the
-/// parity tests allow, and the rounding lands *before* the `× stride` multiply
-/// that would otherwise hide it. Anchors and strides are f32 constants, so
-/// `dist2bbox` itself already promotes; it is the branch convs feeding it that
-/// have to be cast. Cheap insurance — the heads are ~7% of forward time.
+/// Bring a backbone's feature maps back to [`HEAD_DTYPE`] at the head boundary,
+/// for the heads whose branches have not been given a full-width accumulator.
 ///
 /// A no-op when the features are f32 already: `UOp::cast` returns the same node.
 pub(crate) fn in_head_dtype(feat: &Tensor) -> Tensor {
@@ -75,7 +77,11 @@ pub(crate) fn dist2bbox(boxes: &Tensor, anchors: &Tensor, strides: &Tensor, num_
 }
 
 /// Box-regression branch: `Conv(k3) → Conv(k3) → Conv2d(k1, bias)`.
-/// Outputs `4 * reg_max` channels.
+/// Outputs `4 * reg_max` channels at [`HEAD_DTYPE`] whatever the features came
+/// in as: the first conv runs at the feature dtype, and from the second on the
+/// accumulators emit full width, so nothing between it and the distances
+/// rounds through f16 (the measured cost of doing so is 0.07 px; the checkpoint
+/// weights are f16-exact, so half-width operands lose nothing).
 ///
 /// State-dict keys: `0.{conv,bn}.*`, `1.{conv,bn}.*`, `2.weight`, `2.bias`.
 #[derive(Clone, Module)]
@@ -92,8 +98,8 @@ impl BoxBranch {
     pub fn empty(in_ch: usize, hidden: usize, reg_max: usize) -> Self {
         Self {
             conv0: YoloConv::empty(in_ch, hidden, 3, 1, true),
-            conv1: YoloConv::empty(hidden, hidden, 3, 1, true),
-            conv2: conv2d_bias(hidden, 4 * reg_max, 1, 1),
+            conv1: YoloConv::empty(hidden, hidden, 3, 1, true).with_acc_dtype(HEAD_DTYPE),
+            conv2: conv2d_bias(hidden, 4 * reg_max, 1, 1).with_acc_dtype(HEAD_DTYPE),
         }
     }
 
@@ -105,6 +111,7 @@ impl BoxBranch {
 }
 
 /// Classification branch (non-legacy): `(DWConv→Conv) × 2 → Conv2d(bias)`.
+/// The logits come out at [`HEAD_DTYPE`] the way the boxes do.
 ///
 /// State-dict keys: `0.0.*`, `0.1.*`, `1.0.*`, `1.1.*`, `2.weight`, `2.bias`.
 #[derive(Clone, Module)]
@@ -128,7 +135,7 @@ impl ClsBranch {
             conv0: YoloConv::empty(in_ch, hidden, 1, 1, true),
             dw1: YoloConv::empty_dw(hidden, hidden, 3, 1, true),
             conv1: YoloConv::empty(hidden, hidden, 1, 1, true),
-            conv2: conv2d_bias(hidden, nc, 1, 1),
+            conv2: conv2d_bias(hidden, nc, 1, 1).with_acc_dtype(HEAD_DTYPE),
         }
     }
 

@@ -46,6 +46,10 @@ pub fn deconv2d_2x(in_ch: usize, out_ch: usize, kernel: usize) -> ConvTranspose2
 /// Attention projections, and PSABlock FFN output conv).
 ///
 /// State-dict keys: `conv.weight`, `bn.{weight,bias,running_mean,running_var}`.
+/// A checkpoint load folds the norm into the conv ([`fold_batchnorm`]), and a
+/// conv that carries a bias is taken as already normalized.
+///
+/// [`fold_batchnorm`]: crate::yolo::loader::fold_batchnorm
 #[derive(Clone, Module)]
 pub struct YoloConv {
     pub conv: Conv2d,
@@ -64,8 +68,18 @@ impl YoloConv {
         Self { conv: conv2d_grouped(out_ch, in_ch, kernel, stride, kernel / 2, groups), bn: bn(out_ch), act }
     }
 
+    /// Accumulate the conv in `dtype` and keep the block's output there, so
+    /// half-width operands still leave the norm and activation at full width.
+    /// (Doing so for every block costs 5% of the forward for 0.01 px, so the
+    /// default rounds the epilogue to the operand dtype.)
+    pub fn with_acc_dtype(mut self, dtype: DType) -> Self {
+        self.conv = self.conv.with_acc_dtype(dtype);
+        self
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.bn.forward(&self.conv.forward(x)?)?;
+        let x = self.conv.forward(x)?;
+        let x = if self.conv.bias.is_some() { x } else { self.bn.forward(&x)? };
         if self.act { Ok(x.silu()?) } else { Ok(x) }
     }
 }

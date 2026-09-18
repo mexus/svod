@@ -55,9 +55,10 @@ impl Detect {
     }
 
     /// Run box + cls heads on each feature map, decode boxes via dist2bbox,
-    /// sigmoid scores, and cat into `[B, 4+nc, A]`.
+    /// sigmoid scores, and cat into `[B, 4+nc, A]`. The branches run at the
+    /// features' dtype and emit [`super::head::HEAD_DTYPE`], so the decode is
+    /// full-width whatever the backbone computed in.
     pub fn forward(&self, feats: &[Tensor]) -> Result<Tensor> {
-        let feats = &super::head::in_head_dtypes(feats);
         let shape = feats[0].shape()?;
         let b = shape[0].clone();
 
@@ -71,11 +72,13 @@ impl Detect {
             let hw = h * w;
             feat_sizes.push((h, w));
 
-            let box_out = scoped_index("one2one_cv2", i, || self.cv2[i].forward(feat))?;
+            // Each branch ends in its own kernel: fused into the `cat` below, a
+            // final conv would be recomputed over every scale's anchors.
+            let box_out = scoped_index("one2one_cv2", i, || self.cv2[i].forward(feat))?.contiguous();
             let box_out = box_out.try_reshape([b.clone(), SInt::from(4 * self.reg_max), SInt::from(hw)])?;
             boxes_list.push(box_out);
 
-            let cls_out = scoped_index("one2one_cv3", i, || self.cv3[i].forward(feat))?;
+            let cls_out = scoped_index("one2one_cv3", i, || self.cv3[i].forward(feat))?.contiguous();
             let cls_out = cls_out.try_reshape([b.clone(), SInt::from(self.nc), SInt::from(hw)])?;
             scores_list.push(cls_out);
         }

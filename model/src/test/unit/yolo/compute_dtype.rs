@@ -4,6 +4,7 @@ use svod_tensor::nn::Module;
 use test_case::test_case;
 
 use crate::yolo::{Yolo26Detect, YoloConfig, YoloScale};
+use svod_tensor::nn::Layer;
 
 /// f32 unless asked otherwise: the knob must not change existing callers.
 #[test]
@@ -60,6 +61,34 @@ fn the_backbone_computes_at_the_compute_dtype_and_the_head_returns_f32(dtype: DT
     // `x stride` multiply.
     let out = model.forward(&images).expect("model forward");
     assert_eq!(out.dtype(), DType::Float32, "predictions must reach the caller as f32");
+}
+
+/// The head's branches stay at the compute dtype for as long as precision
+/// allows and no longer: a box branch rounds only its first conv's output
+/// through f16 (the second one accumulates and emits f32 for the decode), and
+/// a cls branch rounds everything but its logits.
+#[test_case(DType::Float16 ; "f16")]
+#[test_case(DType::BFloat16 ; "bf16")]
+fn the_head_branches_compute_narrow_and_emit_f32(dtype: DType) {
+    let cfg = YoloConfig::new(YoloScale::Nano, 80).with_compute_dtype(dtype.clone());
+    let model = Yolo26Detect::with_zero_weights(cfg);
+    let feat = Tensor::zeros(&[1, 64, 8, 8], dtype.clone());
+
+    let cv2 = &model.head.cv2[0];
+    let x = cv2.conv0.forward(&feat).expect("box conv0");
+    assert_eq!(x.dtype(), dtype, "the box branch's first conv stays narrow");
+    let x = cv2.conv1.forward(&x).expect("box conv1");
+    assert_eq!(x.dtype(), DType::Float32, "the box branch's second conv accumulates and emits f32");
+    assert_eq!(cv2.conv2.forward(&x).expect("box conv2").dtype(), DType::Float32, "the distances are f32");
+    assert_eq!(cv2.forward(&feat).expect("box branch").dtype(), DType::Float32);
+
+    let cv3 = &model.head.cv3[0];
+    let x = cv3
+        .conv1
+        .forward(&cv3.dw1.forward(&cv3.conv0.forward(&cv3.dw0.forward(&feat).unwrap()).unwrap()).unwrap())
+        .unwrap();
+    assert_eq!(x.dtype(), dtype, "the cls branch stays narrow up to its logits");
+    assert_eq!(cv3.conv2.forward(&x).expect("cls conv2").dtype(), DType::Float32, "the logits are f32");
 }
 
 /// Float parameters move; integer buffers do not — narrowing a count to f16
