@@ -115,14 +115,17 @@ fn reference_prologue(
     (norm_rope(&parts[0], heads.h, wq), norm_rope(&parts[1], heads.h_kv, wk), view(&parts[2], heads.h_kv).contiguous())
 }
 
-/// `qkv_norm_rope` against that graph, at the model's geometry and at a
-/// single-row batch (where the rope position folds to the block index).
-#[test_case(8, 512, Heads { h: 16, h_kv: 8, dh: 128 }; "qwen3 0.6b at 8x512")]
-#[test_case(1, 128, Heads { h: 16, h_kv: 8, dh: 128 }; "a batch-1 prefill")]
-#[test_case(2, 256, Heads { h: 8, h_kv: 8, dh: 128 }; "multi-head attention")]
-#[test_case(4, 128, Heads { h: 12, h_kv: 6, dh: 256 }; "a two-wave block with a 256 head dim")]
+/// `qkv_norm_rope` against that graph, at the model's geometry, at a
+/// single-row batch (where the rope position folds to the block index), and
+/// with the packed rows' per-token rope table.
+#[test_case(8, 512, Heads { h: 16, h_kv: 8, dh: 128 }, false; "qwen3 0.6b at 8x512")]
+#[test_case(8, 512, Heads { h: 16, h_kv: 8, dh: 128 }, true; "qwen3 0.6b at 8x512 packed")]
+#[test_case(1, 128, Heads { h: 16, h_kv: 8, dh: 128 }, false; "a batch-1 prefill")]
+#[test_case(2, 256, Heads { h: 8, h_kv: 8, dh: 128 }, false; "multi-head attention")]
+#[test_case(2, 256, Heads { h: 8, h_kv: 8, dh: 128 }, true; "multi-head attention packed")]
+#[test_case(4, 128, Heads { h: 12, h_kv: 6, dh: 256 }, false; "a two-wave block with a 256 head dim")]
 #[ignore]
-fn qkv_norm_rope_matches_the_graph_gpu(b: usize, l: usize, heads: Heads) {
+fn qkv_norm_rope_matches_the_graph_gpu(b: usize, l: usize, heads: Heads, per_token: bool) {
     if !device_supported() {
         eprintln!("skip qkv_norm_rope_matches_the_graph_gpu: no CUDA sm_80+ device / toolchain");
         return;
@@ -131,9 +134,11 @@ fn qkv_norm_rope_matches_the_graph_gpu(b: usize, l: usize, heads: Heads) {
     let qkv = operand(&[b, l, heads.h * heads.dh + 2 * heads.h_kv * heads.dh], DType::BFloat16, 0.31);
     let wq = operand(&[heads.dh], DType::BFloat16, 0.17);
     let wk = operand(&[heads.dh], DType::BFloat16, 0.23);
-    // The model's sequence-major rope cache: `[1, L, 1, dh/2]`.
-    let cos = operand(&[1, l, 1, half], DType::BFloat16, 0.11);
-    let sin = operand(&[1, l, 1, half], DType::BFloat16, 0.07);
+    // The model's sequence-major rope cache, `[1, L, 1, dh/2]`, or its
+    // per-token gather for packed rows, `[B, L, 1, dh/2]`.
+    let rope_batch = if per_token { b } else { 1 };
+    let cos = operand(&[rope_batch, l, 1, half], DType::BFloat16, 0.11);
+    let sin = operand(&[rope_batch, l, 1, half], DType::BFloat16, 0.07);
 
     let (q, k, v) = qkv_norm_rope(&qkv, &wq, &wk, &cos, &sin, EPS, heads).expect("build").expect("the kernel applies");
     assert_eq!(q.dims().expect("dims"), [b, l, heads.h, heads.dh]);

@@ -34,22 +34,34 @@ pub struct Qwen3Attention {
 
 /// Causal grouped-query attention over sequence-major `[B, L, H, Dh]`: the
 /// hand kernel when it applies (16-bit operands on a supported device at a
-/// tiling shape), else SDPA. Unmasked: padding is on the right, behind the
-/// causal edge.
-pub(crate) fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+/// tiling shape), else SDPA. Padding is on the right, behind the causal edge,
+/// so the only mask is the `[B, L]` segment start of packed rows (see
+/// [`super::Packing`]), which hides the sequences packed before a token's own.
+pub(crate) fn causal_attention(q: &Tensor, k: &Tensor, v: &Tensor, seg_start: Option<&Tensor>) -> Result<Tensor> {
     if matches!(q.dtype().base(), ScalarDType::Float16 | ScalarDType::BFloat16)
         && let Some(out) =
-            svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None }).context(TkSnafu)?
+            svod_tk::flash_attention_with(q, k, v, svod_tk::FaOpts { causal: true, key_lens: None, seg_start })
+                .context(TkSnafu)?
     {
         return Ok(out);
     }
     let head_major = |t: &Tensor| t.try_permute(&[0, 2, 1, 3]);
+    // Keys before the query's own segment are masked out (`true`).
+    let segment_mask = match seg_start {
+        Some(start) => {
+            let (b, l) = (start.dim(0)?, start.dim_const(1)?);
+            let keys = Tensor::arange(0, Some(l as i64), None)?.try_reshape([1isize, 1, 1, l as isize])?;
+            Some(keys.try_lt(&start.try_reshape([b, SInt::Const(1), SInt::Const(l), SInt::Const(1)])?)?)
+        }
+        None => None,
+    };
     let out = head_major(q)?
         .scaled_dot_product_attention()
         .key(&head_major(k)?)
         .value(&head_major(v)?)
         .is_causal(true)
         .enable_gqa(true)
+        .maybe_attn_mask(segment_mask.as_ref())
         .call()?;
     Ok(head_major(&out)?)
 }
@@ -81,24 +93,30 @@ impl Qwen3Attention {
         [self.num_heads * self.head_dim, kv, kv]
     }
 
-    /// `x`: `(B, L, D)` → `(B, L, D)`. `rope`: sequence-major `(cos, sin)`
-    /// `[1, L, 1, Dh/2]`.
+    /// `x`: `(B, L, D)` → `(B, L, D)`. `rope`: sequence-major `(cos, sin)`,
+    /// `[1, L, 1, Dh/2]` by position or `[B, L, 1, Dh/2]` by token.
     pub fn forward(&self, x: &Tensor, rope: &(Tensor, Tensor)) -> Result<Tensor> {
-        Ok(self.forward_into(x, rope, None)?.into_tensor())
+        Ok(self.forward_into(x, rope, None, None)?.into_tensor())
     }
 
     /// [`Self::forward`] with `residual` folded into the `o_proj` GEMM's
-    /// epilogue when that kernel takes it (see [`linear_add`]).
+    /// epilogue when that kernel takes it (see [`linear_add`]) and the packed
+    /// rows' `seg_start` (see [`causal_attention`]).
     pub(crate) fn forward_into(
         &self,
         x: &Tensor,
         rope: &(Tensor, Tensor),
         residual: Option<&Tensor>,
+        seg_start: Option<&Tensor>,
     ) -> Result<Projected> {
         let (b, l) = (x.dim(0)?, x.dim(1)?);
         let qkv = linear(x, &self.qkv_weight)?;
         let (q, k, v) = self.prologue(&qkv, rope, (&b, &l))?;
-        let attn = causal_attention(&q, &k, &v)?.try_reshape([b, l, SInt::Const(self.num_heads * self.head_dim)])?;
+        let attn = causal_attention(&q, &k, &v, seg_start)?.try_reshape([
+            b,
+            l,
+            SInt::Const(self.num_heads * self.head_dim),
+        ])?;
         linear_add(&attn, &self.o_proj_weight, residual)
     }
 

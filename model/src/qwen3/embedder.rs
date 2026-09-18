@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use svod_dtype::DType;
+use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
@@ -15,7 +16,7 @@ use crate::state::{self, StateDict};
 
 use super::config::Qwen3Config;
 use super::error::Result;
-use super::model::{Qwen3Model, last_token};
+use super::model::{Packing, Qwen3Model, gather_tokens, last_token};
 
 #[derive(Clone, Module)]
 pub struct Qwen3Embedding {
@@ -32,7 +33,19 @@ impl Qwen3Embedding {
     /// Right-padded `input_ids` `(B, L)` + `lengths` `(B)` → f32 embeddings
     /// `(B, D)`.
     pub fn encode(&self, input_ids: &Tensor, lengths: &Tensor) -> Result<Tensor> {
-        let pooled = last_token(&self.model.forward(input_ids)?, lengths)?.cast(DType::Float32);
+        self.pool(last_token(&self.model.forward(input_ids)?, lengths)?)
+    }
+
+    /// Packed `input_ids` `(B, L)` (see [`Packing`]) → f32 embeddings
+    /// `(B·S, D)` of the tokens at `pool_idx` `(B, S)`, each sequence's last.
+    pub fn encode_packed(&self, input_ids: &Tensor, packing: &Packing, pool_idx: &Tensor) -> Result<Tensor> {
+        let hidden = self.model.forward_packed(input_ids, packing)?;
+        let d = hidden.dim(2)?;
+        self.pool(gather_tokens(&hidden, pool_idx)?.try_reshape([SInt::from(-1isize), d])?)
+    }
+
+    fn pool(&self, pooled: Tensor) -> Result<Tensor> {
+        let pooled = pooled.cast(DType::Float32);
         Ok(if self.normalize { pooled.lp_normalize(-1, 2)? } else { pooled })
     }
 

@@ -96,6 +96,46 @@ fn right_padding_leaves_real_tokens_unchanged() {
     assert!(moved > 1e-3, "pooling the pad token must differ, moved {moved}");
 }
 
+/// Two sequences packed end to end in one row, each restarting its positions,
+/// equal their separate forwards: the segment mask hides the first from the
+/// second, and the per-token rope matches the per-position prefix.
+#[test]
+fn packed_rows_match_separate_forwards() {
+    use crate::qwen3::Packing;
+    let cfg = tiny_cfg();
+    let hidden = cfg.hidden_size;
+    let model = Qwen3Model::empty(cfg);
+    let (a, b): (Vec<i32>, Vec<i32>) = ((1..6).collect(), (10..13).collect());
+    let alone = |ids: &[i32]| {
+        realized(&model.forward(&Tensor::from_slice(ids).try_reshape([1isize, ids.len() as isize]).unwrap()).unwrap())
+    };
+    let (want_a, want_b) = (alone(&a), alone(&b));
+
+    // `[a | b | pad pad]`: the pads are their own one-token segments.
+    let len = a.len() + b.len() + 2;
+    let ids =
+        Tensor::from_slice([a.clone(), b.clone(), vec![0, 0]].concat()).try_reshape([1isize, len as isize]).unwrap();
+    let positions: Vec<i32> = (0..a.len() as i32).chain(0..b.len() as i32).chain([0, 0]).collect();
+    let seg_start: Vec<i32> = vec![0; a.len()]
+        .into_iter()
+        .chain(vec![a.len() as i32; b.len()])
+        .chain([len as i32 - 2, len as i32 - 1])
+        .collect();
+    let positions = Tensor::from_slice(positions).try_reshape([1isize, len as isize]).unwrap();
+    let seg_start = Tensor::from_slice(seg_start).try_reshape([1isize, len as isize]).unwrap();
+    let got = realized(&model.forward_packed(&ids, &Packing { positions: &positions, seg_start: &seg_start }).unwrap());
+
+    let worst = |got: &[f32], want: &[f32]| got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+    assert!(worst(&got[..a.len() * hidden], &want_a) < 1e-4, "the first segment drifted");
+    assert!(worst(&got[a.len() * hidden..(a.len() + b.len()) * hidden], &want_b) < 1e-4, "the second segment drifted");
+    assert!(got.iter().all(|x| x.is_finite()), "the one-token pad segments must stay finite");
+    // Without the segment mask the second sequence sees the first.
+    let seg_start = Tensor::from_slice(vec![0i32; len]).try_reshape([1isize, len as isize]).unwrap();
+    let leaked =
+        realized(&model.forward_packed(&ids, &Packing { positions: &positions, seg_start: &seg_start }).unwrap());
+    assert!(worst(&leaked[a.len() * hidden..(a.len() + b.len()) * hidden], &want_b) > 1e-3, "the mask must matter");
+}
+
 /// Every key `#[derive(Module)]` emits for a 2-layer tiny backbone, in the
 /// published `Qwen3Model` naming. Drift here is a checkpoint-compatibility break.
 fn expected_keys() -> Vec<String> {

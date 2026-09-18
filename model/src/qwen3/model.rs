@@ -10,10 +10,15 @@
 //! hand flash-attention kernel runs unmasked. Rows are then read back at
 //! [`last_token`]. RoPE only enters through position differences, so this is
 //! the reference's left-padded result to rounding.
+//!
+//! [`Qwen3Model::forward_packed`] takes rows that hold several sequences end
+//! to end: each sequence restarts its positions at 0 and a segment mask keeps
+//! it from seeing the ones packed before it, so the row's padding shrinks to
+//! whatever the packer could not fill.
 
 use std::path::Path;
 
-use svod_dtype::ScalarDType;
+use svod_dtype::{DType, ScalarDType};
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::{Embedding, Layer, Module, RmsNorm};
@@ -37,6 +42,10 @@ pub struct Qwen3Model {
     /// at construction; a forward slices its prefix.
     #[module(skip)]
     rope: (Tensor, Tensor),
+    /// The table's angular frequencies, `[Dh/2]` f32, for rotating packed
+    /// rows' tokens at their own positions.
+    #[module(skip)]
+    inv_freq: Tensor,
 }
 
 /// Sequence-major `(cos, sin)` for `positions` positions, realized.
@@ -48,16 +57,32 @@ fn rope_cache(config: &Qwen3Config, positions: usize) -> svod_tensor::error::Res
     Ok((cos, sin))
 }
 
+/// The hidden states at `index` `[B, S]` positions of each row: `[B, L, D]`
+/// gathered along the sequence → `[B, S, D]`.
+pub(crate) fn gather_tokens(hidden: &Tensor, index: &Tensor) -> Result<Tensor> {
+    let (b, d) = (hidden.dim(0)?, hidden.dim(2)?);
+    let s = index.dim(1)?;
+    let index = index.try_reshape([b.clone(), s.clone(), SInt::Const(1)])?.try_expand([b, s, d])?;
+    Ok(hidden.gather(1, &index)?)
+}
+
 /// The hidden state of each row's last real token: `[B, L, D]` gathered at
 /// `lengths - 1` → `[B, D]`.
 pub(crate) fn last_token(hidden: &Tensor, lengths: &Tensor) -> Result<Tensor> {
-    let (b, d) = (hidden.dim(0)?, hidden.dim(2)?);
-    let index = lengths.try_sub(1)?.try_reshape([b.clone(), SInt::Const(1), SInt::Const(1)])?.try_expand([
-        b,
-        SInt::Const(1),
-        d,
-    ])?;
-    Ok(hidden.gather(1, &index)?.try_squeeze(Some(1))?)
+    let b = hidden.dim(0)?;
+    let index = lengths.try_sub(1)?.try_reshape([b, SInt::Const(1)])?;
+    Ok(gather_tokens(hidden, &index)?.try_squeeze(Some(1))?)
+}
+
+/// The layout of packed rows — several sequences end to end in one row of
+/// `[B, L]` tokens, both tables `[B, L]` `i32`.
+#[derive(Clone, Copy)]
+pub struct Packing<'a> {
+    /// Each token's position within its own sequence.
+    pub positions: &'a Tensor,
+    /// The row index of the first token of each token's sequence; a token
+    /// attends to nothing before it.
+    pub seg_start: &'a Tensor,
 }
 
 impl Qwen3Model {
@@ -67,13 +92,29 @@ impl Qwen3Model {
         let layers = (0..config.num_hidden_layers).map(|_| Qwen3DecoderLayer::empty(&config)).collect();
         let norm = RmsNorm::with_dims(config.hidden_size, config.rms_norm_eps, dtype);
         let rope = rope_cache(&config, config.max_position_embeddings).expect("even head_dim, positive context");
-        Self { config, embeddings, layers, norm, rope }
+        let inv_freq = Tensor::rope_inv_freq(config.rope_theta, config.head_dim).expect("even head_dim");
+        inv_freq.realize().expect("a [Dh/2] constant");
+        Self { config, embeddings, layers, norm, rope, inv_freq }
     }
 
     /// The `(cos, sin)` prefix of the realized cache covering `positions`
     /// positions — sequence-major `[1, positions, 1, Dh/2]`.
     pub(crate) fn rope_prefix(&self, positions: usize) -> Result<(Tensor, Tensor)> {
         Ok((self.rope.0.narrow(1, 0, positions)?, self.rope.1.narrow(1, 0, positions)?))
+    }
+
+    /// `(cos, sin)` at each token's own position, `positions` `[B, L]` →
+    /// `[B, L, 1, Dh/2]`, by the cache's own arithmetic (f32 angles, then the
+    /// model dtype): the rows the cache holds at those positions, without a
+    /// gather over its `P` rows.
+    fn rope_at(&self, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (b, l) = (positions.dim(0)?, positions.dim(1)?);
+        let angles = positions
+            .cast(DType::Float32)
+            .try_reshape([b, l, SInt::Const(1), SInt::Const(1)])?
+            .try_mul(&self.inv_freq)?;
+        let dtype = self.config.dtype.clone();
+        Ok((angles.cos()?.cast(dtype.clone()), angles.sin()?.cast(dtype)))
     }
 
     /// Sequence length the stack runs at: on a device with the hand kernel,
@@ -99,15 +140,27 @@ impl Qwen3Model {
             input_ids.clone()
         };
         let rope = self.rope_prefix(padded)?;
+        let h = self.stack(&ids, &rope, None)?;
+        Ok(if padded > seq_len { h.narrow(1, 0, seq_len)? } else { h })
+    }
 
+    /// Packed `input_ids` `(B, L)` → last-hidden-state `(B, L, D)`: every
+    /// token is rotated by its own position and sees only its own sequence.
+    /// `L` is the caller's — the packer sizes rows to the attention tile.
+    pub fn forward_packed(&self, input_ids: &Tensor, packing: &Packing) -> Result<Tensor> {
+        let rope = self.rope_at(packing.positions)?;
+        self.stack(input_ids, &rope, Some(packing.seg_start))
+    }
+
+    /// The decoder stack and final norm over embedded `ids`.
+    fn stack(&self, ids: &Tensor, rope: &(Tensor, Tensor), seg_start: Option<&Tensor>) -> Result<Tensor> {
         // The stream travels unsummed between layers so each residual add is
         // absorbed by the norm that reads it (see `decoder_layer::Residual`).
-        let mut h = Residual::from(self.embeddings.forward(&ids)?);
+        let mut h = Residual::from(self.embeddings.forward(ids)?);
         for layer in &self.layers {
-            h = layer.forward_residual(h, &rope)?;
+            h = layer.forward_residual(h, rope, seg_start)?;
         }
-        let (_, h) = h.norm(&self.norm)?;
-        Ok(if padded > seq_len { h.narrow(1, 0, seq_len)? } else { h })
+        Ok(h.norm(&self.norm)?.1)
     }
 
     pub fn from_hub(model_id: &str, mut config: Qwen3Config) -> Result<Self> {
