@@ -43,6 +43,46 @@ fn a_folded_conv_matches_conv_then_norm(cin: usize, cout: usize, k: usize, act: 
     assert!(max < 1e-5, "folded conv drifts by {max}");
 }
 
+/// A conv reading NCHW keeps its weight logically `[cout, cin, kh, kw]` while
+/// storing it taps-major; one reading channels-last keeps the bytes as loaded.
+/// Either way the forward is the same.
+#[test_case(false; "nchw input, taps-major weight")]
+#[test_case(true; "channels-last input, cin-major weight")]
+fn the_weight_layout_follows_the_input_layout(channels_last_input: bool) {
+    let sd: StateDict = unfolded_state(4, 8, 3).into_iter().map(|(k, t)| (k, t.cast(DType::Float16))).collect();
+    let mut conv = YoloConv::empty(4, 8, 3, 1, true);
+    if channels_last_input {
+        conv = conv.channels_last_input();
+    }
+    conv.load_state_dict(&sd, "").unwrap();
+    assert_eq!(conv.conv.weight.dims().unwrap(), vec![8, 4, 3, 3]);
+    assert_eq!(
+        conv.conv.weight.contiguous().cast(DType::Float32).to_vec::<f32>().unwrap(),
+        sd["conv.weight"].contiguous().cast(DType::Float32).to_vec::<f32>().unwrap()
+    );
+    assert_eq!(
+        std::sync::Arc::ptr_eq(&conv.conv.weight.uop(), &sd["conv.weight"].uop()),
+        channels_last_input,
+        "a taps-major weight is a view over its own buffer, a cin-major one the checkpoint's node"
+    );
+    let x = Tensor::from_slice(ramp(4 * 25, 2.0, 0.1)).try_reshape([1, 4, 5, 5]).unwrap().cast(DType::Float16);
+    let mut plain = YoloConv::empty(4, 8, 3, 1, true).channels_last_input();
+    plain.load_state_dict(&sd, "").unwrap();
+    let want = plain.forward(&x).unwrap().cast(DType::Float32).to_vec::<f32>().unwrap();
+    let got = conv.forward(&x).unwrap().cast(DType::Float32).to_vec::<f32>().unwrap();
+    let max = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(max < 1e-3, "the layout changes the result by {max}");
+}
+
+/// At f32 there is no tensor core to lay out for, so the weight stays as loaded.
+#[test]
+fn an_f32_conv_keeps_the_checkpoint_layout() {
+    let sd = unfolded_state(4, 8, 3);
+    let mut conv = YoloConv::empty(4, 8, 3, 1, true);
+    conv.load_state_dict(&sd, "").unwrap();
+    assert!(std::sync::Arc::ptr_eq(&conv.conv.weight.uop(), &sd["conv.weight"].uop()));
+}
+
 /// Only a `conv.weight` with a full `bn.*` beside it folds; anything else, such
 /// as the head's biased final convs or the norm keys themselves, passes through.
 #[test]

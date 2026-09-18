@@ -77,11 +77,13 @@ pub struct C3k {
 impl C3k {
     pub fn empty(in_ch: usize, out_ch: usize, n: usize, shortcut: bool, e: f64, k: usize) -> Self {
         let c_ = (out_ch as f64 * e) as usize;
+        // `cv1` and the chain feed 3x3 convs (and `cv3`, a 1x1, which does not
+        // mind), so they store channels-last; `cv2` feeds only `cv3`.
         Self {
-            cv1: YoloConv::empty(in_ch, c_, 1, 1, true),
+            cv1: YoloConv::empty(in_ch, c_, 1, 1, true).channels_last(),
             cv2: YoloConv::empty(in_ch, c_, 1, 1, true),
             cv3: YoloConv::empty(2 * c_, out_ch, 1, 1, true),
-            m: (0..n).map(|_| YoloBottleneck::empty_full(c_, c_, shortcut, k, k, 1.0)).collect(),
+            m: (0..n).map(|_| YoloBottleneck::empty_full(c_, c_, shortcut, k, k, 1.0).channels_last()).collect(),
         }
     }
 

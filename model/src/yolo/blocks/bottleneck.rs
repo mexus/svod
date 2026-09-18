@@ -1,7 +1,7 @@
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
 
-use super::conv::YoloConv;
+use super::conv::{YoloConv, store_channels_last, tensor_core_dtype};
 use crate::state::scoped;
 use crate::yolo::error::Result;
 
@@ -13,6 +13,9 @@ pub struct YoloBottleneck {
     pub cv1: YoloConv,
     pub cv2: YoloConv,
     pub add: bool,
+    /// The block's output is stored channels-last; see [`Self::channels_last`].
+    #[module(skip)]
+    pub channels_last: bool,
 }
 
 impl YoloBottleneck {
@@ -25,12 +28,24 @@ impl YoloBottleneck {
     pub fn empty_full(in_ch: usize, out_ch: usize, shortcut: bool, k1: usize, k2: usize, e: f64) -> Self {
         let c_ = (out_ch as f64 * e) as usize;
         let add = shortcut && in_ch == out_ch;
-        Self { cv1: YoloConv::empty(in_ch, c_, k1, 1, true), cv2: YoloConv::empty(c_, out_ch, k2, 1, true), add }
+        let cv1 = YoloConv::empty(in_ch, c_, k1, 1, true);
+        Self { cv1, cv2: YoloConv::empty(c_, out_ch, k2, 1, true), add, channels_last: false }
+    }
+
+    /// Store both `cv1`'s output and the block's channels-last: `cv1` feeds
+    /// only `cv2`, a 3x3, and the block's output goes to the next block's 3x3
+    /// or a 1x1. The residual add stays in `cv2`'s epilogue, ahead of the store.
+    pub fn channels_last(mut self) -> Self {
+        self.cv1 = self.cv1.channels_last().channels_last_input();
+        self.cv2 = self.cv2.channels_last_input();
+        self.channels_last = true;
+        self
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = scoped("cv1", || self.cv1.forward(x))?;
         let out = scoped("cv2", || self.cv2.forward(&h))?;
-        if self.add { Ok(out.try_add(x)?) } else { Ok(out) }
+        let out = if self.add { out.try_add(x)? } else { out };
+        if self.channels_last && tensor_core_dtype(&out.dtype()) { store_channels_last(&out) } else { Ok(out) }
     }
 }
