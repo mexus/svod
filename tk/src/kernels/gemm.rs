@@ -234,7 +234,7 @@ fn block_coords(ker: &Kernel, m: usize, n: usize, cfg: &GemmCfg) -> (Arc<UOp>, A
 }
 
 /// The `(rows, cols)` of B's shared strip.
-fn b_strip(cfg: &GemmCfg) -> (usize, usize) {
+pub(super) fn b_strip(cfg: &GemmCfg) -> (usize, usize) {
     match cfg.b_order {
         BOrder::Kn => (cfg.k_step, cfg.block_n),
         BOrder::Nk => (cfg.block_n, cfg.k_step),
@@ -242,7 +242,7 @@ fn b_strip(cfg: &GemmCfg) -> (usize, usize) {
 }
 
 /// B's global block index at K-strip `tile` of N-block `col`.
-fn b_index(cfg: &GemmCfg, col: &Arc<UOp>, tile: &Arc<UOp>) -> [Idx; 4] {
+pub(super) fn b_index(cfg: &GemmCfg, col: &Arc<UOp>, tile: &Arc<UOp>) -> [Idx; 4] {
     let (r, c) = match cfg.b_order {
         BOrder::Kn => (tile, col),
         BOrder::Nk => (col, tile),
@@ -251,7 +251,13 @@ fn b_index(cfg: &GemmCfg, col: &Arc<UOp>, tile: &Arc<UOp>) -> [Idx; 4] {
 }
 
 /// This wave's B register tile and its shared sub-tile view, per [`BOrder`].
-fn b_operand<'k>(ker: &'k Kernel, cfg: &GemmCfg, in_dt: &DType, warp_col: &Arc<UOp>, b_smem: &ST) -> (RT<'k>, ST) {
+pub(super) fn b_operand<'k>(
+    ker: &'k Kernel,
+    cfg: &GemmCfg,
+    in_dt: &DType,
+    warp_col: &Arc<UOp>,
+    b_smem: &ST,
+) -> (RT<'k>, ST) {
     let (reg_n, k_step) = (cfg.reg_n(), cfg.k_step);
     match cfg.b_order {
         BOrder::Kn => (
@@ -551,7 +557,7 @@ fn col_at(ix: &Idx, w: usize) -> Idx {
 
 /// `x·sigmoid(x)` in `x`'s dtype, op for op as [`Tensor::silu`] builds it:
 /// `sigmoid(x) = 1/(1 + exp2(x·(−1/ln 2)))`, every step in the operand dtype.
-fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
+pub(super) fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
     let c = |v: f64| UOp::const_(dt.clone(), ConstValue::Float(v));
     let e = x.try_mul(&c(-1.0 / std::f64::consts::LN_2)).and_then(|s| s.try_exp2()).expect("silu: exp2");
     let sig = UOp::try_reciprocal(&c(1.0).try_add(&e).expect("silu: 1 + exp2")).expect("silu: reciprocal");
@@ -570,7 +576,7 @@ fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
 /// whole K-loop pays for it (measured on sm_86: 256 B/lane of spill, 13.7 → 4.0
 /// TFLOP/s). Every index here is a constant, so the accumulator stays in registers
 /// and only the narrow result reaches the store.
-fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT<'k> {
+pub(super) fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT<'k> {
     if acc.elem() == out_dt {
         return acc;
     }

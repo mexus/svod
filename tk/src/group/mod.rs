@@ -28,6 +28,7 @@ use crate::tile::{GL, RT, RegTile, ST};
 mod elementwise;
 mod mma;
 mod movement;
+pub use movement::RowStore;
 mod reduce;
 mod shuffle;
 

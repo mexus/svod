@@ -8,10 +8,13 @@ use svod_tensor::Tensor;
 use test_case::test_case;
 
 use super::device_supported;
-use crate::kernels::conv::{CONV_SUPPORTED_ARCHS, ConvGeom, build_conv, conv2d_nhwc, select_conv_cfg};
+use crate::kernels::conv::{
+    CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv2d_nhwc, select_conv_cfg,
+};
 use crate::kernels::gemm::{Epilogue, GemmPolicy};
 
 const RDNA4: GpuArch = GpuArch::Amd(AmdArch::Gfx1201);
+const SM86: GpuArch = GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6));
 
 fn geom(h: usize, cin: usize, cout: usize, k: usize, stride: usize) -> ConvGeom {
     ConvGeom { batch: 1, h, w: h, cin, cout, kh: k, kw: k, stride, pad: k / 2 }
@@ -92,6 +95,29 @@ fn rel_err(got: &[f32], want: &[f32]) -> f32 {
     got.iter().zip(want).fold(0f32, |a, (g, w)| a.max((g - w).abs())) / scale
 }
 
+/// The graph's `conv2d` over the same channels-last operands (read through
+/// permuted views), with the bias, SiLU and residual the kernel's epilogue folds
+/// in — the `[batch, ho, wo, cout]` answer both forms are checked against.
+fn reference(g: &ConvGeom, x: &Tensor, w: &Tensor, bias: &Tensor, res: Option<&Tensor>) -> Tensor {
+    let y = x
+        .try_permute(&[0, 3, 1, 2])
+        .unwrap()
+        .conv2d()
+        .weight(&w.try_permute(&[0, 3, 1, 2]).unwrap())
+        .stride(&[g.stride, g.stride])
+        .padding(&[(g.pad as isize, g.pad as isize), (g.pad as isize, g.pad as isize)])
+        .call()
+        .expect("reference conv");
+    let y = y.try_add(bias.try_reshape([1, g.cout as isize, 1, 1]).unwrap()).unwrap().silu().unwrap();
+    let y = y.try_permute(&[0, 2, 3, 1]).unwrap();
+    match res {
+        Some(r) => y
+            .try_add(r.try_reshape([g.batch as isize, g.ho() as isize, g.wo() as isize, g.cout as isize]).unwrap())
+            .unwrap(),
+        None => y,
+    }
+}
+
 /// The kernel against the graph's `conv2d` over the same channels-last operands
 /// (the graph reads them through permuted views), bias, SiLU and residual
 /// included: both accumulate in f32 and round to the operand dtype in the same
@@ -120,22 +146,7 @@ fn conv_matches_the_graph_gpu(g: ConvGeom, residual: bool, dtype: DType, tol: f3
         .expect("conv2d build")
         .expect("the kernel applies");
 
-    let want = x
-        .try_permute(&[0, 3, 1, 2])
-        .unwrap()
-        .conv2d()
-        .weight(&w.try_permute(&[0, 3, 1, 2]).unwrap())
-        .stride(&[g.stride, g.stride])
-        .padding(&[(g.pad as isize, g.pad as isize), (g.pad as isize, g.pad as isize)])
-        .call()
-        .expect("reference conv");
-    let want = want.try_add(bias.try_reshape([1, g.cout as isize, 1, 1]).unwrap()).unwrap().silu().unwrap();
-    let want = want.try_permute(&[0, 2, 3, 1]).unwrap();
-    let want = match &res {
-        Some(r) => want.try_add(r).unwrap(),
-        None => want,
-    };
-    let (got, want) = (to_f32_vec(&y), to_f32_vec(&want));
+    let (got, want) = (to_f32_vec(&y), to_f32_vec(&reference(&g, &x, &w, &bias, res.as_ref())));
     let err = rel_err(&got, &want);
     // Where the error sits: an interior pixel never touches the padding.
     let (ho, wo, n) = (g.ho(), g.wo(), g.cout);
@@ -154,4 +165,99 @@ fn conv_matches_the_graph_gpu(g: ConvGeom, residual: bool, dtype: DType, tol: f3
         rel_err(&gb, &wb)
     );
     assert!(err < tol, "relative error {err} exceeds {tol}");
+}
+
+// ── The image-staged plan ───────────────────────────────────────────────────
+
+/// The candidate list: every tile that serves the shape in its gathered form,
+/// plus the two rewrites that take the tap out of the K index. Both are for a
+/// `k > 1` convolution only — a 1x1 has no tap to take out — and the patch is
+/// additionally `ldmatrix`-only (CUDA) and bounded by the strip it replaces,
+/// which is what keeps it off the stride-2 shapes.
+#[test_case(SM86, geom(40, 192, 192, 3, 1), (true, true); "sm86 3x3")]
+#[test_case(SM86, geom(80, 768, 768, 3, 2), (false, true); "sm86 stride 2 stages five times the strip")]
+#[test_case(SM86, geom(40, 384, 192, 1, 1), (false, false); "sm86 1x1 has no tap to unroll")]
+#[test_case(RDNA4, geom(40, 192, 192, 3, 1), (false, true); "rdna4 has no ldmatrix")]
+fn the_rewrites_are_offered(arch: GpuArch, g: ConvGeom, expected: (bool, bool)) {
+    let caps = crate::ArchCaps::for_arch(arch);
+    let plans = conv_candidates(&GemmPolicy::for_arch(arch), &g, &caps);
+    let any = |f: fn(&ConvPlan) -> bool| plans.iter().any(f);
+    let got = (any(|p| matches!(p, ConvPlan::Patch(_))), any(|p| matches!(p, ConvPlan::Tapwise(_))));
+    assert_eq!(got, expected, "{plans:?}");
+    assert!(any(|p| matches!(p, ConvPlan::Gathered(_))), "the gathered form always stands");
+    for plan in &plans {
+        let grid = plan.grid_dims(&g);
+        let cfg = plan.cfg();
+        assert_eq!(grid[0] as usize, g.cout / cfg.block_n);
+        // The M grid covers every output pixel, whichever way it is cut.
+        assert!(grid[1] as usize * cfg.block_m >= g.mkn().0, "{plan:?} leaves output rows uncovered");
+    }
+}
+
+/// Every plan the tuner may pick, built off the GPU: the patch fill, the
+/// gathered `ldmatrix` views of it and the scattered store all lower.
+#[test_case(geom(40, 192, 192, 3, 1), true; "3x3 with residual")]
+#[test_case(geom(20, 192, 192, 3, 1), false; "windows overhang a 20x20 image")]
+#[test_case(geom(80, 768, 768, 3, 2), false; "3x3 stride 2")]
+fn every_plan_builds(g: ConvGeom, residual: bool) {
+    let caps = crate::ArchCaps::for_arch(SM86);
+    let plans = conv_candidates(&GemmPolicy::for_arch(SM86), &g, &caps);
+    let (m, k, n) = g.mkn();
+    let dt = DType::Float16;
+    for plan in plans {
+        let mut sizes = vec![m * n, g.batch * g.h * g.w * g.cin, n * k, n];
+        if residual {
+            sizes.push(m * n);
+        }
+        let bufs = sizes.into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dt.clone())).collect();
+        let cfg = plan.cfg();
+        let ker = crate::Kernel::new("conv2d_nhwc", plan.grid_dims(&g), cfg.threads(caps.wave_size), bufs, caps);
+        plan.build(&ker, g, dt.clone(), Epilogue::BiasAct { bias: (), residual: residual.then_some(()), act: true });
+        assert!(crate::kernel_fingerprint(&ker.finish(cfg.acc_m)).digest != 0, "{plan:?}");
+    }
+}
+
+/// Every plan run on the device against the graph's `conv2d`. The numerics test
+/// above only ever sees the static choice (tuning is off under test), so this is
+/// what covers the image-staged kernel and the tiles the chooser passes over.
+#[test_case(geom(40, 192, 192, 3, 1), false; "3x3 stride 1")]
+#[test_case(geom(40, 192, 192, 3, 1), true; "3x3 stride 1 with residual")]
+#[test_case(geom(20, 192, 192, 3, 1), false; "windows overhang a 20x20 image")]
+#[test_case(ConvGeom { batch: 2, h: 24, w: 40, cin: 64, cout: 128, kh: 3, kw: 3, stride: 1, pad: 1 }, false; "batch 2, non-square")]
+#[ignore]
+fn every_plan_matches_the_graph_gpu(g: ConvGeom, residual: bool) {
+    if !device_supported(CONV_SUPPORTED_ARCHS) {
+        eprintln!("skip every_plan_matches_the_graph_gpu: no supported device / toolchain");
+        return;
+    }
+    let spec = Tensor::empty(&[1], DType::Float32).device();
+    let arch = crate::target::resolve_supported_arch(&spec, CONV_SUPPORTED_ARCHS).expect("a supported arch");
+    let caps = crate::ArchCaps::for_arch(arch);
+    let dt = DType::Float16;
+    let x = operand(&[g.batch, g.h, g.w, g.cin], dt.clone(), 0.31);
+    let w = operand(&[g.cout, g.kh, g.kw, g.cin], dt.clone(), 0.17);
+    let bias = operand(&[g.cout], dt.clone(), 0.53);
+    let res = residual.then(|| operand(&[g.batch, g.ho(), g.wo(), g.cout], dt.clone(), 0.71));
+    let want = to_f32_vec(&reference(&g, &x, &w, &bias, res.as_ref()));
+
+    let (m, n) = (g.mkn().0, g.mkn().2);
+    let plans = conv_candidates(&GemmPolicy::for_device(&spec, arch), &g, &caps);
+    assert!(plans.iter().any(|p| matches!(p, ConvPlan::Patch(_))), "no image-staged plan to cover: {plans:?}");
+    for plan in plans {
+        let epi = Epilogue::BiasAct { bias: (), residual: residual.then_some(()), act: true };
+        let cfg = plan.cfg();
+        let mut y = Tensor::empty(&[m, n], dt.clone()).to(spec.clone());
+        let mut ins: Vec<&Tensor> = vec![&x, &w, &bias];
+        ins.extend(res.as_ref());
+        let (grid, block) = (plan.grid_dims(&g), cfg.threads(caps.wave_size));
+        let (geom, dtc) = (g, dt.clone());
+        crate::launch::run_kernel("conv2d_nhwc_test", grid, block, &mut [&mut y], &ins, move |ker| {
+            plan.build(ker, geom, dtc, epi);
+            ker.finish(cfg.acc_m)
+        })
+        .expect("run the plan");
+        let err = rel_err(&to_f32_vec(&y), &want);
+        println!("conv2d_nhwc {plan:?}: relative error {err:e}");
+        assert!(err < 4e-3, "{plan:?}: relative error {err} exceeds 4e-3");
+    }
 }

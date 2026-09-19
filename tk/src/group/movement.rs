@@ -21,6 +21,13 @@ use crate::tile::{GL, RT, ST};
 use crate::tiles::TileLayout;
 use svod_ir::ops;
 
+/// Where a scattered store's rows land: given the tile-local row, the flat
+/// element offset of that row's start in the destination and, for a tiling that
+/// overhangs the tensor, whether the row exists. The offset is always inside the
+/// tensor (a rejected row clamps), so the epilogue's own reads at it are safe;
+/// only the write is dropped.
+pub type RowStore<'a> = dyn Fn(&Arc<UOp>) -> (Arc<UOp>, Option<Arc<UOp>>) + 'a;
+
 /// Scalar geometry of the coalesced GLOBAL↔LDS fill for one ST tile (the part
 /// independent of the global source / tile position). Shared by the direct fill
 /// and the register-staged prefetch so both address LDS identically.
@@ -772,6 +779,60 @@ impl<'k> Group<'k> {
         self.finalize_reg(rt, ended)
     }
 
+    /// LOCAL→REG fragment gather whose M rows are **gathered**: `row` maps this
+    /// lane's tile-local M row to a logical row of `st`, so one shared tile
+    /// serves several shifted views of itself — the `kh·kw` taps of a
+    /// convolution over one staged image patch. `col_blk` is the wave's column
+    /// block, as [`Self::load`] takes it in `idxs[1]`.
+    ///
+    /// The gather is `ldmatrix.x4`-only, and that is the whole point: there a
+    /// lane supplies its own row address, so an arbitrary row costs nothing,
+    /// while the scalar and vector gathers address through a fragment-blocked
+    /// subtile that cannot express one. Every row `row` returns is decoded once,
+    /// outside any K loop it is built in.
+    ///
+    /// # Panics
+    /// Panics unless the `ldmatrix.x4` plan applies to `(rt, st)` read
+    /// untransposed (CUDA, 16-bit, the 16×16/8-per-lane base, a chunk-keeping
+    /// swizzle), and unless `row` stays inside `st`.
+    pub fn load_local_rows(
+        &self,
+        rt: RT<'k>,
+        st: &ST,
+        col_blk: Option<&Idx>,
+        row: impl Fn(&Arc<UOp>) -> Arc<UOp>,
+    ) -> RT<'k> {
+        let plan = self.ldmatrix_plan(&rt, st, false).expect("gathered LOCAL→REG gather needs ldmatrix.x4");
+        let laneid = self.ker.laneid();
+        let n = rt.shape().len();
+        let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
+        let lane_row = imod(&laneid, 16);
+        let col = imul(&idiv(&laneid, 16), 8);
+        let pair = rt.elem().vec(2).expect("16-bit element pair");
+        let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
+        for h in 0..rt_h {
+            let logical = row(&iadd(&lane_row, &cidx(h * 16)));
+            let (frag, within) = (idiv(&logical, 16), imod(&logical, 16));
+            let (srow, scol) = st.base.swizzle.swizzle_rc(within, col.clone(), st.base.base.cols, st.elem().base());
+            for w in 0..rt_w {
+                let wblk = match col_blk {
+                    None => Idx::Const(w),
+                    Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), rt_w), &cidx(w))),
+                };
+                let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow.clone()), Idx::Uop(scol.clone())];
+                let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
+                for (p, &m) in plan.words.iter().enumerate() {
+                    for e in 0..2 {
+                        let didx = [Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)];
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                    }
+                }
+            }
+        }
+        let ended = super::group_or_single(stores);
+        self.finalize_reg(rt, ended)
+    }
+
     /// The boundary gate for a GLOBAL↔REG hop: `global_row < shape[axis] &
     /// global_col < shape[last]`, restricted to the axes that are actually ragged
     /// (the extent is not a multiple of the per-block tile span — known at build
@@ -928,7 +989,7 @@ impl<'k> Group<'k> {
         axis: usize,
         masked: bool,
     ) -> GL {
-        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, false, |v, _| v.clone())
+        self.store_reg_to_global_with(dst, rt, idxs, src_idxs, axis, masked, false, None, |v, _| v.clone())
     }
 
     /// [`Self::store`]'s REG→GLOBAL hop with a per-element **value transform**:
@@ -946,7 +1007,22 @@ impl<'k> Group<'k> {
     where
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
-        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, value)
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, None, value)
+    }
+
+    /// [`Self::store_global_with`] for a tile whose M rows are **scattered**:
+    /// `rows` maps the tile-local row to the flat element offset of that row's
+    /// start in `dst` and whether it exists — a convolution whose block is a
+    /// 2-D window of the output image, whose rows are `wo` apart. The offset a
+    /// rejected row returns is still dereferenced by the `value` transform's
+    /// reads (the bias column, the residual), so `rows` returns one inside the
+    /// tensor and the gate only drops the write. `ix.block` must carry
+    /// `Idx::Const(0)` at `ix.axis`: the row offset is `rows`' alone.
+    pub fn store_global_rows<F>(&self, dst: GL, rt: &RT<'k>, ix: MoveIdx, rows: &RowStore<'_>, value: F) -> GL
+    where
+        F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
+    {
+        self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, Some(rows), value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -959,6 +1035,7 @@ impl<'k> Group<'k> {
         axis: usize,
         masked: bool,
         clipped: bool,
+        rows: Option<&RowStore<'_>>,
         value: F,
     ) -> GL
     where
@@ -994,7 +1071,12 @@ impl<'k> Group<'k> {
             let (row, col) = rt.lane_rc(transpose, &laneid, &ix[2].to_uop());
             let srow = iadd(&imul(&ix[0].to_uop(), base_rows), &row);
             let scol = iadd(&imul(&ix[1].to_uop(), base_cols), &col);
-            let off = iadd(&dst_i_base, &iadd(&imul(&srow, row_stride), &scol));
+            let scattered = rows.map(|f| f(&srow));
+            let row_off = match &scattered {
+                Some((off, _)) => off.clone(),
+                None => imul(&srow, row_stride),
+            };
+            let off = iadd(&dst_i_base, &iadd(&row_off, &scol));
 
             let mut sidx: Vec<Idx> = src_idxs.to_vec();
             sidx.extend(ix.iter().cloned());
@@ -1003,11 +1085,15 @@ impl<'k> Group<'k> {
                 load = load.cast(dst.elem().clone());
             }
             let load = value(&load, &off);
-            let gate = masked
+            let edge = masked
                 .then(|| {
                     self.boundary_gate(dst.shape(), idxs, axis, s3 * base_rows, s2 * base_cols, &srow, &scol, clipped)
                 })
                 .flatten();
+            let gate = match (edge, scattered.and_then(|(_, valid)| valid)) {
+                (Some(a), Some(b)) => Some(a.try_and_op(&b).expect("scattered store: gate")),
+                (g, None) | (None, g) => g,
+            };
             let target = match gate {
                 Some(g) => index_off_gated(dst.uop(), off, g),
                 None => index_off(dst.uop(), off),
