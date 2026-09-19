@@ -1,4 +1,5 @@
 mod arch;
+mod conv;
 mod elementwise;
 mod fa;
 mod gemm;
