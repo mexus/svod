@@ -62,14 +62,16 @@ impl YoloNeck {
         let cat = Tensor::cat(&[&up, l4], 1)?;
         let l16 = scoped("16", || self.c3k2_16.forward(&cat))?;
 
-        // PAN bottom-up. The downsampling convs feed only a `cat`, and fused
-        // into it each would run over the whole concatenated channel range;
-        // realized, each covers its own channels and the `cat` is a gather.
-        let l17 = scoped("17", || self.conv17.forward(&l16))?.contiguous();
+        // PAN bottom-up. The downsampling convs feed only a `cat`. They used to
+        // be realized first, so that fusing into it could not run each over the
+        // whole concatenated channel range — but a tk convolution's output is
+        // already its own kernel's, and copying the NCHW view of it back out
+        // costs 17 µs for nothing (net -28 µs over the two, measured).
+        let l17 = scoped("17", || self.conv17.forward(&l16))?;
         let cat = Tensor::cat(&[&l17, &l13], 1)?;
         let l19 = scoped("19", || self.c3k2_19.forward(&cat))?;
 
-        let l20 = scoped("20", || self.conv20.forward(&l19))?.contiguous();
+        let l20 = scoped("20", || self.conv20.forward(&l19))?;
         let cat = Tensor::cat(&[&l20, l10], 1)?;
         let l22 = scoped("22", || self.c3k2_22.forward(&cat))?;
 
