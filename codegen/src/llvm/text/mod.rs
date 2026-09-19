@@ -565,6 +565,19 @@ fn build_function_attributes(target: &LlvmTarget, nodes: &[Arc<UOp>]) -> String 
         // ptxas could take as `(n, 1, 1)`. Older LLVMs ignore the unknown
         // string attribute (they only read the `!nvvm.annotations` form),
         // which merely costs the hint.
+        //
+        // FIXME: emitting it also costs us the register cap, and that is a
+        // silent trap rather than intended behaviour. ptxas drops
+        // `--maxrregcount` for any entry carrying `.maxntid` ("This option is
+        // also ignored for entry functions that have .maxntid directive
+        // specified", PTX Compiler API section 5), so the flag is a no-op on
+        // every kernel svod renders. Measured on SM86: `--maxrregcount=64..255`
+        // assembles to 255 registers at every value, while the same PTX with
+        // `.maxntid` deleted honours each value exactly. A register cap must
+        // stay expressible; the fix is the sibling `nvvm.maxnreg` attribute,
+        // which lowers to the per-entry `.maxnreg` directive that does bind
+        // (verified on clang 22, where the two directives coexist). Rewriting
+        // the assembled PTX to inject `.maxnreg` is not the answer.
         LlvmTarget::Nvptx(_) => match local_bounds(nodes) {
             Some(bounds) => {
                 let used = bounds.iter().rposition(|&bound| bound > 1).map_or(1, |last| last + 1);
