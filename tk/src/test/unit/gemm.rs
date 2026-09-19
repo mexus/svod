@@ -21,7 +21,7 @@ use super::device_supported;
 /// when one of these tiles it, so the predicate tests are written against the
 /// same list the policy searches rather than a restatement of its divisibility
 /// rules.
-const TABLE: [GemmCfg; 2] = CUDA_TILES;
+const TABLE: [GemmCfg; 4] = CUDA_TILES;
 
 /// The accumulator fragment width of every arch the GEMM is built for
 /// (`mma.sync`'s and gfx11 WMMA's 16×16).
@@ -176,21 +176,24 @@ proptest! {
 
 // ── Epilogue applicability (GPU-free) ────────────────────────────────────────
 
-/// Every tile a policy can pick reads the same gate/up row arrangement, so a
-/// weight permuted once at load is servable whatever `M` turns out to be — the
-/// invariant [`GemmPolicy::swiglu_pair_width`] exists to state, on every arch
-/// table.
+/// Every tile a policy can pick either reads the widest one's gate/up row
+/// arrangement or declines the epilogue outright, so a weight permuted once at
+/// load is servable whatever `M` turns out to be — the invariant
+/// [`GemmPolicy::swiglu_pair_width`] exists to state, on every arch table.
 #[test_case(SM86, &CUDA_TILES; "cuda")]
 #[test_case(RDNA, &RDNA_TILES; "rdna")]
 #[test_case(RDNA4, &RDNA4_TILES; "rdna4")]
-fn swiglu_pair_width_is_common_to_every_tile(arch: GpuArch, table: &[GemmCfg]) {
+fn swiglu_pair_width_is_the_widest_tiles(arch: GpuArch, table: &[GemmCfg]) {
     let policy = GemmPolicy::for_arch(arch);
     assert_eq!(policy.tiles, table);
-    let pair = policy.swiglu_pair_width().expect("the tiles agree on a pair width");
+    let pair = policy.swiglu_pair_width().expect("the widest tile sets a pair width");
     assert_eq!(pair, table[0].reg_n() / 2);
     for cfg in table {
-        assert_eq!(cfg.reg_n() / 2, pair, "{cfg:?} reads a different gate/up block width");
-        assert!(cfg.carries(Epilogue::SwiGlu { pair }, Some(FRAG_COLS)));
+        assert_eq!(
+            cfg.carries(Epilogue::SwiGlu { pair }, Some(FRAG_COLS)),
+            cfg.reg_n() / 2 == pair,
+            "{cfg:?} must read the table's gate/up block width or refuse the epilogue"
+        );
     }
 }
 

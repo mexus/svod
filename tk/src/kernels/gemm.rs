@@ -773,6 +773,26 @@ pub const NT_128X64: GemmCfg = GemmCfg {
 /// grid is already big enough, so [`GemmPolicy`] picks it only when that grid is not.
 pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 
+/// 64×64 over a 4×2 wave grid (8 waves, 256 threads), one 16×32 accumulator per
+/// wave and a 64-deep strip: half the barriers per K element, and four times the
+/// waves to hide the fill behind. 32 KiB of shared memory, so three blocks per
+/// sm_86 SM — fewer than [`NT_64X64`]'s six, which is why it only leads where the
+/// grid cannot fill the device anyway. Measured on the YOLO26x convolutions
+/// (RTX 3060): `768→768 k3s2 @20²` 244 → 235 µs, the `192→192 k3 @40²`
+/// bottleneck 67.5 → 62.5, `768→768 k3s2 @40²` a wash, and 2% behind on the
+/// wide-grid `384→384 k3s2 @80²`.
+pub const NT_64X64_W8: GemmCfg = GemmCfg { block_m: 64, warps_m: 4, acc_m: 1, k_step: 64, ..NT_128X64 };
+
+/// 32×32 over a 2×2 wave grid, one 16×16 accumulator per wave, a 64-deep strip:
+/// the tile for a shape whose N is too narrow to tile the device — four times
+/// [`NT_64X64`]'s blocks out of the same C. 16 KiB of shared memory and ~half
+/// the operand reuse per fill, so it loses badly wherever the grid is already
+/// wide (`768→768 k3s2 @20²` 244 → 378 µs). Measured where it is not: the
+/// `192→192 k3 @20²` bottleneck 34.6 → 25.3 µs (75 blocks over 28 SMs becomes
+/// 300; ncu puts the 64×64 form at 0.54 waves per SM and 19% achieved
+/// occupancy), `384→192 k3 @20²` 59.4 → 46.8.
+pub const NT_32X32: GemmCfg = GemmCfg { block_m: 32, block_n: 32, acc_m: 1, k_step: 64, ..NT_128X64 };
+
 /// The split-K tile: [`NT_128X64`] over two K-slabs, writing `[2, M, N]` f32
 /// partials that a second pass sums. **Never selected by [`GemmPolicy`]**: the
 /// partials' round trip costs more than the wider grid saves (122 vs 98 µs on a
@@ -780,8 +800,11 @@ pub const NT_64X64: GemmCfg = GemmCfg { block_m: 64, acc_m: 1, ..NT_128X64 };
 /// still). Kept for a device with more bandwidth per FLOP, which flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
-/// The CUDA sm_80+ tiles, widest first.
-pub const CUDA_TILES: [GemmCfg; 2] = [NT_128X64, NT_64X64];
+/// The CUDA sm_80+ tiles, widest first. The two fine ones are never the static
+/// choice ([`GemmPolicy::cfg`] keeps its order among the tiles narrower than the
+/// widest): they are there for [`GemmPolicy::tuned`] to measure on a shape whose
+/// grid starves the device, which the convolutions at 20² and 40² do.
+pub const CUDA_TILES: [GemmCfg; 4] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32];
 
 /// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
 /// L2 swizzle, plus the fine tile on a 64-deep strip, which halves the barriers
@@ -945,14 +968,16 @@ impl GemmPolicy {
 
     /// The gate/up row-block width an [`Epilogue::SwiGlu`] fused weight must be
     /// laid out in: `reg_n/2` — half a wave's N tile, the two halves its
-    /// accumulator holds side by side — common to every tile in the table, or
-    /// `None` when they disagree or the table is empty (the caller then keeps a
-    /// separate SwiGLU pass). The GEMM's `M` is not known when the weight is
-    /// loaded, and `M` is what picks the tile, so the row arrangement has to be
-    /// one that **every** candidate tile reads.
+    /// accumulator holds side by side — taken from the widest tile, or `None`
+    /// when the table is empty or holds a tile wider than its first (the caller
+    /// then keeps a separate SwiGLU pass). The GEMM's `M` is not known when the
+    /// weight is loaded, and `M` is what picks the tile, so the row arrangement
+    /// has to be one every tile that may be picked reads. A *narrower* tile
+    /// cannot be: [`GemmCfg::carries`] admits a `SwiGlu` only at its own
+    /// `reg_n/2`, so a finer tile simply never serves a fused GEMM.
     pub fn swiglu_pair_width(&self) -> Option<usize> {
         let pair = self.tiles.first()?.reg_n() / 2;
-        self.tiles.iter().all(|cfg| cfg.reg_n() / 2 == pair).then_some(pair)
+        self.tiles.iter().all(|cfg| cfg.reg_n() / 2 <= pair).then_some(pair)
     }
 }
 
