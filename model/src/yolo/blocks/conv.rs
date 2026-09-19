@@ -59,6 +59,12 @@ pub fn deconv2d_2x(in_ch: usize, out_ch: usize, kernel: usize) -> ConvTranspose2
 /// channels-last activations keeps the checkpoint's `[cout, cin, kh, kw]`,
 /// which measured faster there. [`Self::channels_last`] picks the output
 /// layout, [`Self::channels_last_input`] declares the input's.
+///
+/// [`Self::nhwc`] goes further: the block takes and returns the `[B, H, W, C]`
+/// tensor itself rather than an NCHW view of it, which is what lets
+/// [`svod_tk::conv2d_nhwc`] bind the activation without a copy. A chain of such
+/// blocks never changes layout; a graph consumer at the end takes the NCHW view
+/// for free.
 #[derive(Clone)]
 pub struct YoloConv {
     pub conv: Conv2d,
@@ -68,19 +74,82 @@ pub struct YoloConv {
     pub channels_last: bool,
     /// The input arrives channels-last; see [`Self::channels_last_input`].
     pub channels_last_input: bool,
+    /// Run [`svod_tk::conv2d_nhwc`]; see [`Self::tk`].
+    pub tk: bool,
+    /// The input is `[B, H, W, C]`; see [`Self::nhwc_in`].
+    pub nhwc_in: bool,
+    /// The output is `[B, H, W, C]`; see [`Self::nhwc_out`].
+    pub nhwc_out: bool,
+    /// The `[cout, kh, kw, cin]` weight the tk kernel reads, filled at load for
+    /// a block that takes and returns `[B, H, W, C]`. Shares its buffer with
+    /// `conv.weight`.
+    pub weight_taps: Option<Tensor>,
 }
 
 impl YoloConv {
     pub fn empty(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, act: bool) -> Self {
         let conv = conv2d(out_ch, in_ch, kernel, stride, kernel / 2);
-        Self { conv, bn: bn(out_ch), act, channels_last: false, channels_last_input: false }
+        Self::wrap(conv, out_ch, act)
     }
 
     /// Depthwise variant: `groups = gcd(in_ch, out_ch)`.
     pub fn empty_dw(in_ch: usize, out_ch: usize, kernel: usize, stride: usize, act: bool) -> Self {
         let groups = gcd(in_ch, out_ch);
-        let conv = conv2d_grouped(out_ch, in_ch, kernel, stride, kernel / 2, groups);
-        Self { conv, bn: bn(out_ch), act, channels_last: false, channels_last_input: false }
+        Self::wrap(conv2d_grouped(out_ch, in_ch, kernel, stride, kernel / 2, groups), out_ch, act)
+    }
+
+    fn wrap(conv: Conv2d, out_ch: usize, act: bool) -> Self {
+        Self {
+            conv,
+            bn: bn(out_ch),
+            act,
+            channels_last: false,
+            channels_last_input: false,
+            tk: false,
+            nhwc_in: false,
+            nhwc_out: false,
+            weight_taps: None,
+        }
+    }
+
+    /// Run [`svod_tk::conv2d_nhwc`], which on gfx1201 under BEAM is 1.6-2.3x the
+    /// best kernel the graph gets for a 3x3. The kernel reads and writes
+    /// `[B, H, W, C]`: an NCHW input is permuted first, which costs a copy the
+    /// win pays for several times over, while an NCHW output is only the view.
+    /// Where the kernel declines (a dtype or shape it does not serve, another
+    /// device) the block runs the graph conv, so this is a performance flag and
+    /// never a correctness one.
+    pub fn tk(mut self) -> Self {
+        self.tk = self.tk_eligible();
+        self
+    }
+
+    /// Whether [`svod_tk::conv2d_nhwc`] can serve this convolution on the
+    /// channel counts alone — the part of its tiling rule that does not depend
+    /// on the image: the output channels tile the widest N edge and the input
+    /// channels fill a K strip. A block that fails this keeps the graph path
+    /// rather than paying for a layout the kernel would decline anyway.
+    pub fn tk_eligible(&self) -> bool {
+        self.conv.groups == 1
+            && self
+                .conv
+                .weight
+                .dims()
+                .is_ok_and(|d| d.len() == 4 && d[0].is_multiple_of(64) && d[1].is_multiple_of(32) && d[2] * d[3] > 1)
+    }
+
+    /// Emit `[B, H, W, C]` — the tensor itself, not an NCHW view of it, which is
+    /// what lets the next block bind it without a copy. A graph consumer takes
+    /// the view back for free.
+    pub fn nhwc_out(mut self) -> Self {
+        self.nhwc_out = true;
+        self
+    }
+
+    /// Take `[B, H, W, C]`, so a [`Self::tk`] block needs no copy in.
+    pub fn nhwc_in(mut self) -> Self {
+        self.nhwc_in = true;
+        self
     }
 
     /// Store the output channels-last, handing on the NCHW view every consumer
@@ -98,10 +167,23 @@ impl YoloConv {
         self
     }
 
+    /// Whether the weight is stored `[cout, kh, kw, cin]`: the layout the tk
+    /// kernel binds, and the one a conv reading NCHW activations wants from the
+    /// graph. A conv reading channels-last keeps the checkpoint's, which
+    /// measured faster there, and at f32 nothing moves.
     fn taps_major(&self) -> bool {
-        !self.channels_last_input
+        (self.tk || !self.channels_last_input)
             && tensor_core_dtype(&self.conv.weight.dtype())
             && self.conv.weight.dims().is_ok_and(|d| d.len() == 4 && d[2] * d[3] > 1)
+    }
+
+    /// The tk kernel's operands, when this block can run it: a taps-major
+    /// weight, the bias the norm was folded into, and no grouping.
+    fn tk_operands(&self) -> Option<(&Tensor, &Tensor)> {
+        let (w, bias) = (self.weight_taps.as_ref()?, self.conv.bias.as_ref()?);
+        // The kernel takes the matrix core's operand dtypes and treats any other
+        // as a caller bug, so an f32 model never asks.
+        (self.tk && self.conv.groups == 1 && tensor_core_dtype(&w.dtype())).then_some((w, bias))
     }
 
     /// Accumulate the conv in `dtype` and keep the block's output there, so
@@ -113,11 +195,35 @@ impl YoloConv {
         self
     }
 
+    /// Whether this block's edges really are `[B, H, W, C]` for a stream of
+    /// `dtype`. Every layout here serves the matrix core, which only the
+    /// half-width dtypes reach, so an f32 model keeps NCHW throughout — and
+    /// because producer and consumer read the same stream dtype, they agree
+    /// without being told.
+    pub fn nhwc_at(&self, dtype: &DType) -> bool {
+        self.nhwc_out && tensor_core_dtype(dtype)
+    }
+
+    /// `x` is `[B, H, W, C]` when [`Self::nhwc_in`] holds for its dtype, else
+    /// `[B, C, H, W]`; the output follows [`Self::nhwc_at`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.conv.forward(x)?;
-        let x = if self.conv.bias.is_some() { x } else { self.bn.forward(&x)? };
-        let x = if self.act { x.silu()? } else { x };
-        if self.channels_last && tensor_core_dtype(&x.dtype()) { store_channels_last(&x) } else { Ok(x) }
+        let core = tensor_core_dtype(&x.dtype());
+        let (nhwc_in, nhwc_out) = (self.nhwc_in && core, self.nhwc_out && core);
+        if core && let Some((w, bias)) = self.tk_operands() {
+            let (stride, pad) = (self.conv.stride.0, self.conv.padding.0.0 as usize);
+            let nhwc = if nhwc_in { x.clone() } else { x.try_permute(&[0, 2, 3, 1])? };
+            if let Some(y) = svod_tk::conv2d_nhwc(&nhwc, w, bias, None, stride, pad, self.act)? {
+                return Ok(if nhwc_out { y } else { y.try_permute(&[0, 3, 1, 2])? });
+            }
+        }
+        let nchw = if nhwc_in { x.try_permute(&[0, 3, 1, 2])? } else { x.clone() };
+        let y = self.conv.forward(&nchw)?;
+        let y = if self.conv.bias.is_some() { y } else { self.bn.forward(&y)? };
+        let y = if self.act { y.silu()? } else { y };
+        if nhwc_out {
+            return Ok(y.try_permute(&[0, 2, 3, 1])?.contiguous());
+        }
+        if self.channels_last && core { store_channels_last(&y) } else { Ok(y) }
     }
 }
 
@@ -139,8 +245,12 @@ impl Module for YoloConv {
         if self.taps_major() {
             let taps_major = self.conv.weight.try_permute(&[0, 2, 3, 1])?.contiguous();
             taps_major.realize()?;
-            // Kept a view: realizing it would copy the bytes back cin-major.
+            // The NCHW form is kept a view: realizing it would copy the bytes
+            // back cin-major, and the tk kernel binds the taps-major tensor.
             self.conv.weight = taps_major.try_permute(&[0, 3, 1, 2])?;
+            self.weight_taps = self.tk.then_some(taps_major);
+        } else {
+            self.weight_taps = None;
         }
         Ok(())
     }

@@ -77,13 +77,21 @@ pub struct C3k {
 impl C3k {
     pub fn empty(in_ch: usize, out_ch: usize, n: usize, shortcut: bool, e: f64, k: usize) -> Self {
         let c_ = (out_ch as f64 * e) as usize;
-        // `cv1` and the chain feed 3x3 convs (and `cv3`, a 1x1, which does not
-        // mind), so they store channels-last; `cv2` feeds only `cv3`.
+        // `cv1` hands the chain the `[B, H, W, C]` tensor itself, so its 3x3
+        // convs run on the tk kernel with no layout change between them; the
+        // chain's output reaches `cv3`'s `cat` as an NCHW view, free to a graph
+        // op. `cv2` feeds only `cv3`.
+        let m: Vec<YoloBottleneck> =
+            (0..n).map(|_| YoloBottleneck::empty_full(c_, c_, shortcut, k, k, 1.0).nhwc()).collect();
+        // The chain is `[B, H, W, C]` only if every link took it; one link on
+        // the graph path would pay for the layout and get nothing back.
+        let chained = m.iter().all(|b| b.nhwc);
+        let cv1 = YoloConv::empty(in_ch, c_, 1, 1, true);
         Self {
-            cv1: YoloConv::empty(in_ch, c_, 1, 1, true).channels_last(),
+            cv1: if chained { cv1.nhwc_out() } else { cv1.channels_last() },
             cv2: YoloConv::empty(in_ch, c_, 1, 1, true),
             cv3: YoloConv::empty(2 * c_, out_ch, 1, 1, true),
-            m: (0..n).map(|_| YoloBottleneck::empty_full(c_, c_, shortcut, k, k, 1.0).channels_last()).collect(),
+            m,
         }
     }
 
@@ -91,6 +99,8 @@ impl C3k {
         let left = scoped("cv1", || self.cv1.forward(x))?;
         let left =
             self.m.iter().enumerate().try_fold(left, |acc, (i, blk)| scoped_index("m", i, || blk.forward(&acc)))?;
+        // The chain ran in `[B, H, W, C]`; the `cat` takes the NCHW view of it.
+        let left = if self.cv1.nhwc_at(&x.dtype()) { left.try_permute(&[0, 3, 1, 2])? } else { left };
         let right = scoped("cv2", || self.cv2.forward(x))?;
         let cat = Tensor::cat(&[&left, &right], 1)?;
         scoped("cv3", || self.cv3.forward(&cat))
@@ -140,15 +150,18 @@ impl C3k2 {
         let c_hidden = (out_ch as f64 * e) as usize;
         let num_heads = (c_hidden / 64).max(1);
         let inner = || {
+            // A bottleneck reached from the `chunk`/`cat` chain keeps NCHW at
+            // its edges — those are channel-axis ops — and runs the tk kernel
+            // inside ([`YoloBottleneck::tk`]).
             if attn {
                 C3k2Inner::Attn(
-                    YoloBottleneck::empty(c_hidden, c_hidden, shortcut),
+                    YoloBottleneck::empty(c_hidden, c_hidden, shortcut).tk(),
                     PSABlock::empty(c_hidden, num_heads),
                 )
             } else if c3k {
                 C3k2Inner::C3k(C3k::empty(c_hidden, c_hidden, 2, shortcut, 0.5, 3))
             } else {
-                C3k2Inner::Bottleneck(YoloBottleneck::empty(c_hidden, c_hidden, shortcut))
+                C3k2Inner::Bottleneck(YoloBottleneck::empty(c_hidden, c_hidden, shortcut).tk())
             }
         };
         Self {

@@ -12,7 +12,7 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use snafu::ensure;
+use snafu::{ResultExt, ensure};
 use svod_dtype::DType;
 use svod_ir::UOp;
 use svod_tensor::Tensor;
@@ -222,6 +222,11 @@ fn row_source(geom: ConvGeom, cfg: GemmCfg) -> Box<RowSource<'static>> {
     })
 }
 
+/// The output's `[batch, ho, wo, cout]`.
+fn y_dims(geom: &ConvGeom) -> Vec<usize> {
+    vec![geom.batch, geom.ho(), geom.wo(), geom.cout]
+}
+
 /// Bind the ABI (`y[M, N]` out; `x[batch·h·w, cin]`, `w[N, K]`, `bias[N]` and,
 /// under a residual, `residual[M, N]` in) and run the gathered GEMM.
 pub fn build_conv(ker: &Kernel, geom: ConvGeom, cfg: GemmCfg, dt: DType, epi: Epilogue<()>) {
@@ -273,8 +278,20 @@ pub fn conv2d_nhwc(
     let rd = residual.map(|r| crate::launch::concrete_dims(r, "conv2d", "residual", 4)).transpose()?;
     let geom =
         ConvGeom { batch: xd[0], h: xd[1], w: xd[2], cin: xd[3], cout: wd[0], kh: wd[1], kw: wd[2], stride, pad };
+    // A dim pinned to one value is that value ([`crate::launch::pinned_dim`]),
+    // but the tensor still carries it symbolically and a kernel placeholder
+    // needs a static shape: reshape to what the dims resolved to.
+    let statically = |t: &Tensor, dims: &[usize]| -> crate::LaunchResult<Tensor> {
+        if t.shape().is_ok_and(|s| s.iter().all(|d| d.as_const().is_some())) {
+            return Ok(t.clone());
+        }
+        t.try_reshape(dims.iter().map(|&d| d as isize).collect::<Vec<_>>()).context(crate::launch::OperandSnafu)
+    };
     let dtype = x.uop().dtype();
-    let y_shape = vec![geom.batch, geom.ho(), geom.wo(), geom.cout];
+    let y_shape = y_dims(&geom);
+    let x = &statically(x, &xd)?;
+    let residual = residual.map(|r| statically(r, &y_shape)).transpose()?;
+    let residual = residual.as_ref();
     let kind = Epilogue::BiasAct { bias: (), residual: residual.map(|_| ()), act };
     let dtypes: Vec<(&'static str, DType)> = [("w", w.uop().dtype()), ("bias", bias.uop().dtype())]
         .into_iter()

@@ -196,7 +196,27 @@ pub enum Error {
 pub fn concrete_dims(t: &Tensor, kernel: &'static str, operand: &'static str, rank: usize) -> Result<Vec<usize>> {
     let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
     snafu::ensure!(shape.len() == rank, OperandRankSnafu { kernel, operand, expected: rank, got: shape.len() });
-    (0..rank).map(|i| shape[i].as_const().context(OperandSymbolicDimSnafu { kernel, operand, axis: i })).collect()
+    (0..rank).map(|i| pinned_dim(&shape[i]).context(OperandSymbolicDimSnafu { kernel, operand, axis: i })).collect()
+}
+
+/// A dimension's compile-time value: its own when it is a constant, and the
+/// single value a symbolic dim is pinned to when its bounds coincide — a JIT
+/// `batch_var` of `(1, 1)` is the constant `1`, and a kernel that needs a
+/// static launch grid can serve it.
+pub fn pinned_dim(dim: &svod_ir::SInt) -> Option<usize> {
+    if let Some(v) = dim.as_const() {
+        return Some(v);
+    }
+    let svod_ir::SInt::Symbolic(uop) = dim else { return None };
+    let bound = |v: &svod_ir::ConstValue| match v {
+        svod_ir::ConstValue::Int(v) if *v >= 0 => Some(*v as usize),
+        svod_ir::ConstValue::UInt(v) => Some(*v as usize),
+        _ => None,
+    };
+    match (bound(uop.vmin()), bound(uop.vmax())) {
+        (Some(lo), Some(hi)) if lo == hi => Some(lo),
+        _ => None,
+    }
 }
 
 /// [`concrete_dims`] for an operand of any rank of at least `min_rank`.
@@ -209,7 +229,7 @@ pub fn concrete_dims_at_least(
     let shape = t.shape().ok().context(OperandIndeterminateShapeSnafu { kernel, operand })?;
     snafu::ensure!(shape.len() >= min_rank, OperandRankSnafu { kernel, operand, expected: min_rank, got: shape.len() });
     (0..shape.len())
-        .map(|i| shape[i].as_const().context(OperandSymbolicDimSnafu { kernel, operand, axis: i }))
+        .map(|i| pinned_dim(&shape[i]).context(OperandSymbolicDimSnafu { kernel, operand, axis: i }))
         .collect()
 }
 

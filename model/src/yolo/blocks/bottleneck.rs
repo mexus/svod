@@ -16,6 +16,9 @@ pub struct YoloBottleneck {
     /// The block's output is stored channels-last; see [`Self::channels_last`].
     #[module(skip)]
     pub channels_last: bool,
+    /// The block takes and returns `[B, H, W, C]`; see [`Self::nhwc`].
+    #[module(skip)]
+    pub nhwc: bool,
 }
 
 impl YoloBottleneck {
@@ -29,7 +32,7 @@ impl YoloBottleneck {
         let c_ = (out_ch as f64 * e) as usize;
         let add = shortcut && in_ch == out_ch;
         let cv1 = YoloConv::empty(in_ch, c_, k1, 1, true);
-        Self { cv1, cv2: YoloConv::empty(c_, out_ch, k2, 1, true), add, channels_last: false }
+        Self { cv1, cv2: YoloConv::empty(c_, out_ch, k2, 1, true), add, channels_last: false, nhwc: false }
     }
 
     /// Store both `cv1`'s output and the block's channels-last: `cv1` feeds
@@ -39,6 +42,39 @@ impl YoloBottleneck {
         self.cv1 = self.cv1.channels_last().channels_last_input();
         self.cv2 = self.cv2.channels_last_input();
         self.channels_last = true;
+        self
+    }
+
+    /// Both convs on the tk kernel, taking and returning NCHW: the first pays
+    /// one permute of its input, the rest of the chain is already channels-last.
+    pub fn tk(mut self) -> Self {
+        if !self.tk_eligible() {
+            return self.channels_last();
+        }
+        self.cv1 = self.cv1.tk().nhwc_out();
+        self.cv2 = self.cv2.tk().nhwc_in();
+        self
+    }
+
+    /// Both convs can run the tk kernel ([`YoloConv::tk_eligible`]). A chain
+    /// whose middle falls back would pay for the layout and get nothing.
+    pub fn tk_eligible(&self) -> bool {
+        self.cv1.tk_eligible() && self.cv2.tk_eligible()
+    }
+
+    /// Take and return `[B, H, W, C]`, both convs on the tk kernel
+    /// ([`YoloConv::nhwc`]). The residual add is elementwise, so it needs no
+    /// layout of its own.
+    pub fn nhwc(mut self) -> Self {
+        // Where the kernel declines, the channels-last store still helps the
+        // graph conv that runs instead, so fall back to that rather than to
+        // plain NCHW.
+        if !self.tk_eligible() {
+            return self.channels_last();
+        }
+        self.cv1 = self.cv1.tk().nhwc_in().nhwc_out();
+        self.cv2 = self.cv2.tk().nhwc_in().nhwc_out();
+        self.nhwc = true;
         self
     }
 

@@ -41,11 +41,11 @@ impl YoloNeck {
             // Layer 16: C3k2 [256, True] — input is cat(upsample(c3), c3) = c3+c3
             c3k2_16: C3k2::empty(c3 + c3, c2, d(2), true, 0.5, true, false),
             // Layer 17: Conv [256, 3, 2]
-            conv17: YoloConv::empty(c2, c2, 3, 2, true),
+            conv17: YoloConv::empty(c2, c2, 3, 2, true).tk(),
             // Layer 19: C3k2 [512, True] — input is cat(conv17_out, c3k2_13_out)
             c3k2_19: C3k2::empty(c2 + c3, c3, d(2), true, 0.5, true, false),
             // Layer 20: Conv [512, 3, 2]
-            conv20: YoloConv::empty(c3, c3, 3, 2, true),
+            conv20: YoloConv::empty(c3, c3, 3, 2, true).tk(),
             // Layer 22: C3k2 [1024, True, 0.5, True] — attn=True
             c3k2_22: C3k2::empty(c3 + c4, c4, d(1), true, 0.5, true, true),
         }

@@ -108,3 +108,46 @@ fn the_fold_keeps_the_weight_dtype() {
     assert_eq!(folded["conv.weight"].dtype(), DType::Float16);
     assert_eq!(folded["conv.bias"].dtype(), DType::Float16);
 }
+
+/// The tk convolution is asked for only where its tiling rule can be met on the
+/// channel counts — the part knowable when the model is built. A block that
+/// fails it keeps the graph path rather than paying for a layout change that
+/// buys nothing.
+#[test_case(192, 192, 3, true; "192 channels, 3x3")]
+#[test_case(384, 128, 3, true; "128 output channels")]
+#[test_case(96, 96, 3, false; "96 output channels miss the N edge")]
+#[test_case(192, 192, 1, false; "a 1x1 stays on the graph")]
+#[test_case(16, 64, 3, false; "16 input channels do not fill a strip")]
+fn the_tk_flag_follows_what_the_kernel_can_tile(cin: usize, cout: usize, k: usize, eligible: bool) {
+    let conv = YoloConv::empty(cin, cout, k, 1, true);
+    assert_eq!(conv.tk_eligible(), eligible);
+    assert_eq!(conv.tk().tk, eligible, "the flag is set only where the kernel can serve");
+}
+
+/// A depthwise block never asks for it: the kernel has no grouped form.
+#[test]
+fn a_depthwise_block_stays_on_the_graph() {
+    assert!(!YoloConv::empty_dw(192, 192, 3, 1, true).tk().tk);
+}
+
+/// The weight the kernel binds is the taps-major tensor, and the one the graph
+/// path reads is the `[cout, cin, kh, kw]` view over the same buffer.
+#[test]
+fn a_tk_block_keeps_both_weight_views() {
+    let sd: StateDict = unfolded_state(64, 64, 3).into_iter().map(|(k, t)| (k, t.cast(DType::Float16))).collect();
+    let mut conv = YoloConv::empty(64, 64, 3, 1, true).tk();
+    conv.load_state_dict(&sd, "").unwrap();
+    let taps = conv.weight_taps.as_ref().expect("a tk block carries the taps-major weight");
+    assert_eq!(taps.dims().unwrap(), vec![64, 3, 3, 64]);
+    assert_eq!(conv.conv.weight.dims().unwrap(), vec![64, 64, 3, 3]);
+    assert_eq!(
+        taps.contiguous().cast(DType::Float32).to_vec::<f32>().unwrap(),
+        sd["conv.weight"]
+            .try_permute(&[0, 2, 3, 1])
+            .unwrap()
+            .contiguous()
+            .cast(DType::Float32)
+            .to_vec::<f32>()
+            .unwrap()
+    );
+}
