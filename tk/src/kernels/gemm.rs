@@ -296,12 +296,19 @@ pub fn gemm_core(
 /// element and whether the row exists at all (a row past a ragged `M`, or a
 /// convolution tap that falls in the padding, reads as zeros). The strip's
 /// columns follow that offset consecutively.
+///
+/// Every offset must be a multiple of the per-lane run (16 bytes, 8 elements at
+/// f16), because a row starts a lane's `cp.async` chunk wherever the arch has
+/// one: an unaligned row would fault the copy, not merely slow it. A
+/// convolution gets the alignment from `cin % k_step == 0`.
 pub type RowSource<'a> = dyn Fn(&Arc<UOp>, &Arc<UOp>, &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) + 'a;
 
 /// [`gemm_core`] with the A strip optionally gathered through `a_rows`
-/// ([`RowSource`]): the pipeline is then the register-staged one on every
-/// arch, and `m` may be ragged — the grid covers `ceil(m / block_m)` row
-/// blocks, the rows past `m` load as zeros and their stores are dropped.
+/// ([`RowSource`]), and `m` may then be ragged — the grid covers
+/// `ceil(m / block_m)` row blocks, the rows past `m` load as zeros and their
+/// stores are dropped. A gathered strip takes the same pipeline as any other:
+/// `cp.async` where the arch has it (the gate rides in the copy's `src_size`,
+/// so a rejected row zero-fills without a read), else the register-staged one.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_core_with(
     ker: &Kernel,
@@ -318,7 +325,8 @@ pub fn gemm_core_with(
         "gemm M={m} must be a multiple of the {} block unless the rows are gathered",
         cfg.block_m
     );
-    assert!(a_rows.is_none() || cfg.stages == 2, "a gathered A strip runs the two-deep staged pipeline");
+    // A gathered strip that cannot go asynchronous falls to the staged pipeline,
+    // which is two-deep; `Strips::pipelined` asserts that where it chooses.
     assert_eq!(n % cfg.block_n, 0, "gemm N={n} must be a multiple of the {} block", cfg.block_n);
     // The K-edge is the A fragment's column count — 16 on MFMA/`mma.sync`, 8 on
     // Apple's `simdgroup_matrix`.
@@ -649,10 +657,7 @@ impl Strips<'_> {
     /// where it applies to both strips ([`Group::cp_async_fill_applies`]), else
     /// the two-deep register-staged stream.
     fn pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
-        if self.a_rows.is_none()
-            && g.cp_async_fill_applies(&a_smem, self.a_gl)
-            && g.cp_async_fill_applies(&b_smem, self.b_gl)
-        {
+        if g.cp_async_fill_applies(&a_smem, self.a_gl) && g.cp_async_fill_applies(&b_smem, self.b_gl) {
             self.async_pipelined(g, lp, a_smem, b_smem)
         } else {
             assert_eq!(self.cfg.stages, 2, "the register-staged pipeline is two-deep (one strip in flight)");
@@ -705,7 +710,11 @@ impl Strips<'_> {
         let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
         let issue = |a: &ST, b: &ST, t: &Arc<UOp>| {
             let (ai, bi) = self.at(t);
-            [g.cp_async_fill(a, self.a_gl, &ai, 2), g.cp_async_fill(b, self.b_gl, &bi, 2)]
+            let a_copy = match self.a_rows {
+                Some(rows) => g.cp_async_fill_rows(a, self.a_gl, |r| rows(r, self.row, t)),
+                None => g.cp_async_fill(a, self.a_gl, &ai, 2),
+            };
+            [a_copy, g.cp_async_fill(b, self.b_gl, &bi, 2)]
         };
         // Prologue: strips `0..stages-1`, each into its own half.
         let mut deps: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();

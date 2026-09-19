@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
-use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_commit, cp_async_wait, ldmatrix};
+use svod_codegen::llvm::nvptx::smem::{cp_async_16, cp_async_16_zfill, cp_async_commit, cp_async_wait, ldmatrix};
 use svod_ir::{AxisType, ConstValue, Op, UOp};
 
 use super::{Group, MoveIdx, iadd, idiv, idx_mul, imod, imul, wave_offset};
@@ -429,6 +429,52 @@ impl<'k> Group<'k> {
                     ),
                 );
                 cp_async_16(&dst, &index_off(src.uop(), off))
+            })
+            .collect();
+        cp_async_commit(copies)
+    }
+
+    /// [`Self::cp_async_fill`] for a strip whose rows are not consecutive in
+    /// `src` — the asynchronous counterpart of
+    /// [`Self::stage_global_rows_to_reg`], with the same `rows` contract. A row
+    /// the gate rejects copies **zero bytes**: its 16-byte chunk zero-fills in
+    /// the copy engine, so the padded taps cost neither a read nor the mask
+    /// multiply the staged path pays, and the strip never lands in a register on
+    /// its way to LDS.
+    ///
+    /// # Panics
+    /// Panics unless [`Self::cp_async_fill_applies`]. Each row offset `rows`
+    /// returns must be a multiple of the per-lane run (16 bytes), which is what
+    /// lets a row start a lane's chunk; a convolution gets that from
+    /// `cin % k_step == 0`.
+    pub fn cp_async_fill_rows(&self, st: &ST, src: &GL, rows: impl Fn(&Arc<UOp>) -> (Arc<UOp>, Arc<UOp>)) -> Arc<UOp> {
+        assert!(
+            self.cp_async_fill_applies(st, src),
+            "cp.async row fill: CUDA, 16-byte lane runs, no cast, chunk swizzle"
+        );
+        let geom = self.lds_fill_geom(st);
+        let run_bytes = geom.ept * st.elem().bytes() as i64;
+
+        let copies: SmallVec<[Arc<UOp>; 4]> = (0..geom.total_calls)
+            .map(|pass| {
+                let (height, width, row, col) = self.fill_lane_rc(&geom, &cidx(pass), &cidx(0));
+                let (srow, scol) =
+                    st.base.swizzle.swizzle_rc(row.clone(), col.clone(), st.base.base.cols, st.elem().base());
+                let dst =
+                    st_index(st, &[Idx::Uop(height.clone()), Idx::Uop(width.clone()), Idx::Uop(srow), Idx::Uop(scol)]);
+                let strip_row = iadd(&imul(&height, geom.base_rows), &row);
+                let strip_col = iadd(&imul(&width, geom.base_cols), &col);
+                let (row_off, valid) = rows(&strip_row);
+                let off = iadd(&row_off, &strip_col);
+                // The gate is the copy's `src_size`, never a mask on a loaded
+                // value. The address is still clamped to element 0 so that no
+                // lane forms one outside the operand, even though a zero-byte
+                // copy does not dereference it.
+                let safe = UOp::try_where(valid.clone(), off, cidx(0)).expect("gathered row: safe offset");
+                let src_bytes = UOp::try_where(valid, cidx(run_bytes), cidx(0))
+                    .expect("gathered row: src_size")
+                    .cast(svod_dtype::DType::Int32);
+                cp_async_16_zfill(&dst, &index_off(src.uop(), safe), &src_bytes)
             })
             .collect();
         cp_async_commit(copies)
