@@ -143,6 +143,13 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     batch: usize,
 
+    /// Leave the batch variable free over `1..=batch` instead of pinning it to
+    /// `batch`. A free variable keeps one plan for every batch size, but it
+    /// costs the hand-written tk kernels (they need a static launch grid) and
+    /// CUDA graph capture (dispatch arguments must not change between runs).
+    #[arg(long)]
+    dynamic_batch: bool,
+
     /// Export SVOD_THREADS before runtime init; default leaves it untouched.
     #[arg(long)]
     threads: Option<usize>,
@@ -253,12 +260,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tag = if device == DeviceSpec::Cpu { "PROVISIONAL (CPU)" } else { "PROVISIONAL" };
     println!(
-        "=== YOLO26 profile: device {}, SVOD_THREADS {threads}, scale {}, nc {}, imgsz {}, batch {} — {tag} ===",
+        "=== YOLO26 profile: device {}, SVOD_THREADS {threads}, scale {}, nc {}, imgsz {}, batch {} ({}) — {tag} ===",
         device.canonicalize(),
         args.scale.letter(),
         args.nc,
         args.size,
-        args.batch
+        args.batch,
+        if args.dynamic_batch { "free" } else { "pinned" }
     );
     println!("compute dtype: {:?} (heads f32)", svod_dtype::DType::from(args.dtype));
 
@@ -278,6 +286,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- prepare: graph build + first compile ------------------------------
     let t_prepare = Instant::now();
     let mut jit = Yolo26DetectJit::new(model);
+    if !args.dynamic_batch {
+        jit = jit.with_b_fixed(args.batch.max(1));
+    }
     jit.prepare_with_config(
         InputSpec::f32(&[args.batch, 3, args.size, args.size]).device_local(),
         &PrepareConfig::device_local(),
