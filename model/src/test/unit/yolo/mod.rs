@@ -14,4 +14,5 @@ mod parity;
 mod pose;
 mod segment;
 mod semseg;
+mod stage_dtype;
 mod weight_layout;
