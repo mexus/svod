@@ -84,6 +84,10 @@ pub struct YoloConv {
     /// a block that takes and returns `[B, H, W, C]`. Shares its buffer with
     /// `conv.weight`.
     pub weight_taps: Option<Tensor>,
+    /// Cast the input to this dtype first; see [`Self::with_io_dtype`].
+    pub in_dtype: Option<DType>,
+    /// Cast the output to this dtype last; see [`Self::with_io_dtype`].
+    pub out_dtype: Option<DType>,
 }
 
 impl YoloConv {
@@ -109,7 +113,20 @@ impl YoloConv {
             nhwc_in: false,
             nhwc_out: false,
             weight_taps: None,
+            in_dtype: None,
+            out_dtype: None,
         }
+    }
+
+    /// Cast this block's input and/or output, which is how a stage is pinned to
+    /// a dtype the rest of the model does not run at: every layer reads its
+    /// width off the stream, so casting at a block's edge carries the whole
+    /// stage with it. Only valid where the edge is NCHW — inside a chain that
+    /// keeps `[B, H, W, C]` the consumer's layout is decided by the same dtype
+    /// test ([`Self::nhwc_at`]) and the two would stop agreeing.
+    pub fn with_io_dtype(mut self, in_dtype: Option<DType>, out_dtype: Option<DType>) -> Self {
+        (self.in_dtype, self.out_dtype) = (in_dtype, out_dtype);
+        self
     }
 
     /// Run [`svod_tk::conv2d_nhwc`], which on gfx1201 under BEAM is 1.6-2.3x the
@@ -207,6 +224,15 @@ impl YoloConv {
     /// `x` is `[B, H, W, C]` when [`Self::nhwc_in`] holds for its dtype, else
     /// `[B, C, H, W]`; the output follows [`Self::nhwc_at`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let cast = self.in_dtype.clone().map(|dt| x.cast(dt));
+        let y = self.forward_inner(cast.as_ref().unwrap_or(x))?;
+        Ok(match self.out_dtype.clone() {
+            Some(dt) => y.cast(dt),
+            None => y,
+        })
+    }
+
+    fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
         let core = tensor_core_dtype(&x.dtype());
         let (nhwc_in, nhwc_out) = (self.nhwc_in && core, self.nhwc_out && core);
         if core && let Some((w, bias)) = self.tk_operands() {

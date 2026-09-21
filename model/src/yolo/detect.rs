@@ -4,6 +4,7 @@
 //! All three share the same [`Detect`] head (differing only in the number of
 //! detection scales) and differ in backbone/neck depth.
 
+use svod_dtype::DType;
 use svod_ir::SInt;
 use svod_tensor::Tensor;
 use svod_tensor::nn::Module;
@@ -11,6 +12,8 @@ use svod_tensor::nn::Module;
 use crate::state::{StateDict, scoped_index};
 
 use super::backbone::{YoloBackbone, scaled_channels};
+use super::blocks::conv::YoloConv;
+use super::blocks::csp::C3k2Inner;
 use super::config::{P2_STRIDES, P6_STRIDES, YoloConfig};
 use super::error::Result;
 
@@ -160,6 +163,67 @@ impl Yolo26Detect {
         let (p3, p4, p5) = crate::state::scoped("neck", || self.neck.forward(&l4, &l6, &l10))?;
         crate::state::scoped("head", || self.head.forward(&[p3, p4, p5]))
     }
+
+    /// Run one stage at `dtype` while the rest of the model keeps its compute
+    /// dtype, and report whether `stage` named one. The names are the ones the
+    /// profiler prints — `backbone.0`..`backbone.10`, `neck.13`..`neck.22` —
+    /// plus `backbone.10.attn` and `neck.22.attn` for the attention inside them.
+    ///
+    /// This locates where a narrow dtype costs accuracy. Every layer takes its
+    /// width from the stream it is handed, so an island is just a cast at each
+    /// end of the stage; the ends chosen here are the NCHW module edges, which
+    /// is the only place a cast cannot break the layout agreement described on
+    /// [`YoloConv::with_io_dtype`].
+    pub fn force_stage_dtype(&mut self, stage: &str, dtype: DType) -> bool {
+        let out = self.config.compute_dtype.clone();
+        let (b, n) = (&mut self.backbone, &mut self.neck);
+        let (d, o) = (&dtype, &out);
+        match stage {
+            "backbone.0" => solo(&mut b.conv0, d, o),
+            "backbone.1" => solo(&mut b.conv1, d, o),
+            "backbone.2" => island(&mut b.c3k2_2.cv1, &mut b.c3k2_2.cv2, d, o),
+            "backbone.3" => solo(&mut b.conv3, d, o),
+            "backbone.4" => island(&mut b.c3k2_4.cv1, &mut b.c3k2_4.cv2, d, o),
+            "backbone.5" => solo(&mut b.conv5, d, o),
+            "backbone.6" => island(&mut b.c3k2_6.cv1, &mut b.c3k2_6.cv2, d, o),
+            "backbone.7" => solo(&mut b.conv7, d, o),
+            "backbone.8" => island(&mut b.c3k2_8.cv1, &mut b.c3k2_8.cv2, d, o),
+            "backbone.9" => island(&mut b.sppf9.cv1, &mut b.sppf9.cv2, d, o),
+            "backbone.10" => island(&mut b.c2psa10.cv1, &mut b.c2psa10.cv2, d, o),
+            "backbone.10.attn" => {
+                for blk in &mut b.c2psa10.m {
+                    island(&mut blk.attn.qkv, &mut blk.attn.proj, d, o);
+                }
+            }
+            "neck.13" => island(&mut n.c3k2_13.cv1, &mut n.c3k2_13.cv2, d, o),
+            "neck.16" => island(&mut n.c3k2_16.cv1, &mut n.c3k2_16.cv2, d, o),
+            "neck.17" => solo(&mut n.conv17, d, o),
+            "neck.19" => island(&mut n.c3k2_19.cv1, &mut n.c3k2_19.cv2, d, o),
+            "neck.20" => solo(&mut n.conv20, d, o),
+            "neck.22" => island(&mut n.c3k2_22.cv1, &mut n.c3k2_22.cv2, d, o),
+            "neck.22.attn" => {
+                for inner in &mut n.c3k2_22.m {
+                    if let C3k2Inner::Attn(_, psa) = inner {
+                        island(&mut psa.attn.qkv, &mut psa.attn.proj, d, o);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// Pin a stage that begins and ends at the same block.
+fn solo(conv: &mut YoloConv, inner: &DType, outer: &DType) {
+    conv.in_dtype = Some(inner.clone());
+    conv.out_dtype = Some(outer.clone());
+}
+
+/// Pin a stage running from `entry`'s input to `exit`'s output.
+fn island(entry: &mut YoloConv, exit: &mut YoloConv, inner: &DType, outer: &DType) {
+    entry.in_dtype = Some(inner.clone());
+    exit.out_dtype = Some(outer.clone());
 }
 
 // ---------------------------------------------------------------------------

@@ -106,6 +106,13 @@ struct Args {
     #[arg(long, value_enum, default_value_t = DtypeArg::F32)]
     dtype: DtypeArg,
 
+    /// Run this stage at f32 while the rest stays at `--dtype`, repeatable.
+    /// Names are the ones the origin rollup prints (`backbone.9`, `neck.22`),
+    /// plus `backbone.10.attn` / `neck.22.attn`. Bisects which stage a narrow
+    /// compute dtype costs accuracy in.
+    #[arg(long = "stage-f32", value_name = "STAGE")]
+    stage_f32: Vec<String>,
+
     /// Number of classes the checkpoint was trained with.
     #[arg(long, default_value_t = 80)]
     nc: usize,
@@ -275,12 +282,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = YoloConfig::new(args.scale.into(), args.nc)
         .with_max_batch_size(args.batch.max(1))
         .with_compute_dtype(args.dtype.into());
-    let model = if let Some(ref path) = args.local {
+    let mut model = if let Some(ref path) = args.local {
         Yolo26Detect::from_safetensors(path, cfg)?
     } else {
         let id = args.hub.as_deref().unwrap_or_else(|| args.scale.hub_id());
         Yolo26Detect::from_hub(id, cfg)?
     };
+    for stage in &args.stage_f32 {
+        if !model.force_stage_dtype(stage, svod_dtype::DType::Float32) {
+            return Err(format!("unknown stage {stage:?}").into());
+        }
+        println!("stage {stage} pinned to f32");
+    }
     let dt_load = t_load.elapsed();
 
     // --- prepare: graph build + first compile ------------------------------
