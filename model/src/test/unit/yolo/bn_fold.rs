@@ -151,3 +151,52 @@ fn a_tk_block_keeps_both_weight_views() {
             .unwrap()
     );
 }
+
+/// The rounding boundary of a narrow block: downstream of the convolution's
+/// reduce there is exactly **one** cast, the narrowing at the store. The fp32
+/// accumulator reaches the norm and the activation unrounded.
+///
+/// Rounding it at the conv and letting `silu` widen again reads (1 widening,
+/// 2 narrowings) instead — a round trip no rewrite may remove, because removing
+/// it changes the result, and it measured +3.2% of the YOLO26x forward. An
+/// unactivated block has no epilogue to hold open and reaches the same counts
+/// the other way, its accumulator rounding at the conv as it always did.
+///
+/// Counting only downstream of the reduce keeps the test blind to however the
+/// caller happened to build its f16 operands.
+#[test_case(true; "activated")]
+#[test_case(false; "unactivated")]
+fn a_narrow_block_rounds_once_after_the_reduce(act: bool) {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use svod_ir::{Op, UOp, ops};
+
+    let sd: StateDict = fold_batchnorm(&unfolded_state(4, 8, 3))
+        .unwrap()
+        .into_iter()
+        .map(|(k, t)| (k, t.cast(DType::Float16)))
+        .collect();
+    let mut conv = YoloConv::empty(4, 8, 3, 1, act);
+    conv.load_state_dict(&sd, "").unwrap();
+
+    let x = Tensor::from_slice(ramp(4 * 25, 2.0, 0.1)).try_reshape([1, 4, 5, 5]).unwrap().cast(DType::Float16);
+    let y = conv.forward(&x).unwrap();
+    assert_eq!(y.dtype(), DType::Float16, "the block leaves at the stream's width");
+
+    let mut seen: HashSet<*const UOp> = HashSet::new();
+    let (mut wide, mut narrow) = (0, 0);
+    for node in y.uop().toposort() {
+        let fed = node.op().sources().iter().any(|s| seen.contains(&Arc::as_ptr(s)));
+        if !fed && !matches!(node.op(), Op::ReduceAxis(..) | Op::Reduce(..)) {
+            continue;
+        }
+        seen.insert(Arc::as_ptr(&node));
+        let Op::Cast(ops::Cast { src, dtype }) = node.op() else { continue };
+        match (src.dtype() == DType::Float16, *dtype == DType::Float16) {
+            (true, false) => wide += 1,
+            (false, true) => narrow += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((wide, narrow), (0, 1), "casts downstream of the reduce for act={act}");
+}

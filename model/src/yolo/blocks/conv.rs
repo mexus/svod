@@ -243,9 +243,23 @@ impl YoloConv {
             }
         }
         let nchw = if nhwc_in { x.try_permute(&[0, 3, 1, 2])? } else { x.clone() };
-        let y = self.conv.forward(&nchw)?;
+        // A narrow stream rounds the convolution's fp32 accumulator before the
+        // norm and the activation ever see it, and `silu` widens straight back —
+        // a round trip no rewrite may remove, because removing it changes the
+        // result. Hold the epilogue at the accumulator's width and round once,
+        // at the store, which is the order PyTorch's fused conv takes. Unlike
+        // [`Self::with_acc_dtype`] the block still *leaves* at the stream's
+        // width, so nothing downstream widens and only the store's element type
+        // is at stake.
+        let (narrow, acc) = (x.dtype(), x.dtype().math_dtype());
+        let hold = self.act && self.conv.acc_dtype.is_none() && acc != narrow;
+        let y = match hold {
+            true => self.conv.clone().with_acc_dtype(acc).forward(&nchw)?,
+            false => self.conv.forward(&nchw)?,
+        };
         let y = if self.conv.bias.is_some() { y } else { self.bn.forward(&y)? };
         let y = if self.act { y.silu()? } else { y };
+        let y = if hold { y.cast(narrow) } else { y };
         if nhwc_out {
             return Ok(y.try_permute(&[0, 2, 3, 1])?.contiguous());
         }
