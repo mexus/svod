@@ -23,9 +23,13 @@ pub struct BenchmarkConfig {
     /// threshold. Used by beam search to skip candidates clearly slower than
     /// the current best (typically `early_stop = beam[0].timing * 3`).
     pub early_stop: Option<Duration>,
-    /// Invalidate L2 between runs by streaming through a scratch buffer.
-    /// Stabilises rankings — without this, second/third runs hit hot caches
-    /// and bias beam toward smaller-tile candidates.
+    /// Evict the cache between runs by streaming through a scratch buffer, so
+    /// the second and third runs do not read a kernel's inputs hot and bias the
+    /// ranking toward smaller tiles. The buffer is *host* memory, so this only
+    /// reaches a kernel the CPU executes — `RendererDevice::
+    /// benchmark_evicts_via_host_stream` is what decides it. A GPU backend pays
+    /// the stream and keeps its device caches; where one stamps its own runs,
+    /// the probes already start each span cache-cold.
     pub clear_l2: bool,
     /// Run the kernel back to back for this long before the first timed run
     /// ([`warm_clock`]): a GPU idles at a fraction of its boost clock and takes
@@ -221,7 +225,8 @@ pub fn warmup_thread_pool() {
     rayon::join(|| (), || ());
 }
 
-/// Stream through a 16 MiB scratch buffer to evict L2 between timing runs.
+/// Stream through a 16 MiB scratch buffer to evict the *host* L2 between
+/// timing runs. This is a CPU-kernel tool; see [`BenchmarkConfig::clear_l2`].
 ///
 /// Apple M1 P-core L2 is 12 MiB, A14/M2 L2 caches are similar; 16 MiB is
 /// large enough to fully evict L2 on common Apple Silicon and x86 desktop

@@ -2033,7 +2033,7 @@ fn beam_search_optimize(
             config.warmup_budget = cold.replace(false).then_some(svod_runtime::benchmark::CLOCK_WARMUP);
             config.early_stop = early_stop
                 .map(|timing| Duration::from_nanos((timing.as_nanos() as f64 / factor).min(u64::MAX as f64) as u64));
-            config.clear_l2 = renderer.device.has_hardware_cache_invalidate();
+            config.clear_l2 = renderer.device.benchmark_evicts_via_host_stream();
             let result = unsafe {
                 svod_runtime::benchmark_kernel(
                     program.as_ref(),
