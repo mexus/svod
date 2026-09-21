@@ -177,7 +177,7 @@ fn conv_matches_the_graph_gpu(g: ConvGeom, residual: bool, dtype: DType, tol: f3
 #[test_case(SM86, geom(40, 192, 192, 3, 1), (true, true); "sm86 3x3")]
 #[test_case(SM86, geom(80, 768, 768, 3, 2), (false, true); "sm86 stride 2 stages five times the strip")]
 #[test_case(SM86, geom(40, 384, 192, 1, 1), (false, false); "sm86 1x1 has no tap to unroll")]
-#[test_case(RDNA4, geom(40, 192, 192, 3, 1), (false, true); "rdna4 has no ldmatrix")]
+#[test_case(RDNA4, geom(40, 192, 192, 3, 1), (false, false); "rdna4 has neither ldmatrix nor cp.async")]
 fn the_rewrites_are_offered(arch: GpuArch, g: ConvGeom, expected: (bool, bool)) {
     let caps = crate::ArchCaps::for_arch(arch);
     let plans = conv_candidates(&GemmPolicy::for_arch(arch), &g, &caps);
@@ -195,13 +195,19 @@ fn the_rewrites_are_offered(arch: GpuArch, g: ConvGeom, expected: (bool, bool)) 
 }
 
 /// Every plan the tuner may pick, built off the GPU: the patch fill, the
-/// gathered `ldmatrix` views of it and the scattered store all lower.
-#[test_case(geom(40, 192, 192, 3, 1), true; "3x3 with residual")]
-#[test_case(geom(20, 192, 192, 3, 1), false; "windows overhang a 20x20 image")]
-#[test_case(geom(80, 768, 768, 3, 2), false; "3x3 stride 2")]
-fn every_plan_builds(g: ConvGeom, residual: bool) {
-    let caps = crate::ArchCaps::for_arch(SM86);
-    let plans = conv_candidates(&GemmPolicy::for_arch(SM86), &g, &caps);
+/// gathered `ldmatrix` views of it and the scattered store all lower. Run per
+/// arch, because `tuned_conv_plan` builds every candidate it is offered just to
+/// fingerprint it — a plan offered on an arch whose body it cannot lower takes
+/// the process down on the *first* convolution, before anything is measured.
+#[test_case(SM86, geom(40, 192, 192, 3, 1), true; "sm86 3x3 with residual")]
+#[test_case(SM86, geom(20, 192, 192, 3, 1), false; "sm86 windows overhang a 20x20 image")]
+#[test_case(SM86, geom(80, 768, 768, 3, 2), false; "sm86 3x3 stride 2")]
+#[test_case(RDNA4, geom(40, 192, 192, 3, 1), true; "rdna4 3x3 with residual")]
+#[test_case(RDNA4, geom(20, 192, 192, 3, 1), false; "rdna4 windows overhang a 20x20 image")]
+#[test_case(RDNA4, geom(80, 768, 768, 3, 2), false; "rdna4 3x3 stride 2")]
+fn every_plan_builds(arch: GpuArch, g: ConvGeom, residual: bool) {
+    let caps = crate::ArchCaps::for_arch(arch);
+    let plans = conv_candidates(&GemmPolicy::for_arch(arch), &g, &caps);
     let (m, k, n) = g.mkn();
     let dt = DType::Float16;
     for plan in plans {
@@ -219,7 +225,8 @@ fn every_plan_builds(g: ConvGeom, residual: bool) {
 
 /// Every plan run on the device against the graph's `conv2d`. The numerics test
 /// above only ever sees the static choice (tuning is off under test), so this is
-/// what covers the image-staged kernel and the tiles the chooser passes over.
+/// what covers the tiles the chooser passes over — and, on CUDA, the
+/// image-staged kernel.
 #[test_case(geom(40, 192, 192, 3, 1), false; "3x3 stride 1")]
 #[test_case(geom(40, 192, 192, 3, 1), true; "3x3 stride 1 with residual")]
 #[test_case(geom(20, 192, 192, 3, 1), false; "windows overhang a 20x20 image")]
@@ -242,7 +249,13 @@ fn every_plan_matches_the_graph_gpu(g: ConvGeom, residual: bool) {
 
     let (m, n) = (g.mkn().0, g.mkn().2);
     let plans = conv_candidates(&GemmPolicy::for_device(&spec, arch), &g, &caps);
-    assert!(plans.iter().any(|p| matches!(p, ConvPlan::Patch(_))), "no image-staged plan to cover: {plans:?}");
+    // The image-staged plan is the reason this test exists, but it is offered
+    // only where `ldmatrix` and `cp.async` are. On an arch without them the
+    // cover is what remains: the tiles the static chooser passes over.
+    assert!(
+        caps.cuda().is_none() || plans.iter().any(|p| matches!(p, ConvPlan::Patch(_))),
+        "no image-staged plan to cover: {plans:?}"
+    );
     for plan in plans {
         let epi = Epilogue::BiasAct { bias: (), residual: residual.then_some(()), act: true };
         let cfg = plan.cfg();

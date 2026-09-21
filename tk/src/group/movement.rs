@@ -383,7 +383,8 @@ impl<'k> Group<'k> {
     }
 
     /// Whether the collaborative fill of `st` from `src` can be `cp.async`
-    /// 16-byte copies: a CUDA target, one lane's `elements_per_thread` run is
+    /// 16-byte copies: a target with an asynchronous copy
+    /// ([`crate::ArchCaps::has_async_copy`]), one lane's `elements_per_thread` run is
     /// exactly 16 bytes, no element cast, the swizzle keeps 16-byte chunks
     /// contiguous ([`crate::swizzle::Swizzle::keeps_16b_chunks`]), and every
     /// lane has its own chunk on every pass. The register-staged fill lets an
@@ -392,7 +393,7 @@ impl<'k> Group<'k> {
     /// guarantee, so a tile that does not divide into whole passes stays on
     /// the staged path.
     pub fn cp_async_fill_applies(&self, st: &ST, src: &GL) -> bool {
-        self.ker.caps.cuda().is_some()
+        self.ker.caps.has_async_copy()
             && st.base.base.elements_per_thread() * st.elem().bytes() == 16
             && src.elem() == st.elem()
             && st.base.swizzle.keeps_16b_chunks()
@@ -413,7 +414,10 @@ impl<'k> Group<'k> {
     /// are 16-byte aligned (`axis` row stride and the innermost extent multiples of
     /// the per-lane run — `D % 8 == 0` for bf16).
     pub fn cp_async_fill(&self, st: &ST, src: &GL, idxs: &[Idx], axis: usize) -> Arc<UOp> {
-        assert!(self.cp_async_fill_applies(st, src), "cp.async fill: CUDA, 16-byte lane runs, no cast, chunk swizzle");
+        assert!(
+            self.cp_async_fill_applies(st, src),
+            "cp.async fill: async-copy target, 16-byte lane runs, no cast, chunk swizzle"
+        );
         let geom = self.lds_fill_geom(st);
         let row_stride: i64 = src.shape()[axis + 1..].iter().product::<usize>() as i64;
         let inner = *src.shape().last().expect("GL rank") as i64;
@@ -457,7 +461,7 @@ impl<'k> Group<'k> {
     pub fn cp_async_fill_rows(&self, st: &ST, src: &GL, rows: impl Fn(&Arc<UOp>) -> (Arc<UOp>, Arc<UOp>)) -> Arc<UOp> {
         assert!(
             self.cp_async_fill_applies(st, src),
-            "cp.async row fill: CUDA, 16-byte lane runs, no cast, chunk swizzle"
+            "cp.async row fill: async-copy target, 16-byte lane runs, no cast, chunk swizzle"
         );
         let geom = self.lds_fill_geom(st);
         let run_bytes = geom.ept * st.elem().bytes() as i64;

@@ -152,9 +152,11 @@ pub fn conv_candidates(policy: &GemmPolicy, geom: &ConvGeom, caps: &crate::ArchC
             plans.push(ConvPlan::Gathered(cfg));
         }
         // Both rewrites exist to take the tap out of the K index, and neither has
-        // anything to take out of a 1x1. The patch is additionally read through
-        // `ldmatrix` (a lane addresses its own row), which only CUDA has.
-        if geom.kh * geom.kw > 1 {
+        // anything to take out of a 1x1. Both fill their strips with `cp.async`
+        // and have no register-staged form, so both need a target that has it
+        // ([`crate::ArchCaps::has_async_copy`]); the patch is additionally read
+        // through `ldmatrix` (a lane addresses its own row), which only CUDA has.
+        if geom.kh * geom.kw > 1 && caps.has_async_copy() {
             plans.push(ConvPlan::Tapwise(cfg));
             if caps.cuda().is_some() {
                 plans.extend(patch_candidate(geom, &cfg, caps.wave_size).map(ConvPlan::Patch));

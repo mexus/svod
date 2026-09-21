@@ -280,4 +280,19 @@ impl ArchCaps {
     pub fn needs_pipeline_commit_fence(&self) -> bool {
         self.arch.amd().is_some_and(AmdArch::is_rdna4)
     }
+
+    /// Whether a GLOBAL→LOCAL tile fill can be issued as asynchronous copies
+    /// retired as one group (`cp.async` on CUDA). A plan whose body is built
+    /// *entirely* out of those copies — the tap-unrolled and image-staged
+    /// convolutions — exists only where this holds; every other fill stages
+    /// through registers and runs anywhere. False on AMD: the `global_load_lds`
+    /// counterpart is not wired up, and a plan offered without it reaches
+    /// [`crate::Group::cp_async_fill`] and panics rather than lowering. False
+    /// on Metal, which has no counterpart at all.
+    pub fn has_async_copy(&self) -> bool {
+        match self.arch {
+            GpuArch::Cuda(_) => true,
+            GpuArch::Amd(_) | GpuArch::Metal(_) => false,
+        }
+    }
 }
