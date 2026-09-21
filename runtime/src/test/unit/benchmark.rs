@@ -127,6 +127,57 @@ fn benchmark_prefers_gpu_stamped_durations() {
     assert!(result.runs.iter().all(|run| *run == Duration::from_micros(7)), "{:?}", result.runs);
 }
 
+/// A backend that stamps its first run and then stops — the shape that would
+/// let a 7 µs device time win the minimum against 5 ms wall times taken on a
+/// different clock.
+struct FlakyStampKernel(std::sync::atomic::AtomicUsize);
+
+impl Program for FlakyStampKernel {
+    unsafe fn execute(
+        &self,
+        _buffers: &[*mut u8],
+        _vals: &[i64],
+        _global_size: Option<[usize; 3]>,
+        _local_size: Option<[usize; 3]>,
+        _wait: bool,
+    ) -> svod_device::Result<()> {
+        std::thread::sleep(Duration::from_millis(5));
+        Ok(())
+    }
+
+    unsafe fn execute_timed(
+        &self,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> svod_device::Result<Option<Duration>> {
+        unsafe { self.execute(buffers, vals, global_size, local_size, true)? };
+        let run = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((run == 0).then_some(Duration::from_micros(7)))
+    }
+
+    fn name(&self) -> &str {
+        "flaky"
+    }
+}
+
+/// One candidate is timed on one clock or the other, never a mixture: a partial
+/// stamp drops back to the wall clock for every run, because a GPU stamp is
+/// shorter than a wall time for reasons that have nothing to do with the kernel.
+#[test]
+fn benchmark_refuses_to_mix_clocks_within_a_candidate() {
+    let kernel = FlakyStampKernel(std::sync::atomic::AtomicUsize::new(0));
+    let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &BenchmarkConfig::default()) }.unwrap();
+
+    assert_eq!(result.runs.len(), 3);
+    assert!(
+        result.runs.iter().all(|run| *run >= Duration::from_millis(5)),
+        "the 7 µs stamp must not survive alongside wall times: {:?}",
+        result.runs
+    );
+}
+
 /// The clock warm-up stops the moment a dispatch fails, so a broken kernel does
 /// not burn the budget.
 #[test]

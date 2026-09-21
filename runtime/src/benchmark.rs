@@ -171,28 +171,38 @@ pub unsafe fn benchmark_kernel(
         };
     }
 
-    // Timing runs
-    let mut runs = Vec::with_capacity(config.timing_runs);
+    // Timing runs. Each keeps both clocks: a GPU stamp is the better number
+    // but is only comparable against other GPU stamps, since it excludes the
+    // submit path the wall clock holds. A backend that stamped some runs and
+    // not others would have its minimum taken from the stamped ones for that
+    // reason alone, so a partial stamp falls back to the wall clock outright.
+    let mut samples = Vec::with_capacity(config.timing_runs);
     for i in 0..config.timing_runs {
         if config.clear_l2 && i > 0 {
             invalidate_l2();
         }
-        // GPU-stamped duration when the backend has one (Metal command-buffer
-        // times); otherwise the wall clock around the synchronous dispatch.
+        // GPU-stamped duration when the backend has one (CUDA events, AMD
+        // dispatch probes, Metal command-buffer times); otherwise the wall
+        // clock around the synchronous dispatch.
         let start = Instant::now();
         let gpu = unsafe { kernel.execute_timed(buffers, vals, global_size, local_size)? };
-        runs.push(gpu.unwrap_or_else(|| start.elapsed()));
+        samples.push((gpu, start.elapsed()));
 
         // Min-of-runs early stop: abort only when the best run so far still
         // exceeds the threshold. A single jitter outlier in an otherwise
         // competitive candidate must not disqualify it — `take_minimum=true`
-        // already discards tail noise from the final result.
+        // already discards tail noise from the final result. Whether to keep
+        // going is the one decision a mixed clock may safely answer.
         if let Some(threshold) = config.early_stop
-            && runs.iter().copied().min().expect("runs non-empty after push") > threshold
+            && samples.iter().map(|&(gpu, wall)| gpu.unwrap_or(wall)).min().expect("non-empty after push") > threshold
         {
             break;
         }
     }
+    let runs: Vec<Duration> = match samples.iter().map(|&(gpu, _)| gpu).collect::<Option<Vec<_>>>() {
+        Some(stamped) => stamped,
+        None => samples.iter().map(|&(_, wall)| wall).collect(),
+    };
 
     // Calculate statistics
     let min = runs.iter().copied().min().unwrap_or(Duration::ZERO);
