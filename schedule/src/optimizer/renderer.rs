@@ -95,6 +95,25 @@ pub enum TcTilePolicy {
     },
 }
 
+/// Output elements an RDNA4 lane may hold as tensor-core accumulators.
+///
+/// gfx12 allocates VGPRs out of a 1536-register SIMD file in granules of 24,
+/// wave32, so a wave costing `v` registers leaves `1536 / (ceil(v / 24) * 24)`
+/// of the SIMD's 16 waves resident. The accumulators are f32 and live across
+/// the whole K loop, so they set the floor under `v`; the A/B fragments, the
+/// operand addresses and the pipeline sit on top of them, and a lane addresses
+/// no more than 256 VGPRs before the rest spills to scratch.
+///
+/// Swept on a Radeon RX 9070 XT (gfx1201) against YOLO26x at f16, 640, b1:
+/// 12 tensor-core tiles' worth of accumulators runs it in 6.61 ms against
+/// 12.43 for [`TcTilePolicy::FixedStep`], which sized 20 of the 196 dispatches
+/// past the ceiling and spilled 204 to 620 bytes a thread, holding them to 5
+/// resident waves of 16. The plateau runs to 120 and 128 falls off it (6.95
+/// ms, six kernels spilling again), so the budget sits at the near edge, where
+/// a kernel whose fragments and addressing cost more than a convolution's
+/// still has somewhere to put them.
+const RDNA4_LANE_ACCUM_MAX: usize = 96;
+
 /// Backend renderer capabilities.
 ///
 /// Describes what features and optimizations a particular backend supports.
@@ -223,18 +242,24 @@ impl Renderer {
     /// How the hand heuristic sizes the per-warp output tile once a tensor core
     /// has landed.
     ///
-    /// [`TcTilePolicy::LaneBudget`] is the measured policy and only the CUDA
-    /// families opt in: 128 accumulators per lane — half of the 255 registers
-    /// an NVIDIA lane addresses — is the optimum on GA106 (RTX 3060, f16 in /
-    /// f32 out `mma.sync`), where it runs GigaAM's 768->3072 projection at
-    /// 20.8 TFLOPS against 15.9 for the fixed step. Every other target keeps
-    /// [`TcTilePolicy::FixedStep`] until its register file can be measured on
-    /// hardware.
+    /// [`TcTilePolicy::LaneBudget`] is the measured policy, and a target opts in
+    /// once its register file has been measured on hardware:
+    ///
+    /// * **CUDA** — 128 accumulators per lane, half of the 255 registers an
+    ///   NVIDIA lane addresses, is the optimum on GA106 (RTX 3060, f16 in /
+    ///   f32 out `mma.sync`), where it runs GigaAM's 768->3072 projection at
+    ///   20.8 TFLOPS against 15.9 for the fixed step.
+    /// * **RDNA4** — [`RDNA4_LANE_ACCUM_MAX`].
+    ///
+    /// Everything else keeps [`TcTilePolicy::FixedStep`], which grows the tile
+    /// by the first of `[5, 4, 3, 2]` that divides each side and so is bounded
+    /// by the extents rather than by the registers they cost.
     pub fn tc_tile_policy(&self) -> TcTilePolicy {
         match self.device {
             RendererDevice::CudaSm75 | RendererDevice::CudaSm80 | RendererDevice::CudaSm89 => {
                 TcTilePolicy::LaneBudget { accum_max: 128 }
             }
+            RendererDevice::AmdRdna4 => TcTilePolicy::LaneBudget { accum_max: RDNA4_LANE_ACCUM_MAX },
             _ => TcTilePolicy::FixedStep,
         }
     }

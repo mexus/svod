@@ -577,15 +577,21 @@ fn apply_rejects_a_group_after_tensor_cores() {
     assert!(matches!(error, OptError::ValidationFailed { reason: "no grouping with tensor cores", .. }));
 }
 
-/// The tile policy is per target: only the CUDA families take the lane budget,
-/// every other backend keeps tinygrad's fixed step.
-#[test_case(Renderer::cuda(), true; "sm80 takes the lane budget")]
-#[test_case(Renderer::cuda_sm75(), true; "sm75 takes the lane budget")]
-#[test_case(Renderer::cuda_sm89(false), true; "sm89 takes the lane budget")]
-#[test_case(Renderer::metal(), false; "metal keeps the fixed step")]
-#[test_case(Renderer::amd_rdna3(), false; "rdna3 keeps the fixed step")]
-#[test_case(Renderer::amd_cdna3(), false; "cdna3 keeps the fixed step")]
-#[test_case(Renderer::intel_xe(), false; "intel xe keeps the fixed step")]
-fn tc_tile_policy_follows_the_target(renderer: Renderer, lane_budget: bool) {
-    assert_eq!(matches!(renderer.tc_tile_policy(), TcTilePolicy::LaneBudget { accum_max: 128 }), lane_budget);
+/// The tile policy is per target: a family takes the lane budget once its
+/// register file has been measured, and the rest keep tinygrad's fixed step.
+#[test_case(Renderer::cuda(), Some(128); "sm80 takes the lane budget")]
+#[test_case(Renderer::cuda_sm75(), Some(128); "sm75 takes the lane budget")]
+#[test_case(Renderer::cuda_sm89(false), Some(128); "sm89 takes the lane budget")]
+#[test_case(Renderer::amd_rdna4(), Some(96); "rdna4 takes the lane budget")]
+#[test_case(Renderer::metal(), None; "metal keeps the fixed step")]
+#[test_case(Renderer::amd_rdna3(), None; "rdna3 keeps the fixed step")]
+#[test_case(Renderer::amd_cdna3(), None; "cdna3 keeps the fixed step")]
+#[test_case(Renderer::amd_cdna4(), None; "cdna4 keeps the fixed step")]
+#[test_case(Renderer::intel_xe(), None; "intel xe keeps the fixed step")]
+fn tc_tile_policy_follows_the_target(renderer: Renderer, accum_max: Option<usize>) {
+    let budget = match renderer.tc_tile_policy() {
+        TcTilePolicy::LaneBudget { accum_max } => Some(accum_max),
+        TcTilePolicy::FixedStep => None,
+    };
+    assert_eq!(budget, accum_max);
 }

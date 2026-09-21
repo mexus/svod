@@ -152,18 +152,19 @@ fn warp_tiles(plan: &[(OptOps, Option<usize>, OptArg)]) -> usize {
         .product()
 }
 
-/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets on the
-/// RDNA4 WMMA for operands laid out `channels_last`; `None` when the shape
-/// declines the tensor core.
+/// The post-TC opt sequence a `(m1, m2, n, k, taps)` convolution gets under
+/// [`TcTilePolicy::FixedStep`] for operands laid out `channels_last`; `None`
+/// when the shape declines the tensor core. RDNA3 stands in for the step: it
+/// carries the same 16x16 WMMA as RDNA4, which now takes the lane budget.
 fn conv_plan(
     shape: (i64, i64, i64, i64, i64),
     channels_last: (bool, bool),
 ) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
-    conv_plan_on(shape, channels_last, Renderer::amd_rdna4())
+    conv_plan_on(shape, channels_last, Renderer::amd_rdna3())
 }
 
-/// [`conv_plan`] against an explicit renderer, so the CUDA `LaneBudget` tiling
-/// can be pinned beside RDNA4's fixed step.
+/// [`conv_plan`] against an explicit renderer, so a `LaneBudget` target's
+/// tiling can be pinned beside the fixed step.
 fn conv_plan_on(
     shape: (i64, i64, i64, i64, i64),
     channels_last: (bool, bool),
@@ -250,7 +251,7 @@ fn cuda_tensor_core_warp_tile(m: i64, n: i64, k: i64, expected: &[(OptOps, usize
     assert_eq!(tc_plan(m, n, k, Renderer::cuda()), expected);
 }
 
-/// Every target off CUDA keeps [`TcTilePolicy::FixedStep`], tinygrad's step:
+/// Every target off the lane budget keeps [`TcTilePolicy::FixedStep`], tinygrad's step:
 type FixedStepPlan = &'static [(OptOps, usize, usize)];
 const FIXED_STEP: &[((usize, usize), FixedStepPlan)] = &[
     ((16, 3), &[(OptOps::UPCAST, 0, 4), (OptOps::UPCAST, 1, 3)]),
@@ -270,7 +271,6 @@ const FIXED_STEP_GRID_N: [i64; 5] = [48, 320, 768, 1536, 3072];
 const FIXED_STEP_GRID_K: [i64; 3] = [320, 768, 3072];
 
 #[test_case(Renderer::amd_rdna3(), (16, 16); "rdna3 wmma")]
-#[test_case(Renderer::amd_rdna4(), (16, 16); "rdna4 wmma")]
 #[test_case(Renderer::amd_cdna3(), (16, 16); "cdna3 mfma")]
 #[test_case(Renderer::amd_cdna4(), (16, 16); "cdna4 mfma")]
 #[test_case(Renderer::metal(), (8, 8); "metal simdgroup")]
@@ -303,6 +303,39 @@ fn conv_warp_tile_grows_where_the_pricier_fragment_is_reused(
 ) {
     let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
     assert_eq!(conv_plan(PROBE_CONV, channels_last), Some(expected));
+}
+
+/// RDNA4 sizes a convolution's warp tile against the register file instead, so
+/// the layout that decides where the fixed step grows no longer decides how far:
+/// the tile comes out square under the budget whichever way the operands lie.
+///
+/// The accumulator assertion is the point of the policy: the fixed step grows M
+/// and then N by the first of `[5, 4, 3, 2]` that divides, so a lane can end up
+/// holding 25 tiles — 200 f32 accumulators on this core — with nothing in the
+/// step to stop it. That is past the 256 VGPRs a wave32 lane addresses once the
+/// fragments, the addresses and the pipeline sit on top of them, and gfx1201
+/// answers by spilling to scratch at 5 resident waves of 16.
+#[test_case(PROBE_CONV, &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 2)]; "the probe conv")]
+#[test_case((40, 40, 192, 16, 9), &[(OptOps::UPCAST, 1, 3), (OptOps::UPCAST, 1, 2)]; "the core takes the whole channel axis, the taps carry the reuse")]
+#[test_case((40, 40, 192, 16, 1), &[]; "one tap and one channel trip cannot amortise a wider tile")]
+fn rdna4_conv_warp_tile_stays_inside_the_lane_budget(
+    shape: (i64, i64, i64, i64, i64),
+    expected: &[(OptOps, usize, usize)],
+) {
+    let renderer = Renderer::amd_rdna4();
+    let TcTilePolicy::LaneBudget { accum_max } = renderer.tc_tile_policy() else { panic!("RDNA4 takes the budget") };
+    let lane_tile = renderer.tensor_cores[0].lane_tile();
+    let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
+
+    for channels_last in [(false, false), (true, true), (true, false), (false, true)] {
+        let plan = conv_plan_on(shape, channels_last, renderer.clone()).expect("the conv takes a tensor core");
+        assert_eq!(plan, expected, "{shape:?} {channels_last:?}");
+        assert!(
+            warp_tiles(&plan) * lane_tile <= accum_max,
+            "{shape:?} {channels_last:?}: {} accumulators over the {accum_max} budget",
+            warp_tiles(&plan) * lane_tile
+        );
+    }
 }
 
 /// On CUDA the warp tile is capped by the trips the accumulator is reused over,
@@ -349,7 +382,7 @@ proptest! {
             prop_assert_eq!(conv_plan(shape, channels_last), Some(plan.clone()), "the plan is a function of the shape");
             for (op, _, arg) in plan {
                 let OptArg::Int(amount) = arg else { continue };
-                prop_assert!(op != OptOps::UPCAST || amount <= Renderer::amd_rdna4().upcast_max);
+                prop_assert!(op != OptOps::UPCAST || amount <= Renderer::amd_rdna3().upcast_max);
             }
         }
     }
