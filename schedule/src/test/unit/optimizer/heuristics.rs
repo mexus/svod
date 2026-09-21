@@ -159,8 +159,18 @@ fn conv_plan(
     shape: (i64, i64, i64, i64, i64),
     channels_last: (bool, bool),
 ) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
+    conv_plan_on(shape, channels_last, Renderer::amd_rdna4())
+}
+
+/// [`conv_plan`] against an explicit renderer, so the CUDA `LaneBudget` tiling
+/// can be pinned beside RDNA4's fixed step.
+fn conv_plan_on(
+    shape: (i64, i64, i64, i64, i64),
+    channels_last: (bool, bool),
+    renderer: Renderer,
+) -> Option<Vec<(OptOps, Option<usize>, OptArg)>> {
     let (m1, m2, n, k, taps) = shape;
-    let mut scheduler = Scheduler::new(taps_conv(m1, m2, n, k, taps, channels_last), Renderer::amd_rdna4());
+    let mut scheduler = Scheduler::new(taps_conv(m1, m2, n, k, taps, channels_last), renderer);
     try_tensor_cores(&mut scheduler, &HeuristicsConfig::builder().build()).then(|| {
         scheduler
             .applied_opts
@@ -293,6 +303,33 @@ fn conv_warp_tile_grows_where_the_pricier_fragment_is_reused(
 ) {
     let expected: Vec<_> = expected.iter().map(|&(op, axis, arg)| opt(op, axis, arg)).collect();
     assert_eq!(conv_plan(PROBE_CONV, channels_last), Some(expected));
+}
+
+/// On CUDA the warp tile is capped by the trips the accumulator is reused over,
+/// and a convolution's taps are trips: they stay a loop around the WMMA while
+/// the accumulator is set up and written back once for all of them. Counting
+/// only what the core left of its own K axis divides that depth by the tap
+/// count — at `k = 16` the core consumes the whole channel axis, the cap reads
+/// `1` and the tile cannot grow at all, though nine taps of reuse sit behind it.
+///
+/// The first two rows are the regression: both returned an **empty plan** before
+/// `reduce_depth` counted the taps. The `k = 192` row is deep enough on the
+/// channel axis alone and is unchanged by the fix; the single-tap row is the
+/// control, where there is genuinely nothing to amortise and the cap must still
+/// bite.
+///
+/// The realized tile is `3` and not the `9`/`12` the growth allows because our
+/// axis choice (`bdae1883`, which offers the operands both ways round) lands a
+/// 5-extent spatial axis on N, and 5 is prime: no [`TC_GROWTH_FACTORS`] entry
+/// divides it under the cap, so N cannot grow and the tile comes out M-only.
+/// The cap itself is doing its job — `growth` is 9/12/12/1 across these rows.
+#[test_case((40, 40, 192, 16, 9), 3; "the core takes the whole channel axis, the taps carry the reuse")]
+#[test_case((40, 40, 192, 32, 9), 3; "two channel trips and nine taps")]
+#[test_case(PROBE_CONV, 3; "192 channels deep enough on their own, unchanged by the fix")]
+#[test_case((40, 40, 192, 16, 1), 1; "one tap and one channel trip cannot amortise a wider tile")]
+fn cuda_conv_warp_tile_counts_the_taps_as_reduce_trips(shape: (i64, i64, i64, i64, i64), tiles: usize) {
+    let plan = conv_plan_on(shape, (true, true), Renderer::cuda()).expect("the conv takes a tensor core");
+    assert_eq!(warp_tiles(&plan), tiles, "warp tile for {shape:?}: {plan:?}");
 }
 
 // Growing the tile along the axis that reuses the pricier operand fragment is a
