@@ -12,7 +12,8 @@ use test_case::test_case;
 
 use crate::kernels::gemm::{
     CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_128X128_RDNA4,
-    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, swiglu_pair_width,
+    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, silu,
+    swiglu_pair_width,
 };
 
 use super::device_supported;
@@ -617,4 +618,44 @@ fn staged_gemm_rdna4_fences_the_commit() {
 
     let fences = code.lines().filter(|l| l.contains("@llvm.amdgcn.sched.barrier(i32 0)") && !l.contains("declare"));
     assert_eq!(fences.count(), 1, "one commit fence per trip:\n{code}");
+}
+
+// ── The activation's width (GPU-free) ────────────────────────────────────────
+
+/// The epilogue's `silu` evaluates where [`svod_tensor::Tensor::silu`] does — at
+/// [`DType::math_dtype`], rounding once on the way out — so the kernel path and
+/// the graph path it replaces agree op for op. Every YOLO conv goes through it
+/// (`conv2d_nhwc_silu`), and left at fp16 the four roundings cost the model a
+/// P5/32 detection.
+#[test_case(DType::Float16; "fp16 widens")]
+#[test_case(DType::BFloat16; "bf16 widens")]
+fn silu_evaluates_a_narrow_operand_in_fp32(dt: DType) {
+    use svod_ir::{Op, UnaryOp};
+
+    let x = svod_ir::UOp::variable("x".into(), -8, 8, dt.clone());
+    let y = silu(&x, &dt);
+    assert_eq!(y.dtype(), dt, "silu hands back the operand's own width");
+
+    let (mut math, mut casts) = (Vec::new(), Vec::new());
+    for node in y.toposort() {
+        match node.op() {
+            Op::Unary(UnaryOp::Exp2 | UnaryOp::Reciprocal, src) => math.push(src.dtype()),
+            Op::Cast(cast) => casts.push((cast.src.dtype(), cast.dtype.clone())),
+            _ => {}
+        }
+    }
+    assert_eq!(math, [DType::Float32, DType::Float32], "exp2 and the reciprocal both belong at fp32");
+    assert_eq!(casts, [(dt.clone(), DType::Float32), (DType::Float32, dt)], "one cast in, one rounding out");
+}
+
+/// An operand that is already wide keeps the chain it had: no cast is minted, so
+/// an fp32 kernel's AST — and its cache key — is untouched.
+#[test]
+fn silu_leaves_a_wide_operand_alone() {
+    use svod_ir::Op;
+
+    let x = svod_ir::UOp::variable("x".into(), -8, 8, DType::Float32);
+    let y = silu(&x, &DType::Float32);
+    assert_eq!(y.dtype(), DType::Float32);
+    assert!(!y.toposort().iter().any(|n| matches!(n.op(), Op::Cast(..))), "fp32 silu mints a cast");
 }

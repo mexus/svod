@@ -555,13 +555,20 @@ fn col_at(ix: &Idx, w: usize) -> Idx {
     }
 }
 
-/// `x·sigmoid(x)` in `x`'s dtype, op for op as [`Tensor::silu`] builds it:
-/// `sigmoid(x) = 1/(1 + exp2(x·(−1/ln 2)))`, every step in the operand dtype.
-pub(super) fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
-    let c = |v: f64| UOp::const_(dt.clone(), ConstValue::Float(v));
+/// `x·sigmoid(x)`, op for op as [`Tensor::silu`] builds it:
+/// `sigmoid(x) = 1/(1 + exp2(x·(−1/ln 2)))`.
+///
+/// The chain runs at [`DType::math_dtype`] and rounds once on the way out, which
+/// is what `Tensor` does and what PyTorch's elementwise kernels do: a narrow
+/// operand left to round at every step costs three roundings it need not pay.
+/// Both casts are no-ops for an operand that is already wide.
+pub(crate) fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
+    let math = dt.math_dtype();
+    let x = x.cast(math.clone());
+    let c = |v: f64| UOp::const_(math.clone(), ConstValue::Float(v));
     let e = x.try_mul(&c(-1.0 / std::f64::consts::LN_2)).and_then(|s| s.try_exp2()).expect("silu: exp2");
     let sig = UOp::try_reciprocal(&c(1.0).try_add(&e).expect("silu: 1 + exp2")).expect("silu: reciprocal");
-    x.try_mul(&sig).expect("silu: x·sigmoid(x)")
+    x.try_mul(&sig).expect("silu: x·sigmoid(x)").cast(dt.clone())
 }
 
 /// Convert a finished f32 accumulator to the output dtype **in registers**, as an
