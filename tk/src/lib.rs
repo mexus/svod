@@ -76,7 +76,10 @@ pub const WARP_THREADS: usize = 64;
 const _: () = assert!(WARP_THREADS == ArchCaps::GFX942.wave_size);
 
 // ── Use the built-in kernels (Tensor in → Tensor out) ───────────────────────
-pub use kernels::conv::{CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, PatchCfg, conv2d_nhwc, select_conv_cfg};
+pub use kernels::conv::{
+    CONV_K_FLOOR, CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, PatchCfg, conv2d_nhwc, conv2d_nhwc_worth_asking,
+    select_conv_cfg,
+};
 pub use kernels::fa::{
     FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOpts, flash_attention, flash_attention_supported,
     flash_attention_tuned, flash_attention_with,

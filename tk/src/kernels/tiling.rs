@@ -129,6 +129,13 @@ const AXES: [Axis; 6] = [
 /// The block edges worth trying, coarsest last: every matrix core in tk tiles a
 /// 16-wide fragment, so these are 2-16 fragments a side.
 const EDGES: [usize; 4] = [32, 64, 128, 256];
+/// The narrowest N edge any lattice tile has: what an output-channel count must
+/// divide by to be tiled at all, on any device.
+pub const N_EDGE_MIN: usize = EDGES[0];
+/// The shallowest strip: one matrix-core fragment, 16 wide on every part tk
+/// targets, so an input-channel count that is not a multiple of it never fills a
+/// strip.
+pub const K_STEP_MIN: usize = 16;
 /// Wave-grid sides. Past four waves a side the block outgrows the tile it has
 /// to divide.
 const WAVES: [usize; 3] = [1, 2, 4];

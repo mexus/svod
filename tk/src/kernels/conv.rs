@@ -83,6 +83,53 @@ impl ConvGeom {
     }
 }
 
+/// The K below which the tap walk's per-trip index decode outweighs what the
+/// matrix core saves over the graph's own kernel, so a caller should not ask.
+/// Measured on gfx1201 under BEAM=4 against the kernel BEAM finds, in the frame:
+/// K = 288 (`32→32 k3 @160²`) loses ~29 µs a convolution, K = 864 (`96→96 k3
+/// @80²`) wins ~8 (33.9 µs against ~26), K ≥ 3456 wins outright. The floor sits
+/// between the two, at the first K a 64-channel 3x3 reaches; `benches/conv.rs`
+/// carries rows on both sides of it.
+pub const CONV_K_FLOOR: usize = 576;
+
+/// Whether [`conv2d_nhwc`] is worth asking for on the channel counts alone — the
+/// part of the decision knowable before the image is: some lattice tile tiles
+/// `cout` and strips `cin` ([`tiling::N_EDGE_MIN`], [`tiling::K_STEP_MIN`]), and
+/// `K = taps · cin` clears [`CONV_K_FLOOR`]. The device may still decline the
+/// shape at launch ([`ConvGeom::tiles`], or CUDA's fine-tile rule below); the
+/// caller then keeps its graph conv.
+pub fn conv2d_nhwc_worth_asking(cin: usize, cout: usize, taps: usize) -> bool {
+    cout.is_multiple_of(tiling::N_EDGE_MIN) && cin.is_multiple_of(tiling::K_STEP_MIN) && taps * cin >= CONV_K_FLOOR
+}
+
+/// Whether `geom`'s grid on `cfg` falls short of what `policy` wants resident.
+fn starves(policy: &GemmPolicy, geom: &ConvGeom, cfg: &GemmCfg) -> bool {
+    geom.blocks(cfg) < policy.compute_units * policy.resident
+}
+
+/// A shape only the table's fine tiles serve, on a grid that already fills the
+/// device. The fine tiles exist for a short grid — [`super::gemm::NT_32X32`] is
+/// measured winning at 75 blocks over 28 SMs and losing badly wherever the grid
+/// is wide — and there the kernel loses to the graph's own convolution outright:
+/// on sm_86, in the frame, `384→96 k3 @80²` (600 blocks) runs 320 µs against the
+/// graph's 229 and `768→96 k3 @40²` (150) 190 against 178, while `768→96 k3
+/// @20²` (39) runs 63 against 95. Such a shape is declined on the table path and
+/// the caller keeps its graph conv. A shape no table tile serves is not this
+/// case: it goes to the lattice.
+fn fine_only_on_a_wide_grid(policy: &GemmPolicy, geom: &ConvGeom) -> bool {
+    let Some(widest) = policy.tiles.first() else { return false };
+    let wide = |cfg: &GemmCfg| cfg.block_m * cfg.block_n >= widest.block_m * widest.block_n;
+    let mut fits = policy.tiles.iter().filter(|cfg| geom.tiles(cfg)).peekable();
+    fits.peek().is_some() && fits.all(|cfg| !wide(cfg) && !starves(policy, geom, cfg))
+}
+
+/// Whether the table path declines `geom` for `caps`'s family: the fine-tile
+/// rule above is CUDA's — its table was measured that way — while RDNA's tables
+/// hand every shape to the lattice walk, which measures instead.
+fn table_declines(policy: &GemmPolicy, caps: &crate::ArchCaps, geom: &ConvGeom) -> bool {
+    caps.cuda().is_some() && fine_only_on_a_wide_grid(policy, geom)
+}
+
 /// The tile for `geom` from `policy`'s table, or `None` when none tiles it:
 /// the widest tile unless its grid would not fill the device, in which case the
 /// finer ones come first, as [`GemmPolicy::cfg`] orders them. The L2 swizzle is
@@ -90,10 +137,9 @@ impl ConvGeom {
 pub fn select_conv_cfg(policy: &GemmPolicy, geom: &ConvGeom) -> Option<GemmCfg> {
     let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let widest = policy.tiles.first()?;
-    let starved = geom.blocks(widest) < policy.compute_units * policy.resident;
     let wide = |cfg: &GemmCfg| cfg.block_m * cfg.block_n >= widest.block_m * widest.block_n;
     let mut table: Vec<GemmCfg> = policy.tiles.iter().map(plain).collect();
-    if starved {
+    if starves(policy, geom, widest) {
         table.sort_by_key(wide);
     }
     table.into_iter().find(|cfg| geom.tiles(cfg))
@@ -175,6 +221,9 @@ fn conv_tile_seeds(budget: &TileBudget, policy: &GemmPolicy, dtype: &DType, geom
 /// Each gathered tile contributes its best image-staged counterpart, when it has
 /// one ([`patch_candidate`]).
 pub fn conv_candidates(policy: &GemmPolicy, geom: &ConvGeom, caps: &crate::ArchCaps) -> Vec<ConvPlan> {
+    if table_declines(policy, caps, geom) {
+        return Vec::new();
+    }
     let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let mut plans: Vec<ConvPlan> = select_conv_cfg(policy, geom).map(ConvPlan::Gathered).into_iter().collect();
     for cfg in policy.tiles.iter().map(plain).filter(|cfg| geom.tiles(cfg)) {
@@ -218,6 +267,9 @@ pub fn tuned_conv_plan(
 ) -> Option<ConvPlan> {
     let policy = GemmPolicy::for_device(spec, arch);
     let caps = crate::ArchCaps::for_arch(arch);
+    if table_declines(&policy, &caps, &geom) {
+        return None;
+    }
     let candidates = conv_candidates(&policy, &geom, &caps);
     let fallback = || select_conv_cfg(&policy, &geom).map(ConvPlan::Gathered);
     let (m, k, n) = geom.mkn();
@@ -320,7 +372,10 @@ fn choose_conv_plan(
     if crate::tune::enabled() {
         tuned_conv_plan(crate::tune::TuneStore::global(), spec, arch, dtype, geom, epi)
     } else {
-        select_conv_cfg(&GemmPolicy::for_device(spec, arch), &geom).map(ConvPlan::Gathered)
+        let policy = GemmPolicy::for_device(spec, arch);
+        (!table_declines(&policy, &crate::ArchCaps::for_arch(arch), &geom))
+            .then(|| select_conv_cfg(&policy, &geom).map(ConvPlan::Gathered))
+            .flatten()
     }
 }
 

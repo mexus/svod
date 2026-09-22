@@ -9,7 +9,8 @@ use test_case::test_case;
 
 use super::device_supported;
 use crate::kernels::conv::{
-    CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv2d_nhwc, select_conv_cfg,
+    CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv2d_nhwc, conv2d_nhwc_worth_asking,
+    select_conv_cfg,
 };
 use crate::kernels::gemm::{Epilogue, GemmPolicy};
 
@@ -46,6 +47,41 @@ fn rdna4_tiles(g: ConvGeom, served: bool) {
         assert_eq!((grid[0] * grid[1]) as usize, g.blocks(&cfg));
         assert!(grid[1] as usize * cfg.block_m >= g.mkn().0, "the grid covers every output row");
     }
+}
+
+/// The rule a caller asks before it has a device: the lattice's narrowest edges
+/// and the K floor. A 1x1 passes on K alone; whether its layout makes it worth
+/// running is the caller's knowledge, not the kernel's.
+#[test_case(96, 96, 9, true; "96 channels, K = 864")]
+#[test_case(384, 96, 9, true; "the x head's reduction")]
+#[test_case(64, 64, 9, true; "K = 576, the floor itself")]
+#[test_case(32, 32, 9, false; "K = 288 is under the floor")]
+#[test_case(48, 48, 9, false; "48 output channels miss the N edge")]
+#[test_case(16, 64, 9, false; "16 input channels: K = 144")]
+#[test_case(24, 64, 9, false; "24 input channels never fill a strip")]
+#[test_case(1536, 768, 1, true; "a 1x1 passes on K")]
+fn worth_asking_follows_the_lattice_and_the_floor(cin: usize, cout: usize, taps: usize, want: bool) {
+    assert_eq!(conv2d_nhwc_worth_asking(cin, cout, taps), want);
+}
+
+/// On CUDA a shape only the fine table tile serves is declined unless its grid
+/// starves the device (fewer blocks than the SMs keep resident): the fine tile
+/// wins there and loses to the graph's own kernel on a wide grid. A shape a
+/// wide tile also serves is never declined, and RDNA never applies the rule —
+/// its 128x64 tile is "fine" beside the 128x128 one, and backbone.1 lives on it.
+#[test_case(SM86, geom(80, 384, 96, 3, 1), false; "sm86 384-96 at 80: 600 fine blocks")]
+#[test_case(SM86, geom(40, 768, 96, 3, 1), false; "sm86 768-96 at 40: 150")]
+#[test_case(SM86, geom(20, 768, 96, 3, 1), true; "sm86 768-96 at 20: 39, starved")]
+#[test_case(SM86, geom(80, 128, 32, 3, 1), false; "sm86 the s head at 80")]
+#[test_case(SM86, geom(20, 512, 32, 3, 1), true; "sm86 the s head at 20")]
+#[test_case(SM86, geom(20, 192, 192, 3, 1), true; "sm86 a wide tile also fits")]
+#[test_case(SM86, geom(80, 96, 96, 3, 1), false; "sm86 96-96: no table tile at all, so the lattice's")]
+#[test_case(RDNA4, geom(320, 96, 192, 3, 2), true; "rdna4 keeps backbone.1 on its 128x64 tile")]
+fn the_fine_tile_is_declined_on_a_wide_grid(arch: GpuArch, g: ConvGeom, offered: bool) {
+    let (policy, caps) = (GemmPolicy::for_arch(arch), crate::ArchCaps::for_arch(arch));
+    let plans = conv_candidates(&policy, &g, &caps);
+    assert_eq!(!plans.is_empty(), offered, "{plans:?}");
+    assert!(plans.iter().all(|p| g.tiles(&p.cfg())));
 }
 
 /// The kernel builds off the GPU, on every arch of the table, with and without a
