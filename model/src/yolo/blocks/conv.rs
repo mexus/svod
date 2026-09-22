@@ -199,8 +199,12 @@ impl YoloConv {
     fn tk_operands(&self) -> Option<(&Tensor, &Tensor)> {
         let (w, bias) = (self.weight_taps.as_ref()?, self.conv.bias.as_ref()?);
         // The kernel takes the matrix core's operand dtypes and treats any other
-        // as a caller bug, so an f32 model never asks.
-        (self.tk && self.conv.groups == 1 && tensor_core_dtype(&w.dtype())).then_some((w, bias))
+        // as a caller bug, so an f32 model never asks. It also accumulates in
+        // f32 and rounds once to the *operand* dtype, with no say in the matter,
+        // so a block that asked to keep its accumulator ([`Self::with_acc_dtype`])
+        // would silently not get it: those keep the graph path.
+        (self.tk && self.conv.groups == 1 && self.conv.acc_dtype.is_none() && tensor_core_dtype(&w.dtype()))
+            .then_some((w, bias))
     }
 
     /// Accumulate the conv in `dtype` and keep the block's output there, so
