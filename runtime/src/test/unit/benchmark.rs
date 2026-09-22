@@ -26,65 +26,13 @@ impl Program for MockKernel {
 #[test]
 fn test_benchmark_basic() {
     let kernel = MockKernel { name: "test".into(), sleep_micros: 100 };
-    let config = BenchmarkConfig {
-        warmup_runs: 1,
-        timing_runs: 3,
-        take_minimum: true,
-        early_stop: None,
-        clear_l2: false,
-        warmup_budget: None,
-    };
+    let config = BenchmarkConfig { warmup_runs: 1, timing_runs: 3, take_minimum: true, clear_l2: false };
 
     let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
 
     assert_eq!(result.runs.len(), 3);
     assert!(result.min >= Duration::from_micros(100));
     assert!(result.min <= result.mean);
-}
-
-#[test]
-fn test_benchmark_early_stop() {
-    let kernel = MockKernel { name: "slow".into(), sleep_micros: 10000 };
-    let config = BenchmarkConfig {
-        warmup_runs: 0,
-        timing_runs: 5,
-        take_minimum: true,
-        early_stop: Some(Duration::from_micros(100)),
-        clear_l2: false,
-        warmup_budget: None,
-    };
-
-    let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
-
-    // Each run is ~10ms; the very first exceeds the 100µs threshold and
-    // the loop bails out, so we record exactly one run instead of five.
-    assert_eq!(result.runs.len(), 1);
-}
-
-#[test]
-fn test_benchmark_early_stop_passes_under_cutoff() {
-    let kernel = MockKernel { name: "fast".into(), sleep_micros: 50 };
-    // Wide margin: a 50us sleep can take >1ms wall on a loaded CI runner, and
-    // this test only claims that early-stop does NOT trigger under the cutoff.
-    let cutoff = Duration::from_millis(100);
-    let config = BenchmarkConfig { early_stop: Some(cutoff * 3), ..BenchmarkConfig::default() };
-
-    let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
-
-    assert_eq!(result.runs.len(), config.timing_runs);
-    assert!(result.min < cutoff);
-}
-
-#[test]
-fn test_benchmark_early_stop_aborts_over_cutoff() {
-    let kernel = MockKernel { name: "slow".into(), sleep_micros: 10000 };
-    let cutoff = Duration::from_micros(100);
-    let config = BenchmarkConfig { early_stop: Some(cutoff * 3), ..BenchmarkConfig::default() };
-
-    let result = unsafe { benchmark_kernel(&kernel, &[], &[], None, None, &config) }.unwrap();
-
-    assert_eq!(result.runs.len(), 1);
-    assert!(result.min > cutoff * 3);
 }
 
 /// A backend with GPU stamps reports the device time, not the (longer) wall
@@ -236,7 +184,7 @@ fn warm_clock_runs_until_the_time_plateaus_or_the_budget_ends() {
 #[test]
 fn round_robin_keeps_each_candidate_minimum_and_drops_failures() {
     let mut calls = Vec::new();
-    let best = round_robin_min(3, 2, |i| {
+    let best = round_robin_min(3, 2, None, |i| {
         calls.push(i);
         match (i, calls.len()) {
             (1, _) => None,
@@ -247,4 +195,35 @@ fn round_robin_keeps_each_candidate_minimum_and_drops_failures() {
     });
     assert_eq!(calls, vec![0, 1, 2, 0, 2], "candidate 1 is not retried after failing");
     assert_eq!(best, vec![Some(Duration::from_micros(6)), None, Some(Duration::from_micros(23))]);
+}
+
+/// A candidate past the early-stop bound is not run again but keeps the minimum
+/// it reached; one inside it is timed every round, and a bound never drops a
+/// candidate that fails outright from reporting nothing.
+#[test]
+fn round_robin_retires_candidates_past_the_early_stop_bound() {
+    let mut calls = Vec::new();
+    let best = round_robin_min(3, 3, Some(Duration::from_micros(10)), |i| {
+        calls.push(i);
+        match i {
+            0 => Some(Duration::from_micros(30 - calls.len() as u64)),
+            1 => Some(Duration::from_micros(8)),
+            _ => None,
+        }
+    });
+    assert_eq!(calls, vec![0, 1, 2, 1, 1], "candidate 0 is not retried after its first run exceeds the bound");
+    assert_eq!(best, vec![Some(Duration::from_micros(29)), Some(Duration::from_micros(8)), None]);
+}
+
+/// A run at the bound is a competitive run: only a minimum strictly past it
+/// retires the candidate.
+#[test]
+fn round_robin_keeps_timing_a_candidate_at_the_bound() {
+    let mut runs = 0;
+    let best = round_robin_min(1, 3, Some(Duration::from_micros(10)), |_| {
+        runs += 1;
+        Some(Duration::from_micros(10))
+    });
+    assert_eq!(runs, 3);
+    assert_eq!(best, vec![Some(Duration::from_micros(10))]);
 }

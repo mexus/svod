@@ -233,7 +233,7 @@ impl TuneStore {
                 warm_clock(CLOCK_WARMUP, || first.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos));
             }
             let time = |i: usize| launches[i].as_ref()?.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos);
-            let times: Vec<_> = round_robin_min(count, ROUNDS, time);
+            let times: Vec<_> = round_robin_min(count, ROUNDS, None, time);
             for (i, t) in times.iter().enumerate() {
                 tracing::debug!(
                     kernel = key.kernel,

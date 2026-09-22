@@ -73,6 +73,13 @@ impl CacheGuard {
     }
 }
 
+/// A per-artifact timing as the batch benchmark the searches take.
+fn each<T>(
+    mut time: impl FnMut(&T) -> Option<Duration>,
+) -> impl FnMut(&[T], Option<Duration>) -> Vec<Option<Duration>> {
+    move |batch, _| batch.iter().map(&mut time).collect()
+}
+
 /// Run `compile`/`bench` through the cached remote search.
 fn cached<T>(
     scheduler: &Scheduler,
@@ -80,7 +87,7 @@ fn cached<T>(
     identity: &str,
     fingerprint: u64,
     compile: impl FnMut(&[Vec<Opt>], &mut dyn FnMut(usize, CompiledCandidate<T>)) -> Result<(), OptError>,
-    bench: impl Fn(&T, Option<Duration>) -> Option<Duration>,
+    bench: impl FnMut(&[T], Option<Duration>) -> Vec<Option<Duration>>,
 ) -> BeamResult {
     beam_search_cached_remote(scheduler.clone(), config, identity, fingerprint, compile, bench).expect("cached")
 }
@@ -92,7 +99,7 @@ fn cached_staged<T>(
     identity: &str,
     fingerprint: u64,
     compile: impl FnMut(&[Scheduler], &mut dyn FnMut(usize, CompiledCandidate<T>)),
-    bench: impl Fn(&T, Option<Duration>) -> Option<Duration>,
+    bench: impl FnMut(&[T], Option<Duration>) -> Vec<Option<Duration>>,
 ) -> BeamResult {
     beam_search_cached_staged(scheduler.clone(), config, identity, fingerprint, compile, bench).expect("cached")
 }
@@ -184,6 +191,7 @@ fn beam_cache_key_separates_behavior_and_ignores_execution_details() {
     for (what, variant) in [
         ("compile workers", variant(BeamConfig { compile_workers: base.compile_workers + 1, ..base.clone() })),
         ("child recycling", variant(BeamConfig { max_tasks_per_child: base.max_tasks_per_child + 1, ..base.clone() })),
+        ("timing batch", variant(BeamConfig { timing_batch: base.timing_batch + 1, ..base.clone() })),
     ] {
         assert_eq!(base_key, variant, "{what} must not change the key");
     }
@@ -334,7 +342,7 @@ fn test_remote_beam_parent_tracks_only_opt_sequences() {
             }
             Ok(())
         },
-        |index, _| Some(Duration::from_nanos(10_000 - *index)),
+        each(|index| Some(Duration::from_nanos(10_000 - *index))),
     )
     .unwrap();
     assert_eq!(result.iterations, 1);
@@ -388,12 +396,12 @@ fn test_staged_beam_streams_unordered_compiles_dedups_and_serializes_timing() {
         },
         {
             let (calls, active, maximum) = (Arc::clone(&benchmark_calls), Arc::clone(&active), Arc::clone(&maximum));
-            move |artifact: &FakeArtifact, _| {
-                calls.fetch_add(1, Ordering::SeqCst);
+            move |batch: &[FakeArtifact], _| {
+                calls.fetch_add(batch.len(), Ordering::SeqCst);
                 maximum.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(1));
                 active.fetch_sub(1, Ordering::SeqCst);
-                Some(Duration::from_nanos(10_000 - artifact.index as u64))
+                batch.iter().map(|artifact| Some(Duration::from_nanos(10_000 - artifact.index as u64))).collect()
             }
         },
     )
@@ -430,7 +438,7 @@ fn test_staged_beam_cache_cold_and_warm_choose_same_winner() {
                     emit(index, compiled(plan_identity(&candidate.applied_opts), Some(1)));
                 }
             },
-            |identity, _| plan_timing(*identity),
+            each(|identity| plan_timing(*identity)),
         )
     };
     let cold = run(&scheduler);
@@ -465,7 +473,7 @@ fn test_remote_beam_cache_reuses_winner_across_parallel_and_recycling_changes() 
             identity,
             0x22,
             |candidates, emit| remote_wave(&worker, base, config, candidates, emit),
-            |artifact, _| plan_timing(*artifact),
+            each(|artifact| plan_timing(*artifact)),
         )
     };
     let cold_run = run(&cold);
@@ -490,7 +498,7 @@ fn test_remote_beam_does_not_cache_unbenchmarked_search() {
         identity,
         0x31,
         |_candidates, _emit: &mut dyn FnMut(usize, CompiledCandidate<usize>)| Ok(()),
-        |_artifact, _| Some(Duration::from_nanos(1)),
+        each(|_| Some(Duration::from_nanos(1))),
     );
     assert_eq!(failed.benchmarked, 0);
     assert_eq!(failed.timing, Duration::MAX);
@@ -506,7 +514,7 @@ fn test_remote_beam_does_not_cache_unbenchmarked_search() {
             }
             Ok(())
         },
-        |artifact, _| Some(Duration::from_nanos(10_000 - *artifact)),
+        each(|artifact| Some(Duration::from_nanos(10_000 - *artifact))),
     );
     assert!(cold.iterations > 0, "the failed search must not create a cache hit");
     assert!(cache_get(&guard.key).is_some());
@@ -529,10 +537,99 @@ fn test_remote_beam_worker_error_invalidates_cache() {
         |_candidates, _emit: &mut dyn FnMut(usize, CompiledCandidate<usize>)| {
             Err(OptError::BeamWorker { message: "disconnected".into() })
         },
-        |_artifact, _| Some(Duration::from_nanos(1)),
+        each(|_| Some(Duration::from_nanos(1))),
     );
     assert!(matches!(result, Err(OptError::BeamWorker { .. })));
     assert!(cache_get(&guard.key).is_none(), "a stale entry must be dropped when the worker fails");
+}
+
+/// A wave's unique binaries reach the backend in batches of the configured size
+/// plus the remainder, each timed once, and every batch after the first wave
+/// carries the incumbent's early-stop bound.
+#[test]
+fn candidates_are_timed_in_batches_under_one_early_stop_bound() {
+    use std::sync::{Arc, Mutex};
+    let scheduler = weak_axis_scheduler(0x2b47);
+    let config =
+        BeamConfig { beam_width: 2, timing_batch: 4, min_progress_ns: 1, disable_cache: true, ..Default::default() };
+    let base = scheduler.applied_opts.len();
+    let worker = scheduler.clone();
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let result = beam_search_remote_staged(
+        scheduler,
+        &config,
+        |candidates, emit| {
+            for (index, opts) in candidates.iter().enumerate() {
+                if apply_remote_candidate(worker.clone(), base, opts, &config).is_some() {
+                    // Deeper plans time better, so the search runs past its first wave.
+                    let depth = (opts.len() - base) as u64;
+                    emit(index, compiled(depth << 32 | index as u64, Some(1)));
+                }
+            }
+            Ok(())
+        },
+        {
+            let batches = Arc::clone(&batches);
+            move |batch: &[u64], early_stop| {
+                batches.lock().unwrap().push((batch.to_vec(), early_stop));
+                batch
+                    .iter()
+                    .map(|artifact| Some(Duration::from_nanos(1_000 - 100 * (artifact >> 32) + artifact % 3)))
+                    .collect()
+            }
+        },
+    )
+    .expect("remote beam search");
+    let batches = batches.lock().unwrap();
+    assert!(result.iterations > 1, "the fixture must run more than one wave: {}", result.iterations);
+    let timed: usize = batches.iter().map(|(batch, _)| batch.len()).sum();
+    assert_eq!(timed, result.unique_binary, "every unique binary is timed exactly once");
+    assert_eq!(result.benchmarked, result.unique_binary);
+    assert!(batches.iter().all(|(batch, _)| !batch.is_empty() && batch.len() <= config.timing_batch));
+    let full = batches.iter().filter(|(batch, _)| batch.len() == config.timing_batch).count();
+    assert!(full > 1, "a wave larger than the batch fills more than one: {batches:?}");
+    // Waves read off the bound: it moves to three times the best of everything
+    // timed before the wave, and stays for the wave's batches.
+    let timing = |artifact: u64| 1_000 - 100 * (artifact >> 32) + artifact % 3;
+    let (mut best_before, mut wave_best, mut current, mut waves) = (u64::MAX, u64::MAX, None, 0);
+    for (batch, bound) in batches.iter() {
+        if current != Some(*bound) {
+            best_before = best_before.min(wave_best);
+            wave_best = u64::MAX;
+            waves += 1;
+            let incumbent = (best_before != u64::MAX).then(|| Duration::from_nanos(best_before * 3));
+            assert_eq!(*bound, incumbent, "wave {waves} is bounded by three times its incumbent: {batches:?}");
+            current = Some(*bound);
+        }
+        wave_best = wave_best.min(batch.iter().map(|&artifact| timing(artifact)).min().expect("non-empty"));
+    }
+    assert!(waves > 1, "{batches:?}");
+}
+
+/// A member the backend answers `None` for is left out of the wave, never
+/// ranked, and the rest of its batch is unaffected.
+#[test]
+fn a_member_the_backend_cannot_time_is_left_out() {
+    let scheduler = weak_axis_scheduler(0x2b48);
+    let config = BeamConfig { min_progress_ns: 1_000_000_000, disable_cache: true, ..Default::default() };
+    let base = scheduler.applied_opts.len();
+    let worker = scheduler.clone();
+    let result = beam_search_remote_staged(
+        scheduler,
+        &config,
+        |candidates, emit| remote_wave(&worker, base, &config, candidates, emit),
+        |batch: &[u64], _| {
+            batch.iter().map(|artifact| (artifact % 2 == 1).then(|| Duration::from_nanos(1 + artifact % 97))).collect()
+        },
+    )
+    .expect("remote beam search");
+    assert!(
+        result.benchmarked > 0 && result.benchmarked < result.unique_binary,
+        "{} timed of {} unique",
+        result.benchmarked,
+        result.unique_binary
+    );
+    assert_eq!(plan_identity(&result.scheduler.applied_opts) % 2, 1, "an untimed member cannot win");
 }
 
 /// `out[row] = sum_c x[row + c]` on a GPU renderer: the matvec shape whose hand-coded
@@ -676,9 +773,9 @@ fn staged_beam_seeds_the_hand_coded_kernel() {
                 }
             }
         },
-        |identity: &u64, _early_stop| {
+        each(|identity: &u64| {
             Some(if *identity == plan_identity(&seed_opts) { Duration::from_nanos(1) } else { Duration::from_nanos(2) })
-        },
+        }),
     )
     .expect("staged beam search");
     assert!(waves.lock().unwrap()[0].contains(&seed_opts), "the seed belongs to the first wave");
@@ -710,9 +807,9 @@ fn remote_beam_replays_the_multi_opt_seed() {
             }
             Ok(())
         },
-        |identity: &u64, _early_stop| {
+        each(|identity: &u64| {
             Some(if *identity == plan_identity(&seed_opts) { Duration::from_nanos(1) } else { Duration::from_nanos(2) })
-        },
+        }),
     )
     .expect("remote beam search");
     assert!(replayed.lock().unwrap().contains(&seed_opts), "the seed must survive the worker's replay");

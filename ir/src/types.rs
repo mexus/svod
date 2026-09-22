@@ -1417,6 +1417,12 @@ impl RendererDevice {
     pub const fn benchmark_evicts_via_host_stream(&self) -> bool {
         matches!(self, Self::Cpu)
     }
+
+    /// True when the device drops its clock between dispatches and needs a
+    /// stretch of load before a timing means anything; the CPU is timed as it is.
+    pub const fn idles_its_clock(&self) -> bool {
+        !matches!(self, Self::Cpu)
+    }
 }
 
 impl core::fmt::Display for RendererDevice {

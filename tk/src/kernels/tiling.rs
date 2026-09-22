@@ -179,7 +179,7 @@ impl TileBudget {
                 warmed = true;
             }
             let time = |i: usize| launches[i].as_ref()?.dispatch_gpu_ns().ok().flatten().map(Duration::from_nanos);
-            for (i, ns) in round_robin_min(launches.len(), TUNE_ROUNDS, time).into_iter().enumerate() {
+            for (i, ns) in round_robin_min(launches.len(), TUNE_ROUNDS, None, time).into_iter().enumerate() {
                 // What the tile cost in registers and LDS beside what it cost in
                 // time: where the compiler began spilling is the step the cost
                 // model cannot see, and on AMD this is the only place it shows.

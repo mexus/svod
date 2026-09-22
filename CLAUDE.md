@@ -54,6 +54,15 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   code duplication and simplify test understanding.
 - We add test infrastructure to the `.tokeignore` file in order to understand the codebase size better.
 
+## Settled decisions
+
+- **BEAM times candidates in batches on a lifted clock** (`TimingBatch` in
+  `schedule/src/optimizer/beam.rs`; `warm_clock` + `round_robin_min` in the benchmark closure of
+  `tensor/src/realize.rs`). Timing each candidate the moment its compile lands ranks the GPU's
+  idle clock, not the kernels: a median 1.5x and up to 6x error on gfx1201, which once made
+  BEAM=8 pick a 6x slower plan. The per-batch clock lift is deliberate and not a removable
+  extra; the search is not slower with it.
+
 ## Task evaluation
 
 - `cargo fmt`, `cargo clippy` and `cargo test` should pass before I can perform review.
