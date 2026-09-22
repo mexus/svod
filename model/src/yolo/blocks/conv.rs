@@ -228,22 +228,45 @@ impl YoloConv {
     /// `x` is `[B, H, W, C]` when [`Self::nhwc_in`] holds for its dtype, else
     /// `[B, C, H, W]`; the output follows [`Self::nhwc_at`].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let cast = self.in_dtype.clone().map(|dt| x.cast(dt));
-        let y = self.forward_inner(cast.as_ref().unwrap_or(x))?;
+        self.forward_with(x, None)
+    }
+
+    /// [`Self::forward`] plus `residual`, given in the block's output layout.
+    /// Where the kernel runs and emits `[B, H, W, C]` the add rides its
+    /// epilogue — one store, instead of a kernel that reads the output back —
+    /// and everywhere else it follows the block as an elementwise op.
+    pub fn forward_residual(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        self.forward_with(x, Some(residual))
+    }
+
+    fn forward_with(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Tensor> {
+        let cast = |t: &Tensor| self.in_dtype.clone().map(|dt| t.cast(dt));
+        let (x_cast, residual_cast) = (cast(x), residual.and_then(cast));
+        let y = self.forward_inner(x_cast.as_ref().unwrap_or(x), residual_cast.as_ref().or(residual))?;
         Ok(match self.out_dtype.clone() {
             Some(dt) => y.cast(dt),
             None => y,
         })
     }
 
-    fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward_inner(&self, x: &Tensor, residual: Option<&Tensor>) -> Result<Tensor> {
         let core = tensor_core_dtype(&x.dtype());
         let (nhwc_in, nhwc_out) = (self.nhwc_in && core, self.nhwc_out && core);
+        let add = |y: Tensor, residual: Option<&Tensor>| -> Result<Tensor> {
+            Ok(match residual {
+                Some(r) => y.try_add(r)?,
+                None => y,
+            })
+        };
+        // The residual arrives in the output layout, so it is the kernel's
+        // operand exactly when the output is `[B, H, W, C]`; an NCHW one would
+        // need the copy the fusion saves, and follows the block instead.
+        let fused = residual.filter(|_| nhwc_out);
         if core && let Some((w, bias)) = self.tk_operands() {
             let (stride, pad) = (self.conv.stride.0, self.conv.padding.0.0 as usize);
             let nhwc = if nhwc_in { x.clone() } else { x.try_permute(&[0, 2, 3, 1])? };
-            if let Some(y) = svod_tk::conv2d_nhwc(&nhwc, w, bias, None, stride, pad, self.act)? {
-                return Ok(if nhwc_out { y } else { y.try_permute(&[0, 3, 1, 2])? });
+            if let Some(y) = svod_tk::conv2d_nhwc(&nhwc, w, bias, fused, stride, pad, self.act)? {
+                return if nhwc_out { Ok(y) } else { add(y.try_permute(&[0, 3, 1, 2])?, residual) };
             }
         }
         let nchw = if nhwc_in { x.try_permute(&[0, 3, 1, 2])? } else { x.clone() };
@@ -265,8 +288,9 @@ impl YoloConv {
         let y = if self.act { y.silu()? } else { y };
         let y = if hold { y.cast(narrow) } else { y };
         if nhwc_out {
-            return Ok(y.try_permute(&[0, 2, 3, 1])?.contiguous());
+            return Ok(add(y.try_permute(&[0, 2, 3, 1])?, residual)?.contiguous());
         }
+        let y = add(y, residual)?;
         if self.channels_last && core { store_channels_last(&y) } else { Ok(y) }
     }
 }

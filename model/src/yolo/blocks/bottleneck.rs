@@ -63,8 +63,9 @@ impl YoloBottleneck {
     }
 
     /// Take and return `[B, H, W, C]`, both convs on the tk kernel
-    /// ([`YoloConv::nhwc`]). The residual add is elementwise, so it needs no
-    /// layout of its own.
+    /// ([`YoloConv::nhwc`]). The residual add rides `cv2`'s epilogue
+    /// ([`YoloConv::forward_residual`]): the block's input already has the
+    /// kernel's layout, so nothing reads the output back to add it.
     pub fn nhwc(mut self) -> Self {
         // Where the kernel declines, the channels-last store still helps the
         // graph conv that runs instead, so fall back to that rather than to
@@ -80,8 +81,7 @@ impl YoloBottleneck {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let h = scoped("cv1", || self.cv1.forward(x))?;
-        let out = scoped("cv2", || self.cv2.forward(&h))?;
-        let out = if self.add { out.try_add(x)? } else { out };
+        let out = scoped("cv2", || if self.add { self.cv2.forward_residual(&h, x) } else { self.cv2.forward(&h) })?;
         if self.channels_last && tensor_core_dtype(&out.dtype()) { store_channels_last(&out) } else { Ok(out) }
     }
 }

@@ -15,4 +15,5 @@ mod pose;
 mod segment;
 mod semseg;
 mod stage_dtype;
+mod tk_gate;
 mod weight_layout;
