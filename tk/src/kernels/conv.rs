@@ -24,6 +24,7 @@ use super::gemm::{
     BOrder, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, RowSource, b_index, b_operand, b_strip,
     gemm_core_with, narrow, silu,
 };
+use super::tiling::{self, TileBudget, TripCost};
 use crate::group::{iadd, idiv, imod, imul};
 use crate::index::{Idx, cidx, load_off};
 use crate::tiles::TileLayout;
@@ -140,6 +141,35 @@ impl ConvPlan {
     }
 }
 
+/// Tiles the model offers the walk to start from. Only the best few matter —
+/// [`TileBudget::search`] reaches the rest — and every extra seed is a compile
+/// on first use.
+const CONV_SEEDS: usize = 4;
+
+/// Where the tile walk starts for `geom`: the tiles the device's own limits
+/// allow, ranked by what a kernel that rebuilds a row index per K trip pays for
+/// them ([`crate::kernels::tiling`]), followed by every tile of the family's
+/// hand table that also serves the shape.
+///
+/// The table entries are all lattice points, so keeping them adds no reach — it
+/// pins a floor. The lattice's rank is a cost model and the table was *measured*
+/// on its arch, and [`TileBudget::search`] keeps the fastest tile it ever times:
+/// seeding it with the table's answer is what makes the search's result no worse
+/// than today's by construction rather than by hope.
+fn conv_tile_seeds(budget: &TileBudget, policy: &GemmPolicy, dtype: &DType, geom: &ConvGeom) -> Vec<GemmCfg> {
+    let (m, _, n) = geom.mkn();
+    let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
+    let base = plain(policy.tiles.first().unwrap_or(&super::gemm::NT_128X64));
+    let mut seeds: Vec<GemmCfg> =
+        budget.ranked(&base, dtype.bytes(), TripCost::PerStripRow, (m, n), CONV_SEEDS, |cfg| geom.tiles(cfg)).to_vec();
+    for cfg in policy.tiles.iter().map(plain).filter(|cfg| geom.tiles(cfg)) {
+        if !seeds.contains(&cfg) {
+            seeds.push(cfg);
+        }
+    }
+    seeds
+}
+
 /// Every plan that serves `geom` on `policy`'s table, the static
 /// [`select_conv_cfg`] choice first so a table with nothing to measure keeps it.
 /// Each gathered tile contributes its best image-staged counterpart, when it has
@@ -166,9 +196,18 @@ pub fn conv_candidates(policy: &GemmPolicy, geom: &ConvGeom, caps: &crate::ArchC
     plans
 }
 
-/// [`conv_candidates`] as measured on this device ([`crate::tune`]): every plan
-/// is timed once on synthetic operands and the fastest kept in `store`; the
-/// static choice where only one fits or nothing measured.
+/// The plan for `geom` as measured on this device ([`crate::tune`]), over
+/// whichever of the two search spaces the arch actually has:
+///
+/// - **the tile**, where [`conv_candidates`] offers the gathered form alone —
+///   [`TileBudget::search`] walks the device's own lattice from
+///   [`conv_tile_seeds`], which is every AMD convolution and, on CUDA, the
+///   shapes no table tile serves;
+/// - **the form**, otherwise — each of [`conv_candidates`]'s plans timed once
+///   on synthetic operands over the family's hand table, as before.
+///
+/// Either way the winner lands in `store` and the next process starts tuned.
+/// Falls back to the static [`select_conv_cfg`] when nothing measured.
 pub fn tuned_conv_plan(
     store: &crate::tune::TuneStore,
     spec: &svod_dtype::DeviceSpec,
@@ -181,31 +220,22 @@ pub fn tuned_conv_plan(
     let caps = crate::ArchCaps::for_arch(arch);
     let candidates = conv_candidates(&policy, &geom, &caps);
     let fallback = || select_conv_cfg(&policy, &geom).map(ConvPlan::Gathered);
-    if candidates.len() < 2 {
-        return candidates.first().copied().or_else(fallback);
-    }
     let (m, k, n) = geom.mkn();
     let residual = matches!(epi, Epilogue::BiasAct { residual: Some(()), .. });
     let build = move |ker: &Kernel, plan: ConvPlan| {
         plan.build(ker, geom, dtype.clone(), epi);
         ker.finish(plan.cfg().acc_m)
     };
-    let builds = || {
-        let placeholders = || {
-            let mut sizes = vec![m * n, geom.batch * geom.h * geom.w * geom.cin, n * k, n];
-            if residual {
-                sizes.push(m * n);
-            }
-            sizes.into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dtype.clone())).collect()
-        };
-        candidates
-            .iter()
-            .map(|&plan| {
-                let (grid, block) = (plan.grid_dims(&geom), plan.cfg().threads(caps.wave_size));
-                let ker = Kernel::new("conv2d_nhwc", grid, block, placeholders(), caps);
-                crate::kernel_fingerprint(&build(&ker, plan)).digest
-            })
-            .collect()
+    let fingerprint = |plan: ConvPlan| {
+        let mut sizes = vec![m * n, geom.batch * geom.h * geom.w * geom.cin, n * k, n];
+        if residual {
+            sizes.push(m * n);
+        }
+        let placeholders =
+            sizes.into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dtype.clone())).collect();
+        let (grid, block) = (plan.grid_dims(&geom), plan.cfg().threads(caps.wave_size));
+        let ker = Kernel::new("conv2d_nhwc", grid, block, placeholders, caps);
+        crate::kernel_fingerprint(&build(&ker, plan)).digest
     };
     let shape = [
         geom.batch,
@@ -220,9 +250,7 @@ pub fn tuned_conv_plan(
         dtype.bytes(),
         epi.code(),
     ];
-    let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&candidates, dtype));
-    let compile = |i: usize| {
-        let plan = candidates[i];
+    let compile = |plan: ConvPlan| {
         let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
         let (x, w, b) = (
             operand(&[geom.batch, geom.h, geom.w, geom.cin])?,
@@ -239,7 +267,45 @@ pub fn tuned_conv_plan(
         crate::launch::compile_kernel("conv2d_nhwc_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, plan))
             .ok()
     };
-    store.select(&key, candidates.len(), builds, compile).map(|i| candidates[i]).or_else(fallback)
+
+    // The tap-unrolled and image-staged rewrites are the other half of the
+    // search space, and the product of the two searches has never been measured
+    // on any target. Where the arch offers them the form search keeps the hand
+    // table it was measured on; where the gathered form stands alone the tile is
+    // the only free variable and the lattice walk takes the table's place.
+    //
+    // That covers two cases. On AMD it is every convolution, since both rewrites
+    // fill their strips with `cp.async` ([`crate::ArchCaps::has_async_copy`]).
+    // On CUDA it is the shapes the table serves with nothing at all — `candidates`
+    // is then empty and `all` holds vacuously — so a tile the table never carried
+    // is reachable there too, without disturbing a shape it did carry.
+    if let Some(budget) = TileBudget::for_device(spec, arch)
+        && candidates.iter().all(|plan| matches!(plan, ConvPlan::Gathered(_)))
+    {
+        let seeds = conv_tile_seeds(&budget, &policy, dtype, &geom);
+        if let Some(&first) = seeds.first() {
+            let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&seeds, dtype));
+            let builds = || seeds.iter().map(|&cfg| fingerprint(ConvPlan::Gathered(cfg))).collect();
+            let search = || {
+                budget
+                    .search(&seeds, dtype.bytes(), |cfg| geom.tiles(cfg), |cfg| compile(ConvPlan::Gathered(cfg)))
+                    .map(|(cfg, ns)| (tiling::pack(&cfg), ns))
+            };
+            return store
+                .searched(&key, builds, search)
+                .map(|bits| tiling::unpack(&first, bits))
+                .filter(|cfg| geom.tiles(cfg))
+                .map(ConvPlan::Gathered)
+                .or_else(fallback);
+        }
+    }
+
+    if candidates.len() < 2 {
+        return candidates.first().copied().or_else(fallback);
+    }
+    let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&candidates, dtype));
+    let builds = || candidates.iter().map(|&plan| fingerprint(plan)).collect();
+    store.select(&key, candidates.len(), builds, |i| compile(candidates[i])).map(|i| candidates[i]).or_else(fallback)
 }
 
 /// The plan for `geom` on the device behind `spec`: measured when tuning is on
