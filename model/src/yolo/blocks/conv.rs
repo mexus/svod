@@ -141,18 +141,20 @@ impl YoloConv {
         self
     }
 
-    /// Whether [`svod_tk::conv2d_nhwc`] can serve this convolution on the
-    /// channel counts alone — the part of its tiling rule that does not depend
-    /// on the image: the output channels tile the widest N edge and the input
-    /// channels fill a K strip. A block that fails this keeps the graph path
-    /// rather than paying for a layout the kernel would decline anyway.
+    /// Whether [`svod_tk::conv2d_nhwc`] is worth asking for on the channel
+    /// counts alone — the part of the decision knowable when the model is built.
+    /// The kernel's own rule ([`svod_tk::conv2d_nhwc_worth_asking`]) says whether
+    /// a tile serves the channels and whether K is deep enough to pay for the
+    /// tap walk; this block adds what only the model knows: the kernel has no
+    /// grouped form, and a YOLO 1x1 sits at an NCHW `chunk`/`cat` edge, where
+    /// the permute into `[B, H, W, C]` costs more than the kernel saves. A block
+    /// that fails keeps the graph path rather than paying for a layout the
+    /// kernel would decline anyway.
     pub fn tk_eligible(&self) -> bool {
         self.conv.groups == 1
-            && self
-                .conv
-                .weight
-                .dims()
-                .is_ok_and(|d| d.len() == 4 && d[0].is_multiple_of(64) && d[1].is_multiple_of(32) && d[2] * d[3] > 1)
+            && self.conv.weight.dims().is_ok_and(|d| {
+                d.len() == 4 && d[2] * d[3] > 1 && svod_tk::conv2d_nhwc_worth_asking(d[1], d[0], d[2] * d[3])
+            })
     }
 
     /// Emit `[B, H, W, C]` — the tensor itself, not an NCHW view of it, which is

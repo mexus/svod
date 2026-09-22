@@ -109,15 +109,20 @@ fn the_fold_keeps_the_weight_dtype() {
     assert_eq!(folded["conv.bias"].dtype(), DType::Float16);
 }
 
-/// The tk convolution is asked for only where its tiling rule can be met on the
-/// channel counts — the part knowable when the model is built. A block that
-/// fails it keeps the graph path rather than paying for a layout change that
-/// buys nothing.
+/// The tk convolution is asked for where the kernel says it is worth asking on
+/// the channel counts — a lattice tile serves them and K clears the floor
+/// ([`svod_tk::conv2d_nhwc_worth_asking`]) — and the block is one the model
+/// routes there: dense, and not a 1x1. A block that fails keeps the graph path
+/// rather than paying for a layout change that buys nothing.
 #[test_case(192, 192, 3, true; "192 channels, 3x3")]
 #[test_case(384, 128, 3, true; "128 output channels")]
-#[test_case(96, 96, 3, false; "96 output channels miss the N edge")]
+#[test_case(96, 96, 3, true; "96 channels tile the 32-wide N edge, K = 864")]
+#[test_case(384, 96, 3, true; "the x head's reduction")]
+#[test_case(64, 64, 3, true; "the m bodies, K = 576, the floor itself")]
+#[test_case(32, 32, 3, false; "K = 288 is under the floor")]
+#[test_case(48, 48, 3, false; "48 output channels miss the N edge")]
 #[test_case(192, 192, 1, false; "a 1x1 stays on the graph")]
-#[test_case(16, 64, 3, false; "16 input channels do not fill a strip")]
+#[test_case(16, 64, 3, false; "16 input channels: K = 144")]
 fn the_tk_flag_follows_what_the_kernel_can_tile(cin: usize, cout: usize, k: usize, eligible: bool) {
     let conv = YoloConv::empty(cin, cout, k, 1, true);
     assert_eq!(conv.tk_eligible(), eligible);
