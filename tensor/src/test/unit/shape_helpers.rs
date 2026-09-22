@@ -4,7 +4,7 @@ use svod_dtype::DType;
 use svod_ir::SInt;
 use test_case::test_case;
 
-use crate::nn::{CoordinateTransformMode, ResizeMode};
+use crate::nn::{CoordinateTransformMode, NearestMode, ResizeMode};
 use crate::test::helpers::{RealizeTestExt, assert_close_f32, test_setup};
 use crate::{ErrorKind, Tensor, Variable};
 
@@ -181,28 +181,28 @@ fn unfold_reference(shape: &[usize], dim: usize, size: usize, step: usize) -> (V
     (out_shape, out)
 }
 
-/// The yolo backbone's nearest 2x upsample (gather along H then W).
-fn upsample_nearest_2x_gather(x: &Tensor) -> Tensor {
+/// The yolo backbone's nearest upsample as an explicit gather along H then W —
+/// the form `resize` emitted before the view fast path, kept as its oracle.
+fn upsample_nearest_gather(x: &Tensor, repeat: usize) -> Tensor {
     let b = x.dim(0).unwrap();
     let c = x.dim(1).unwrap();
     let h = x.dim_const(2).unwrap();
     let w = x.dim_const(3).unwrap();
+    let index =
+        |extent: usize| -> Vec<i64> { (0..extent as i64).flat_map(|v| std::iter::repeat_n(v, repeat)).collect() };
 
-    let h_idx: Vec<i64> = (0..h as i64).flat_map(|v| [v, v]).collect();
-    let w_idx: Vec<i64> = (0..w as i64).flat_map(|v| [v, v]).collect();
-
-    let h_index = Tensor::from_slice(&h_idx)
-        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(h * 2), SInt::from(1usize)])
+    let h_index = Tensor::from_slice(index(h))
+        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(h * repeat), SInt::from(1usize)])
         .unwrap()
-        .try_expand([b, c, SInt::from(h * 2), SInt::from(w)])
+        .try_expand([b, c, SInt::from(h * repeat), SInt::from(w)])
         .unwrap();
     let x = x.gather(2, &h_index).unwrap();
 
     let shape = x.shape().unwrap();
-    let w_index = Tensor::from_slice(&w_idx)
-        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(1usize), SInt::from(w * 2)])
+    let w_index = Tensor::from_slice(index(w))
+        .try_reshape([SInt::from(1usize), SInt::from(1usize), SInt::from(1usize), SInt::from(w * repeat)])
         .unwrap()
-        .try_expand([shape[0].clone(), shape[1].clone(), SInt::from(h * 2), SInt::from(w * 2)])
+        .try_expand([shape[0].clone(), shape[1].clone(), SInt::from(h * repeat), SInt::from(w * repeat)])
         .unwrap();
     x.gather(3, &w_index).unwrap()
 }
@@ -304,18 +304,47 @@ crate::codegen_tests! {
         assert!(x.unfold(1, 2, 1).is_err(), "axis out of range");
     }
 
-    #[test_case(&[1, 2, 3, 4]; "single_batch")]
-    #[test_case(&[2, 3, 2, 5]; "multi_batch")]
-    fn test_upsample_nearest_matches_gather(config, shape: &[usize]) {
+    #[test_case(&[1, 2, 3, 4], 2; "single_batch")]
+    #[test_case(&[2, 3, 2, 5], 2; "multi_batch")]
+    #[test_case(&[1, 1, 2, 3], 3; "scale_three")]
+    #[test_case(&[2, 2, 3, 2], 1; "scale_one_is_identity")]
+    fn test_upsample_nearest_matches_gather(config, shape: &[usize], repeat: usize) {
         test_setup();
         let x = iota(shape);
-        let expect = upsample_nearest_2x_gather(&x);
-        let got = x.upsample(&[2, 2], ResizeMode::Nearest).unwrap();
+        let expect = upsample_nearest_gather(&x, repeat);
+        let got = x.upsample(&[repeat, repeat], ResizeMode::Nearest).unwrap();
         assert_eq!(got.dims().unwrap(), expect.dims().unwrap());
         assert_eq!(
             got.realize_with_and(&config).as_vec::<f32>().unwrap(),
             expect.realize_with_and(&config).as_vec::<f32>().unwrap()
         );
+    }
+
+    /// `floor(o / s)` — the view the fast path substitutes — is what nearest
+    /// resize computes for only two of the (coordinate transform, rounding)
+    /// pairings. The other two here read a different input element, so they
+    /// pin that the fast path is not taken for them.
+    #[test_case(CoordinateTransformMode::HalfPixel, NearestMode::RoundPreferFloor, &[0., 0., 0., 0., 1., 1., 1., 1.]; "half_pixel_round_prefer_floor_is_the_view")]
+    #[test_case(CoordinateTransformMode::Asymmetric, NearestMode::Floor, &[0., 0., 0., 0., 1., 1., 1., 1.]; "asymmetric_floor_is_the_view")]
+    #[test_case(CoordinateTransformMode::Asymmetric, NearestMode::RoundPreferFloor, &[0., 0., 0., 1., 1., 1., 1., 1.]; "asymmetric_round_prefer_floor_is_not")]
+    #[test_case(CoordinateTransformMode::HalfPixel, NearestMode::Floor, &[0., 0., 0., 0., 0., 0., 1., 1.]; "half_pixel_floor_is_not")]
+    fn test_resize_nearest_rounding_decides_the_view(
+        config,
+        coordinate: CoordinateTransformMode,
+        nearest: NearestMode,
+        expect: &[f32],
+    ) {
+        test_setup();
+        let got = iota(&[1, 1, 1, 2])
+            .resize()
+            .scales(&[1.0, 1.0, 1.0, 4.0])
+            .mode(ResizeMode::Nearest)
+            .coordinate_transformation_mode(coordinate)
+            .nearest_mode(nearest)
+            .call()
+            .unwrap();
+        assert_eq!(got.dims().unwrap(), vec![1, 1, 1, 8]);
+        assert_eq!(got.realize_with_and(&config).as_vec::<f32>().unwrap(), expect);
     }
 
     #[test_case(&[1, 1, 3, 4]; "single_channel")]
