@@ -27,37 +27,45 @@ use svod_tensor::Tensor;
 mod common;
 use common::{bench_kernel, bench_plan, requirements_met};
 
-/// `(cin, cout, side, stride, k, label)` — one `pad = k / 2` convolution each,
-/// at batch 1; `side` is the *input* side.
+/// `(cin, cout, side, stride, k, chain, label)` — one `pad = k / 2` convolution
+/// each, at batch 1; `side` is the *input* side. `chain` says the model holds
+/// this shape's activation channels-last (inside a bottleneck chain) rather
+/// than NCHW (the downsamples, the head, the 1x1s), which decides what the
+/// graph arm is measured over.
 ///
 /// The first four are the shapes commit 7f6e8134 measured on gfx1201, so the
-/// numbers here sit beside that message's. The rest are the YOLO26-x shapes the
-/// model does not route here, largest MAC share first.
-const SHAPES: &[(usize, usize, usize, usize, usize, &str)] = &[
-    (768, 768, 80, 2, 3, "768-768-s2-80"),
-    (768, 768, 20, 1, 3, "768-768-s1-20"),
-    (384, 384, 160, 2, 3, "384-384-s2-160"),
-    (192, 192, 40, 1, 3, "192-192-s1-40"),
-    // Turned away by `cout % 64`: the C3k bottleneck body (9.3% of the x MACs)
-    // and the neck's 384-to-96 reduction (2.2%).
-    (96, 96, 80, 1, 3, "96-96-s1-80"),
-    (384, 96, 80, 1, 3, "384-96-s1-80"),
-    // Turned away by `kh * kw > 1`: the C3k2 splits and joins, 1x1 and already
-    // channels-last where they sit.
-    (1536, 768, 40, 1, 1, "1536-768-k1-40"),
-    (768, 768, 80, 1, 1, "768-768-k1-80"),
-    (1536, 384, 80, 1, 1, "1536-384-k1-80"),
-    (384, 384, 160, 1, 1, "384-384-k1-160"),
-    // The head's box branch, which asks for no tk kernel at all though its
-    // channels already pass the gate: `hb` is 64 at m/l and 96 at x.
-    (512, 64, 20, 1, 3, "512-64-s1-20"),
-    (768, 96, 20, 1, 3, "768-96-s1-20"),
-    // The same branch at n, where the feature stacks are a quarter as wide: the
-    // shallowest K in the model, and the case that says whether asking for tk in
-    // the head is safe at every scale or only where the stack is deep.
-    (64, 64, 80, 1, 3, "64-64-s1-80"),
-    (128, 64, 40, 1, 3, "128-64-s1-40"),
-    (256, 64, 20, 1, 3, "256-64-s1-20"),
+/// numbers here sit beside that message's. The rest are YOLO26 shapes on either
+/// side of the gate, largest MAC share first.
+const SHAPES: &[(usize, usize, usize, usize, usize, bool, &str)] = &[
+    (768, 768, 80, 2, 3, false, "768-768-s2-80"),
+    (768, 768, 20, 1, 3, true, "768-768-s1-20"),
+    (384, 384, 160, 2, 3, false, "384-384-s2-160"),
+    (192, 192, 40, 1, 3, true, "192-192-s1-40"),
+    // The x C3k bodies a `cout % 64` bound turned away (9.3% of the x MACs, K = 864)
+    // and the x head's 384-to-96 reduction (2.2%).
+    (96, 96, 80, 1, 3, true, "96-96-s1-80"),
+    (384, 96, 80, 1, 3, false, "384-96-s1-80"),
+    // Either side of `CONV_K_FLOOR`: the m/l bodies of backbone.2 at K = 288, which
+    // lose in the frame; the m/l bodies of backbone.4 at K = 576, the floor itself;
+    // and x's backbone.2 at 48 channels, which no tile serves at all.
+    (32, 32, 160, 1, 3, true, "32-32-s1-160"),
+    (64, 64, 80, 1, 3, true, "64-64-s1-80"),
+    (48, 48, 160, 1, 3, true, "48-48-s1-160"),
+    // Turned away by `kh * kw > 1`: the C3k2 splits and joins, 1x1 and at an NCHW
+    // `chunk`/`cat` edge where they sit.
+    (1536, 768, 40, 1, 1, false, "1536-768-k1-40"),
+    (768, 768, 80, 1, 1, false, "768-768-k1-80"),
+    (1536, 384, 80, 1, 1, false, "1536-384-k1-80"),
+    (384, 384, 160, 1, 1, false, "384-384-k1-160"),
+    // The head's box branch, `conv0` at each level: 64 wide at m/l, 96 at x.
+    (512, 64, 20, 1, 3, false, "512-64-s1-20"),
+    (768, 96, 40, 1, 3, false, "768-96-s1-40"),
+    (768, 96, 20, 1, 3, false, "768-96-s1-20"),
+    // The same branch at s, 32 wide: the shallowest grids the gate admits, and
+    // on CUDA the three levels fall on both sides of the fine-tile rule.
+    (128, 32, 80, 1, 3, false, "128-32-s1-80"),
+    (256, 32, 40, 1, 3, false, "256-32-s1-40"),
+    (512, 32, 20, 1, 3, false, "512-32-s1-20"),
 ];
 
 /// A realized random tensor on the env-selected device, at the bench dtype.
@@ -78,7 +86,7 @@ fn bench_conv2d_nhwc(c: &mut Criterion) {
     // f16 is what the YOLO path computes in; the matrix core needs it either way.
     let dtype = DType::Float16;
     let mut group = c.benchmark_group("conv2d_nhwc");
-    for &(cin, cout, side, stride, k, label) in SHAPES {
+    for &(cin, cout, side, stride, k, chain, label) in SHAPES {
         let (kh, kw, pad) = (k, k, k / 2);
         let out = (side + 2 * pad - kh) / stride + 1;
         group.throughput(Throughput::Elements(2 * (out * out * cout * kh * kw * cin) as u64));
@@ -101,16 +109,33 @@ fn bench_conv2d_nhwc(c: &mut Criterion) {
             Err(err) => panic!("conv2d_nhwc build {label}: {err}"),
         }
 
-        // Reference: the optimizer's own conv, NCHW as a model would hold it.
-        let xn = randn(&[1, cin, side, side], dtype.clone());
-        let wn = randn(&[cout, cin, kh, kw], dtype.clone());
+        // Reference: the optimizer's own conv as the model runs it — the folded
+        // bias and SiLU held at f32 and rounded once at the store — over the
+        // layout the model holds this shape in. Inside a chain the activation is
+        // channels-last (an NCHW view of `[B, H, W, C]` storage) and the weight
+        // the checkpoint's; elsewhere the activation is NCHW and the weight
+        // taps-major, as `YoloConv` stores it for a conv reading NCHW. A bare
+        // NCHW conv is 1.5x too flattering to the graph on `96-96-s1-80`.
+        let (xn, wn) = if chain {
+            let x = randn(&[1, side, side, cin], dtype.clone()).try_permute(&[0, 3, 1, 2]).expect("channels-last view");
+            (x, randn(&[cout, cin, kh, kw], dtype.clone()))
+        } else {
+            let w = randn(&[cout, kh, kw, cin], dtype.clone()).try_permute(&[0, 3, 1, 2]).expect("taps-major view");
+            (randn(&[1, cin, side, side], dtype.clone()), w)
+        };
+        let bn = randn(&[cout], dtype.clone());
         let reference = xn
             .conv2d()
             .weight(&wn)
+            .bias(&bn)
             .stride(&[stride, stride])
             .padding(&[(pad as isize, pad as isize), (pad as isize, pad as isize)])
+            .acc_dtype(DType::Float32)
             .call()
             .expect("reference conv2d")
+            .silu()
+            .expect("reference silu")
+            .cast(dtype.clone())
             .contiguous();
         let ref_plan = reference.prepare().expect("prepare reference");
         group.bench_with_input(BenchmarkId::new("generic", label), &label, |b, _| bench_plan(b, &ref_plan));
