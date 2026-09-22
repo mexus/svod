@@ -129,8 +129,10 @@ const AXES: [Axis; 6] = [
 /// The block edges worth trying, coarsest last: every matrix core in tk tiles a
 /// 16-wide fragment, so these are 2-16 fragments a side.
 const EDGES: [usize; 4] = [32, 64, 128, 256];
-/// The narrowest N edge any lattice tile has: what an output-channel count must
-/// divide by to be tiled at all, on any device.
+/// The narrowest N edge the walk is seeded from: what an output-channel count
+/// must divide by to be searched at all, on any device. A step may halve an
+/// edge once more, but no seed is narrower, and a shape without a seed is never
+/// walked.
 pub const N_EDGE_MIN: usize = EDGES[0];
 /// The shallowest strip: one matrix-core fragment, 16 wide on every part tk
 /// targets, so an input-channel count that is not a multiple of it never fills a
@@ -428,10 +430,25 @@ impl TileBudget {
         out
     }
 
-    /// Whether the tile divides into whole matrix-core fragments: the wave grid
-    /// over the block, and the strip over the core's K edge.
+    /// Whether the tile divides into whole matrix-core fragments — the wave grid
+    /// over the block, and the strip over the core's K edge — and into more than
+    /// a single one.
+    ///
+    /// A wave holding one accumulator fragment over a one-fragment strip
+    /// (`reg_m = reg_n = k_step = mma_edge`) is the one tile class the
+    /// convolution kernel computes wrong: on gfx1201 every such tile the walk
+    /// could reach for thirteen YOLO26-m shapes returned garbage (480 of 480,
+    /// relative error 0.8-1.4) while no tile outside the class did, and one of
+    /// them won the search for m's `64→64 k3 @80²` bodies and moved the model's
+    /// boxes by 16 px. The walk ranks by time alone and cannot see that. It is
+    /// also the cost model's worst tile — one matrix-core step per trip, the
+    /// maximal decode overhead — so nothing is lost by never offering it. The
+    /// kernel bug behind it is a separate item; `every_lattice_tile_matches_the_graph_gpu`
+    /// in the conv tests reproduces it.
     fn well_formed(&self, cfg: &GemmCfg) -> bool {
         let rows = cfg.warps_m * cfg.acc_m;
+        let single_fragment =
+            cfg.reg_m() == self.mma_edge && cfg.reg_n() == self.mma_edge && cfg.k_step == self.mma_edge;
         cfg.block_m.is_multiple_of(rows)
             && cfg.block_n.is_multiple_of(cfg.warps_n)
             && cfg.reg_m().is_multiple_of(self.mma_edge)
@@ -439,6 +456,7 @@ impl TileBudget {
             // The strip is reduced by whole matrix-core steps, so a `k_step`
             // under the core's K edge is not a smaller tile — it is not a tile.
             && cfg.k_step.is_multiple_of(self.mma_edge)
+            && !single_fragment
     }
 }
 

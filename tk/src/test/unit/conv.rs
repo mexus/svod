@@ -9,10 +9,11 @@ use test_case::test_case;
 
 use super::device_supported;
 use crate::kernels::conv::{
-    CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv2d_nhwc, conv2d_nhwc_worth_asking,
-    declines, select_conv_cfg,
+    CONV_SUPPORTED_ARCHS, ConvGeom, ConvPlan, build_conv, conv_candidates, conv_tile_seeds, conv2d_nhwc,
+    conv2d_nhwc_worth_asking, declines, select_conv_cfg,
 };
-use crate::kernels::gemm::{Epilogue, GemmPolicy};
+use crate::kernels::gemm::{Epilogue, GemmCfg, GemmPolicy};
+use crate::kernels::tiling::TileBudget;
 
 const RDNA4: GpuArch = GpuArch::Amd(AmdArch::Gfx1201);
 const SM86: GpuArch = GpuArch::Cuda(svod_dtype::CudaArch::from_compute_capability(8, 6));
@@ -315,4 +316,96 @@ fn every_plan_matches_the_graph_gpu(g: ConvGeom, residual: bool) {
         println!("conv2d_nhwc {plan:?}: relative error {err:e}");
         assert!(err < 4e-3, "{plan:?}: relative error {err} exceeds 4e-3");
     }
+}
+
+/// Every tile the lattice walk can reach for `g` computes what the graph does.
+/// The walk ranks by time alone ([`TileBudget::search`]), so a tile that
+/// compiles, runs fast and computes the wrong thing wins the search unopposed —
+/// which is how YOLO26-m's f16 parity broke on gfx1201 (16 px of box drift on
+/// both arms of an A/B) while x's held. This is the check the search does not
+/// make: the set reachable from the model's own seeds by one-step doublings and
+/// halvings, each tile run on the device against the graph's answer. A tile
+/// the device refuses to run is reported and not counted — the search skips it
+/// the same way.
+///
+/// ```text
+/// SVOD_DEVICE=AMD:0 cargo test --release -p svod-tk --lib every_lattice_tile -- --ignored --nocapture
+/// ```
+#[test_case(geom(80, 64, 64, 3, 1); "m bodies 64-64 at 80")]
+#[test_case(geom(40, 128, 128, 3, 1); "m bodies 128-128 at 40")]
+#[test_case(geom(20, 128, 128, 3, 1); "m backbone.8 bodies at 20")]
+#[test_case(geom(80, 256, 64, 3, 1); "m head at 80")]
+#[test_case(geom(40, 512, 64, 3, 1); "m head at 40")]
+#[test_case(geom(20, 512, 64, 3, 1); "m head at 20")]
+#[test_case(geom(20, 512, 256, 3, 1); "m neck.22 attn cv1")]
+#[test_case(geom(20, 256, 512, 3, 1); "m neck.22 attn cv2")]
+#[test_case(geom(320, 64, 128, 3, 2); "m backbone.1")]
+#[test_case(geom(160, 256, 256, 3, 2); "m backbone.3")]
+#[test_case(geom(80, 256, 256, 3, 2); "m neck.17")]
+#[test_case(geom(80, 512, 512, 3, 2); "m backbone.5")]
+#[test_case(geom(40, 512, 512, 3, 2); "m backbone.7 and neck.20")]
+#[test_case(geom(160, 64, 64, 3, 2); "n backbone.3")]
+#[test_case(geom(80, 128, 128, 3, 2); "n backbone.5")]
+#[test_case(geom(40, 128, 256, 3, 2); "n backbone.7")]
+#[test_case(geom(80, 64, 64, 3, 2); "n neck.17")]
+#[test_case(geom(40, 128, 128, 3, 2); "n neck.20")]
+#[test_case(geom(20, 128, 64, 3, 1); "n neck.22 attn cv1")]
+#[test_case(geom(20, 64, 128, 3, 1); "n neck.22 attn cv2")]
+#[ignore]
+fn every_lattice_tile_matches_the_graph_gpu(g: ConvGeom) {
+    if !device_supported(CONV_SUPPORTED_ARCHS) {
+        eprintln!("skip every_lattice_tile_matches_the_graph_gpu: no supported device / toolchain");
+        return;
+    }
+    let spec = Tensor::empty(&[1], DType::Float32).device();
+    let arch = crate::target::resolve_supported_arch(&spec, CONV_SUPPORTED_ARCHS).expect("a supported arch");
+    let caps = crate::ArchCaps::for_arch(arch);
+    let Some(budget) = TileBudget::for_device(&spec, arch) else {
+        eprintln!("skip every_lattice_tile_matches_the_graph_gpu: the device reports no limits to build a lattice on");
+        return;
+    };
+    let policy = GemmPolicy::for_device(&spec, arch);
+    let dt = DType::Float16;
+    let x = operand(&[g.batch, g.h, g.w, g.cin], dt.clone(), 0.31);
+    let w = operand(&[g.cout, g.kh, g.kw, g.cin], dt.clone(), 0.17);
+    let bias = operand(&[g.cout], dt.clone(), 0.53);
+    let want = to_f32_vec(&reference(&g, &x, &w, &bias, None));
+    let (m, n) = (g.mkn().0, g.mkn().2);
+
+    let mut tiles: Vec<GemmCfg> = conv_tile_seeds(&budget, &policy, &dt, &g);
+    let mut next = 0;
+    while next < tiles.len() {
+        for cfg in budget.neighbours(&tiles[next], dt.bytes(), |cfg| g.tiles(cfg)) {
+            if !tiles.contains(&cfg) {
+                tiles.push(cfg);
+            }
+        }
+        next += 1;
+    }
+
+    let mut wrong = Vec::new();
+    for &cfg in &tiles {
+        let plan = ConvPlan::Gathered(cfg);
+        let epi = Epilogue::BiasAct { bias: (), residual: None, act: true };
+        let mut y = Tensor::empty(&[m, n], dt.clone()).to(spec.clone());
+        let ins: Vec<&Tensor> = vec![&x, &w, &bias];
+        let (grid, block) = (plan.grid_dims(&g), cfg.threads(caps.wave_size));
+        let (geom, dtc) = (g, dt.clone());
+        let ran = crate::launch::run_kernel("conv2d_nhwc_lattice", grid, block, &mut [&mut y], &ins, move |ker| {
+            plan.build(ker, geom, dtc, epi);
+            ker.finish(cfg.acc_m)
+        });
+        match ran {
+            Ok(_) => {
+                let err = rel_err(&to_f32_vec(&y), &want);
+                println!("{} {cfg:?}: relative error {err:e}", if err < 4e-3 { "ok " } else { "BAD" });
+                if err >= 4e-3 {
+                    wrong.push((cfg, err));
+                }
+            }
+            Err(err) => println!("--- {cfg:?}: did not run: {err}"),
+        }
+    }
+    println!("{} tiles reachable for {g:?}, {} wrong", tiles.len(), wrong.len());
+    assert!(wrong.is_empty(), "tiles that compute the wrong thing: {wrong:?}");
 }

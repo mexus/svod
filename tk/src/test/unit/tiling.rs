@@ -31,6 +31,41 @@ fn rtx_3060() -> TileBudget {
     }
 }
 
+/// An RX 9070 XT (gfx1201): 64 CUs, 64 KiB of LDS a workgroup and a CU, the
+/// register file unreported, a 16-wide WMMA fragment on a 32-lane wave.
+fn rx_9070_xt() -> TileBudget {
+    TileBudget {
+        wave_size: 32,
+        limits: WorkgroupLimits {
+            max_threads: 1024,
+            shared_per_workgroup: 64 * 1024,
+            shared_per_cu: 64 * 1024,
+            registers_per_cu: None,
+        },
+        mma_edge: 16,
+        blocks_wanted: 64,
+        resident_floor: 2,
+    }
+}
+
+/// Every tile the walk can reach for `g`: the seeds and their transitive
+/// one-step neighbours, under the kernel's own tiling rule.
+fn reachable(budget: &TileBudget, g: &ConvGeom) -> Vec<GemmCfg> {
+    let (m, _, n) = g.mkn();
+    let mut tiles: Vec<GemmCfg> =
+        budget.ranked(&NT_128X64, 2, TripCost::PerStripRow, (m, n), usize::MAX, |cfg| g.tiles(cfg)).to_vec();
+    let mut next = 0;
+    while next < tiles.len() {
+        for cfg in budget.neighbours(&tiles[next], 2, |cfg| g.tiles(cfg)) {
+            if !tiles.contains(&cfg) {
+                tiles.push(cfg);
+            }
+        }
+        next += 1;
+    }
+    tiles
+}
+
 /// `(block_m, block_n, k_step)` of each candidate, in rank order, under the
 /// kernel's own tiling rule.
 fn ranked(
@@ -147,4 +182,32 @@ fn an_untileable_shape_yields_no_candidate() {
     let tiles: Vec<GemmCfg> =
         budget.ranked(&NT_128X64, 2, TripCost::PerStripRow, (m, n), 8, |cfg| cfg.tiles(m, k, n)).into_iter().collect();
     assert!(tiles.is_empty(), "expected no candidate for {m}x{k}x{n}, got {tiles:?}");
+}
+
+/// The one tile class the convolution kernel computes wrong — a wave holding a
+/// single 16x16 accumulator over a 16-deep strip — is neither seeded nor
+/// reached. On gfx1201 all 480 such tiles the walk could reach for YOLO26-m's
+/// shapes returned garbage and one of them won the search for the `64→64 k3
+/// @80²` bodies; `every_lattice_tile_matches_the_graph_gpu` is the sweep that
+/// found it, and this is what keeps it out of the walk on every device.
+#[test_case(yolo_conv(64, 64, 80, 1); "m bodies, where the search picked one")]
+#[test_case(yolo_conv(64, 64, 160, 2); "n backbone.3, where the store held one")]
+#[test_case(yolo_conv(96, 96, 80, 1); "x bodies")]
+#[test_case(yolo_conv(512, 64, 20, 1); "m head at 20, a starved grid")]
+fn the_single_fragment_tile_is_never_reached(g: ConvGeom) {
+    let single = |cfg: &GemmCfg| cfg.reg_m() == 16 && cfg.reg_n() == 16 && cfg.k_step == 16;
+    for budget in [rx_9070_xt(), rtx_3060()] {
+        let tiles = reachable(&budget, &g);
+        assert!(!tiles.is_empty(), "the walk has somewhere to start");
+        let reached: Vec<_> = tiles.iter().filter(|cfg| single(cfg)).collect();
+        assert!(reached.is_empty(), "{reached:?}");
+        // The step onto it from its nearest neighbour is the one refused: every
+        // other move from that tile still stands.
+        let from = GemmCfg { block_m: 32, block_n: 32, warps_m: 2, warps_n: 2, acc_m: 1, k_step: 32, ..NT_128X64 };
+        let moves = budget.neighbours(&from, 2, |cfg| g.tiles(cfg));
+        assert!(moves.iter().all(|cfg| !single(cfg)), "{moves:?}");
+        assert!(!moves.is_empty(), "the other moves from that tile still stand");
+        // The deeper strip stays on offer wherever the channels fill it.
+        assert_eq!(moves.iter().any(|cfg| cfg.k_step == 64), g.cin.is_multiple_of(64), "{moves:?}");
+    }
 }

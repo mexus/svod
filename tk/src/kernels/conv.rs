@@ -209,7 +209,12 @@ const CONV_SEEDS: usize = 4;
 /// on its arch, and [`TileBudget::search`] keeps the fastest tile it ever times:
 /// seeding it with the table's answer is what makes the search's result no worse
 /// than today's by construction rather than by hope.
-fn conv_tile_seeds(budget: &TileBudget, policy: &GemmPolicy, dtype: &DType, geom: &ConvGeom) -> Vec<GemmCfg> {
+pub(crate) fn conv_tile_seeds(
+    budget: &TileBudget,
+    policy: &GemmPolicy,
+    dtype: &DType,
+    geom: &ConvGeom,
+) -> Vec<GemmCfg> {
     let (m, _, n) = geom.mkn();
     let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let base = plain(policy.tiles.first().unwrap_or(&super::gemm::NT_128X64));
