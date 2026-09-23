@@ -6,12 +6,14 @@
 //! convolution shapes YOLO26-x tunes on it, whose per-candidate times were
 //! measured on the hardware.
 
+use std::time::Duration;
+
 use svod_dtype::DType;
 use test_case::test_case;
 
 use crate::kernels::conv::ConvGeom;
 use crate::kernels::gemm::{GemmCfg, NT_128X64};
-use crate::kernels::tiling::{TileBudget, TripCost};
+use crate::kernels::tiling::{TileBudget, Trial, TripCost, agreement, pack};
 use crate::target::WorkgroupLimits;
 
 /// An RTX 3060 (GA106): 28 SMs, 48 KiB of shared memory a workgroup, 100 KiB an
@@ -210,4 +212,139 @@ fn the_single_fragment_tile_is_never_reached(g: ConvGeom) {
         // The deeper strip stays on offer wherever the channels fill it.
         assert_eq!(moves.iter().any(|cfg| cfg.k_step == 64), g.cin.is_multiple_of(64), "{moves:?}");
     }
+}
+
+/// A tile whose time and answer are scripted, so the search's own walk runs
+/// without a device.
+struct Scripted {
+    ns: u64,
+    output: Option<Vec<f32>>,
+}
+
+impl Trial for Scripted {
+    fn time(&self) -> Option<Duration> {
+        Some(Duration::from_nanos(self.ns))
+    }
+
+    fn output(&self) -> Option<Vec<f32>> {
+        self.output.clone()
+    }
+}
+
+/// The answer a right tile computes, off by up to `rounding` of each value.
+fn answer(rounding: f32) -> Vec<f32> {
+    (0..256).map(|i| (i as f32 * 0.37).sin() * (1.0 + rounding * ((i % 7) as f32 - 3.0) / 3.0)).collect()
+}
+
+/// m's `64→64 k3 @80²` bodies on gfx1201, where a wrong tile once won, and
+/// the tiles the walk starts from.
+fn m_bodies() -> (TileBudget, ConvGeom, Vec<GemmCfg>) {
+    let (budget, g) = (rx_9070_xt(), yolo_conv(64, 64, 80, 1));
+    let (m, _, n) = g.mkn();
+    let seeds = budget.ranked(&NT_128X64, 2, TripCost::PerStripRow, (m, n), 4, |cfg| g.tiles(cfg)).to_vec();
+    (budget, g, seeds)
+}
+
+/// What a right tile costs: fixed by its config, never the 1 ns of `walk`'s odd one.
+fn right_ns(cfg: &GemmCfg) -> u64 {
+    1000 + (pack(cfg) % 997) as u64
+}
+
+/// The walk from `seeds` where every tile answers right, each with rounding of
+/// its own (up to 4e-3, above the 2.5e-3 the sweep saw), except `odd`: the
+/// fastest of all, answering `odd_output`.
+fn walk(seeds: &[GemmCfg], odd: GemmCfg, odd_output: Option<Vec<f32>>) -> Option<(GemmCfg, u64)> {
+    let (budget, g, _) = m_bodies();
+    budget.search(
+        seeds,
+        2,
+        agreement(&DType::Float16),
+        |cfg| g.tiles(cfg),
+        |cfg| {
+            Some(match cfg == odd {
+                true => Scripted { ns: 1, output: odd_output.clone() },
+                false => Scripted { ns: right_ns(&cfg), output: Some(answer((pack(&cfg) % 5) as f32 * 1e-3)) },
+            })
+        },
+    )
+}
+
+fn garbage() -> Vec<f32> {
+    answer(0.0).iter().map(|v| 0.2 - 0.7 * v).collect()
+}
+
+/// A tile that computes garbage faster than anything right never wins: the
+/// seeds agree on the answer without it and it is dropped. Answering right, the
+/// same tile wins, so its output is all that sinks it.
+#[test]
+fn a_fast_wrong_seed_never_wins() {
+    let (_, _, seeds) = m_bodies();
+    assert!(seeds.len() >= 3, "a majority needs rivals: {seeds:?}");
+    for odd in seeds.clone() {
+        let won = walk(&seeds, odd, Some(garbage())).expect("the right seeds agree");
+        assert!(won.0 != odd && won.1 > 1, "{odd:?} won: {won:?}");
+        assert_eq!(walk(&seeds, odd, Some(answer(0.0))), Some((odd, 1)));
+    }
+}
+
+/// The seeds' answer holds for the rest of the walk: a wrong tile one step from
+/// the fastest seed, where the walk goes next, is dropped the same way.
+#[test]
+fn a_fast_wrong_tile_met_later_is_dropped() {
+    let (budget, g, seeds) = m_bodies();
+    let fastest = *seeds.iter().min_by_key(|cfg| right_ns(cfg)).expect("seeds");
+    let odd = budget
+        .neighbours(&fastest, 2, |cfg| g.tiles(cfg))
+        .into_iter()
+        .find(|cfg| !seeds.contains(cfg))
+        .expect("a step off the seeds");
+    let won = walk(&seeds, odd, Some(garbage())).expect("the right seeds agree");
+    assert!(won.0 != odd && won.1 > 1, "{odd:?} won: {won:?}");
+    assert_eq!(walk(&seeds, odd, Some(answer(0.0))), Some((odd, 1)));
+}
+
+/// A NaN agrees with nothing, itself included — not even as the seed the
+/// ranking put first, which a tie would otherwise favour — and an output that
+/// cannot be read back is no answer either.
+#[test_case(Some(vec![f32::NAN; 256]); "NaN")]
+#[test_case(Some(vec![f32::INFINITY; 256]); "infinity")]
+#[test_case(None; "unreadable")]
+fn an_output_that_is_no_number_never_wins(odd_output: Option<Vec<f32>>) {
+    let (_, _, seeds) = m_bodies();
+    let won = walk(&seeds, seeds[0], odd_output).expect("the other seeds agree");
+    assert!(won.0 != seeds[0] && won.1 > 1, "{won:?}");
+}
+
+/// Seeds that agree on nothing leave no way to tell a right tile from a wrong
+/// one: the search gives up and the caller's static tile stands.
+#[test]
+fn seeds_that_cannot_agree_end_the_search() {
+    let (budget, g, seeds) = m_bodies();
+    let found = budget.search(
+        &seeds,
+        2,
+        agreement(&DType::Float16),
+        |cfg| g.tiles(cfg),
+        |cfg| {
+            let phase = seeds.iter().position(|seed| *seed == cfg).unwrap_or(seeds.len()) as f32;
+            Some(Scripted {
+                ns: right_ns(&cfg),
+                output: Some((0..256).map(|i| (i as f32 * 0.37 + phase).sin()).collect()),
+            })
+        },
+    );
+    assert_eq!(found, None);
+}
+
+/// The line between one answer and two sits above what rounding moves two right
+/// tiles apart (the sweep: within 2.5e-3 of the graph each, so 5e-3 of each
+/// other) and below the wrong tile class (0.78 and up), for every dtype the
+/// kernel stores, and it widens with a coarser one.
+#[test]
+fn the_agreement_line_sits_between_rounding_and_the_wrong_class() {
+    for dtype in [DType::Float16, DType::BFloat16, DType::Float32] {
+        let line = agreement(&dtype);
+        assert!(line > 5e-3 && line < 0.78, "{dtype:?}: {line}");
+    }
+    assert!(agreement(&DType::BFloat16) > agreement(&DType::Float16));
 }

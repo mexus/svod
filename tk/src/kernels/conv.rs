@@ -314,22 +314,30 @@ pub fn tuned_conv_plan(
         dtype.bytes(),
         epi.code(),
     ];
+    // One set of operands for every candidate, drawn on first use, so their
+    // outputs are one answer to check each other against.
+    let operands: OnceCell<Option<Vec<Tensor>>> = OnceCell::new();
     let compile = |plan: ConvPlan| {
-        let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
-        let (x, w, b) = (
-            operand(&[geom.batch, geom.h, geom.w, geom.cin])?,
-            operand(&[geom.cout, geom.kh, geom.kw, geom.cin])?,
-            operand(&[geom.cout])?,
-        );
-        let mut ins = vec![x, w, b];
-        if residual {
-            ins.push(operand(&[m, n])?);
-        }
-        let ins: Vec<&Tensor> = ins.iter().collect();
+        let ins = operands.get_or_init(|| {
+            let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
+            let mut shapes = vec![
+                vec![geom.batch, geom.h, geom.w, geom.cin],
+                vec![geom.cout, geom.kh, geom.kw, geom.cin],
+                vec![geom.cout],
+            ];
+            if residual {
+                shapes.push(vec![m, n]);
+            }
+            shapes.iter().map(|shape| operand(shape)).collect()
+        });
+        let ins: Vec<&Tensor> = ins.as_ref()?.iter().collect();
         let mut y = Tensor::empty(&[m, n], dtype.clone()).to(spec.clone());
         let (grid, block) = (plan.grid_dims(&geom), plan.cfg().threads(caps.wave_size));
-        crate::launch::compile_kernel("conv2d_nhwc_tune", grid, block, &mut [&mut y], &ins, move |ker| build(ker, plan))
-            .ok()
+        let launch = crate::launch::compile_kernel("conv2d_nhwc_tune", grid, block, &mut [&mut y], &ins, move |ker| {
+            build(ker, plan)
+        })
+        .ok()?;
+        Some(tiling::Launched { launch, output: y })
     };
 
     // The tap-unrolled and image-staged rewrites are the other half of the
@@ -351,8 +359,9 @@ pub fn tuned_conv_plan(
             let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&seeds, dtype));
             let builds = || seeds.iter().map(|&cfg| fingerprint(ConvPlan::Gathered(cfg))).collect();
             let search = || {
+                let (bytes, tolerance) = (dtype.bytes(), tiling::agreement(dtype));
                 budget
-                    .search(&seeds, dtype.bytes(), |cfg| geom.tiles(cfg), |cfg| compile(ConvPlan::Gathered(cfg)))
+                    .search(&seeds, bytes, tolerance, |cfg| geom.tiles(cfg), |cfg| compile(ConvPlan::Gathered(cfg)))
                     .map(|(cfg, ns)| (tiling::pack(&cfg), ns))
             };
             return store
@@ -369,7 +378,10 @@ pub fn tuned_conv_plan(
     }
     let key = crate::tune::TuneKey::new("conv2d_nhwc", spec, arch, &shape, &(&candidates, dtype));
     let builds = || candidates.iter().map(|&plan| fingerprint(plan)).collect();
-    store.select(&key, candidates.len(), builds, |i| compile(candidates[i])).map(|i| candidates[i]).or_else(fallback)
+    store
+        .select(&key, candidates.len(), builds, |i| compile(candidates[i]).map(|trial| trial.launch))
+        .map(|i| candidates[i])
+        .or_else(fallback)
 }
 
 /// The plan for `geom` on the device behind `spec`: measured when tuning is on

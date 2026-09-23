@@ -82,6 +82,10 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   and BEAM=4 is −12.4% at n, −0.7…−1.8% at s/m/l and a wash at x; the plans BEAM finds under it
   need it (replayed without it, x runs +45% with NaN boxes). The exemption is not optional:
   capped too, every tk convolution kept 132 B of its register tiles in scratch.
+- **The tk tile search times a tile only once its output agrees with its rivals'**
+  (`TileBudget::search`, `tiling::agreement`): ranked by time alone it once handed m's bodies a
+  tile that computed garbage fast (16 px of box drift). The check reads every candidate back on a
+  tune-store miss only; do not trade it for a faster first run.
 
 ## Task evaluation
 
