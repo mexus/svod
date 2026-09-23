@@ -73,6 +73,8 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   m/l and a per-site allowlist cannot tell the shapes apart, so neither replaces this. The
   96-channel bodies are a lever at BEAM=4 and a wash at BEAM=8; do not re-open them per width.
   Measured x/b1: gfx1201 4.767 → 4.515 ms (−5.3%, BEAM=4 under BEAM=8's frame), RTX 3060 −0.6%.
+  Re-checked in the frame under clang 22: a floor of 1152 loses at s/m/l/x (+1.7…+5.6%). The conv
+  bench's isolated graph arm flatters K = 864 (18 µs against 21.8 in the frame); it cannot move it.
 - **Every loop the AMD renderer emits carries `amdgpu.loop.unroll.threshold = 300`, except a loop
   whose counter indexes a register array** (`LOOP_HINT` and `register_indexing_ranges` in
   `codegen/src/llvm/amd/mod.rs`). Without the cap, AMDGPU's +200 per branch on the loop's own
