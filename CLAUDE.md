@@ -73,6 +73,15 @@ Use `/tinygrad` for comparing with Tinygrad's implementation.
   m/l and a per-site allowlist cannot tell the shapes apart, so neither replaces this. The
   96-channel bodies are a lever at BEAM=4 and a wash at BEAM=8; do not re-open them per width.
   Measured x/b1: gfx1201 4.767 → 4.515 ms (−5.3%, BEAM=4 under BEAM=8's frame), RTX 3060 −0.6%.
+- **Every loop the AMD renderer emits carries `amdgpu.loop.unroll.threshold = 300`, except a loop
+  whose counter indexes a register array** (`LOOP_HINT` and `register_indexing_ranges` in
+  `codegen/src/llvm/amd/mod.rs`). Without the cap, AMDGPU's +200 per branch on the loop's own
+  index fully unrolls a reduce loop over gated loads (a cat, padding): YOLO26-n's `neck.13.cv1`
+  became 72 WMMAs and 843 spilled VGPRs, 99 µs instead of 27, and clang 20.1.2 compiled that
+  spill into NaN — at BEAM=0 and at BEAM=4 alike, which picks the same kernel. With it, n is right
+  and BEAM=4 is −12.4% at n, −0.7…−1.8% at s/m/l and a wash at x; the plans BEAM finds under it
+  need it (replayed without it, x runs +45% with NaN boxes). The exemption is not optional:
+  capped too, every tk convolution kept 132 B of its register tiles in scratch.
 
 ## Task evaluation
 

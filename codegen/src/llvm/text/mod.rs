@@ -93,6 +93,9 @@ impl Renderer for LlvmTextRenderer {
         }
 
         let mut ctx = RenderContext::new();
+        if self.target.is_amd() {
+            ctx.set_loop_hint(amd::LOOP_HINT, amd::register_indexing_ranges(&nodes));
+        }
         let mut kernel: Vec<String> = Vec::new();
         let mut operations = Vec::new();
         let mut buffer_args: Vec<BufferArg> = Vec::new();
@@ -256,10 +259,11 @@ entry:
 }}
 
 attributes #0 = {{ {attrs} }}
-"#,
+{loop_metadata}"#,
             module_prefix = module_prefix,
             inner_params = inner_params.join(", "),
             inner_body = kernel.join("\n"),
+            loop_metadata = ctx.loop_metadata().iter().map(|line| format!("{line}\n")).collect::<String>(),
         );
 
         tracing::trace!(generated_code = ir, "llvm codegen: final generated code");

@@ -36,6 +36,18 @@ fn iota(shape: &[usize]) -> Tensor {
     Tensor::arange(0, Some(n as i64), None).unwrap().cast(DType::Float32).try_reshape(&dims).unwrap()
 }
 
+/// `len` pseudo-random values `k / den` with `|k| <= span`: on a grid f16 holds
+/// exactly, so a reference built from them has no rounding to model.
+fn grid(len: usize, seed: u64, span: i64, den: f32) -> Vec<f32> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as i64 % (2 * span + 1) - span) as f32 / den
+        })
+        .collect()
+}
+
 // =========================================================================
 // Symbolic-dim consistency matrix (no codegen)
 // =========================================================================
@@ -318,6 +330,54 @@ crate::codegen_tests! {
             got.realize_with_and(&config).as_vec::<f32>().unwrap(),
             expect.realize_with_and(&config).as_vec::<f32>().unwrap()
         );
+    }
+
+    /// YOLO26-n's two readers of the neck's upsample view, as `YoloConv` builds
+    /// them: a 1x1 convolution over `cat(up2(a), skip)` at f16 with an f32
+    /// accumulator, then bias and SiLU. On gfx1201 `neck.13.cv1`'s reduce loop
+    /// carries 48 loads gated on its own index, and LLVM's unroll boost for such
+    /// branches used to unroll it whole into a spill clang 20 miscompiled to NaN.
+    ///
+    /// Every product is a multiple of 2^-16 and every sum stays under 2^8, so the
+    /// f32 accumulation is exact in any order and only the f16 store rounds.
+    #[test_case(256, 128, 20, 128; "yolo26n_neck13")]
+    #[test_case(128, 128, 40, 64; "yolo26n_neck16")]
+    fn test_upsample_cat_conv_f16_matches_reference(config, c_up: usize, c_skip: usize, side: usize, c_out: usize) {
+        test_setup();
+        let (width, cin) = (2 * side, c_up + c_skip);
+        let pixels = width * width;
+        let (a, skip) = (grid(c_up * side * side, 1, 64, 64.0), grid(c_skip * pixels, 2, 64, 64.0));
+        let (w, b) = (grid(c_out * cin, 3, 32, 1024.0), grid(c_out, 4, 64, 64.0));
+        // f16 buffers, as the model's layers hand them over, not casts to fuse.
+        let f16 = |data: &[f32], dims: &[usize]| {
+            let t = Tensor::from_slice(data).try_reshape(dims).unwrap().cast(DType::Float16);
+            t.realize_with(&config).unwrap();
+            t
+        };
+
+        let up = f16(&a, &[1, c_up, side, side]).upsample(&[2, 2], ResizeMode::Nearest).unwrap();
+        let cat = Tensor::cat(&[&up, &f16(&skip, &[1, c_skip, width, width])], 1).unwrap();
+        let (weight, bias) = (f16(&w, &[c_out, cin, 1, 1]), f16(&b, &[c_out]));
+        let conv = cat.conv2d().weight(&weight).bias(&bias).acc_dtype(DType::Float32).call().unwrap();
+        let y = conv.silu().unwrap().cast(DType::Float16);
+        // Realized alone so the convolution stores f16, as the model's does,
+        // instead of fusing the read-back cast.
+        y.realize_with(&config).unwrap();
+        let got = y.cast(DType::Float32).realize_with_and(&config).as_vec::<f32>().unwrap();
+
+        let column = |p: usize| -> Vec<f32> {
+            let (row, col) = (p / width, p % width);
+            let up = (0..c_up).map(|c| a[(c * side + row / 2) * side + col / 2]);
+            up.chain((0..c_skip).map(|c| skip[c * pixels + p])).collect()
+        };
+        for p in 0..pixels {
+            let column = column(p);
+            for co in 0..c_out {
+                let sum = b[co] + w[co * cin..][..cin].iter().zip(&column).map(|(w, x)| w * x).sum::<f32>();
+                let (got, want) = (got[co * pixels + p], sum / (1.0 + (-sum).exp()));
+                assert!((got - want).abs() <= 2e-3 * want.abs().max(1.0), "out[{co}, {p}] = {got}, want {want}");
+            }
+        }
     }
 
     /// `floor(o / s)` — the view the fast path substitutes — is what nearest

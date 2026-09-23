@@ -1022,7 +1022,7 @@ impl CacheKey {
         let ast_hash = hasher.finish();
 
         Self {
-            schema: 13,
+            schema: 14,
             ast_hash,
             beam_width: config.beam_width,
             device: scheduler.ren.device,
