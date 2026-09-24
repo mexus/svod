@@ -27,12 +27,15 @@ pub enum Swizzle {
     Sw16x32,
     /// `ST_32X16` (bf16 XOR).
     Sw32x16,
-    /// `ST_16X16_MMA`: the 16-byte chunk index XORed with row bit 2
-    /// (`col ^= (16/itemsize)·((row/4)%2)`). Conflict-free for the `mma.sync`
-    /// fragment gather (per register a warp touches 8 rows × one 16-byte chunk:
-    /// unswizzled rows `r` and `r+4` share banks in a 32-byte row), for
-    /// `ldmatrix` (the same 8-row × 16-byte phase) and for 16-byte `cp.async`
-    /// writers; 16-byte groups stay contiguous.
+    /// `ST_16X16_MMA` and its wider-row kin: the 16-byte chunk index XORed with
+    /// the row's position among the rows that share a 128-byte bank line —
+    /// `chunk ^= (row / (8/C)) % C` for `C` chunks a row (2 at 16 bf16 columns,
+    /// i.e. `col ^= 8·((row/4)%2)`; 4 and 8 for 64- and 128-byte rows).
+    /// Conflict-free for the `mma.sync` fragment gather (per register a warp
+    /// touches 8 rows × one 16-byte chunk: unswizzled, rows `r` and `r + 8/C`
+    /// share banks), for `ldmatrix` (the same 8-row × 16-byte phase) and for
+    /// 16-byte `cp.async` writers, which cover `8/C` whole rows per 8 lanes;
+    /// 16-byte groups stay contiguous.
     Sw16x16Mma,
 }
 
@@ -105,12 +108,16 @@ impl Swizzle {
             Swizzle::Identity => (row, col),
             Swizzle::Sw16x16Mma => {
                 let chunk = 16 / scalar.bytes() as i64;
+                let chunks = cols as i64 / chunk;
                 assert!(
-                    chunk < cols as i64,
-                    "Sw16x16Mma needs two 16-byte chunks per row; {cols} {scalar:?} columns are {} bytes",
+                    [2, 4, 8].contains(&chunks) && cols as i64 % chunk == 0,
+                    "Sw16x16Mma needs 2, 4 or 8 16-byte chunks per row; {cols} {scalar:?} columns are {} bytes",
                     cols * scalar.bytes()
                 );
-                (row.clone(), col.xor(&row.shr(&cidx(2)).mod_(&cidx(2)).mul(&cidx(chunk))))
+                // Rows sharing a 128-byte bank line: 8/C, a power of two.
+                let line_rows = 8 / chunks;
+                let line = if line_rows == 1 { row.clone() } else { row.shr(&cidx(line_rows.ilog2() as i64)) };
+                (row.clone(), col.xor(&line.mod_(&cidx(chunks)).mul(&cidx(chunk))))
             }
             Swizzle::Sw16x16 | Swizzle::Sw32x32 | Swizzle::Sw16x32 | Swizzle::Sw32x16 => {
                 let cols_i = cols as i64;

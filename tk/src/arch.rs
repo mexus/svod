@@ -44,7 +44,7 @@ use svod_dtype::{AmdArch, CudaArch, GpuArch};
 use crate::tiles::{
     RT_8X8_SIMD, RT_8X8_SIMD_T, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_MMA_HALVES, RT_16X16_W32_ACC,
     RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_8X8, ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED,
-    ST_16X16_SWIZZLED_W32, STBaseShape,
+    ST_16X16_SWIZZLED_W32, ST_16X32_MMA, ST_16X64_MMA, STBaseShape,
 };
 
 /// Logical role of a 16×16 matrix-core fragment, independent of arch packing.
@@ -220,6 +220,19 @@ impl ArchCaps {
     /// bank conflicts (the matmul A/B strips). `None` where [`Self::frag`] is.
     pub fn shared_swizzled(&self) -> Option<STBaseShape> {
         self.shared_strip(true)
+    }
+
+    /// The strip for `cols`-wide rows of a `bytes`-wide element that are only ever
+    /// read by whole rows (every [`crate::ST::subtile`] of it spans its full width):
+    /// on CUDA, where a row of 64 or 128 bytes is one base tile ([`ST_16X32_MMA`],
+    /// [`ST_16X64_MMA`]), so the `cp.async` fill writes each row contiguously; the
+    /// swizzled strip ([`Self::shared_swizzled`]) everywhere else.
+    pub fn shared_rows(&self, cols: usize, bytes: usize) -> Option<STBaseShape> {
+        match (self.arch, cols * bytes) {
+            (GpuArch::Cuda(_), 64) if bytes == 2 && self.has_matrix_core_layouts() => Some(ST_16X32_MMA),
+            (GpuArch::Cuda(_), 128) if bytes == 2 && self.has_matrix_core_layouts() => Some(ST_16X64_MMA),
+            _ => self.shared_swizzled(),
+        }
     }
 
     fn shared_strip(&self, swizzled: bool) -> Option<STBaseShape> {

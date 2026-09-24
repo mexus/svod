@@ -5,6 +5,7 @@ use std::sync::Arc;
 use svod_dtype::{DType, ScalarDType};
 use svod_ir::uop::eval::eval_binary_op;
 use svod_ir::{ConstValue, Op, UOp};
+use test_case::test_case;
 
 use crate::swizzle::Swizzle;
 use crate::tiles::ST_16X16;
@@ -96,10 +97,48 @@ fn test_sw16x16_mma_conflict_free() {
     }
 }
 
+/// On a row of `C` 16-byte chunks (16, 32 or 64 16-bit columns: the fragment-wide
+/// strip and the full-row GEMM strips) the chunk swizzle keeps the row and every
+/// chunk whole, and both 128-byte phases a warp issues land on the 8 distinct
+/// 16-byte bank slots of a line: an `ldmatrix` phase (8 consecutive rows, one
+/// logical chunk) and a `cp.async` phase (8 consecutive lanes filling `8/C` whole
+/// rows, chunk by chunk).
+#[test_case(16; "32-byte rows")]
+#[test_case(32; "64-byte rows")]
+#[test_case(64; "128-byte rows")]
+fn chunk_swizzle_phases_are_conflict_free(cols: usize) {
+    let cidx = |v: usize| UOp::index_const(v as i64);
+    let chunks = cols / 8;
+    // The 16-byte bank slot of logical chunk `c` of row `r`.
+    let slot = |r: usize, c: usize| {
+        let at = |e: usize| {
+            let (srow, scol) = Swizzle::Sw16x16Mma.swizzle_rc(cidx(r), cidx(8 * c + e), cols, ScalarDType::BFloat16);
+            assert_eq!(eval_const(&srow), r as i64, "the chunk swizzle keeps the row");
+            eval_const(&scol) as usize
+        };
+        let first = at(0);
+        assert_eq!(first % 8, 0, "row {r} chunk {c} stays 16-byte aligned");
+        assert!((1..8).all(|e| at(e) == first + e), "row {r} chunk {c} stays contiguous");
+        (r * cols + first) / 8 % 8
+    };
+    let distinct = |slots: Vec<usize>| slots.iter().collect::<std::collections::HashSet<_>>().len();
+    for r0 in (0..16).step_by(8) {
+        for c in 0..chunks {
+            assert_eq!(distinct((0..8).map(|i| slot(r0 + i, c)).collect()), 8, "ldmatrix rows {r0}.. chunk {c}");
+        }
+    }
+    for r0 in (0..16).step_by(8 / chunks) {
+        let lanes = (0..8).map(|l| slot(r0 + l / chunks, l % chunks)).collect();
+        assert_eq!(distinct(lanes), 8, "cp.async from row {r0}");
+    }
+}
+
 #[test]
 fn test_swizzle_is_bijection() {
     assert_bijection(Swizzle::Sw16x16, 16, 16, ScalarDType::BFloat16);
     assert_bijection(Swizzle::Sw16x16Mma, 16, 16, ScalarDType::BFloat16);
+    assert_bijection(Swizzle::Sw16x16Mma, 16, 32, ScalarDType::BFloat16);
+    assert_bijection(Swizzle::Sw16x16Mma, 16, 64, ScalarDType::BFloat16);
     assert_bijection(Swizzle::Sw16x16Mma, 16, 16, ScalarDType::Float32);
     assert_bijection(Swizzle::Sw32x32, 32, 32, ScalarDType::BFloat16);
     assert_bijection(Swizzle::Sw16x32, 16, 32, ScalarDType::BFloat16);

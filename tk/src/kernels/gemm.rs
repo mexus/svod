@@ -354,9 +354,14 @@ pub fn gemm_core_with(
     let in_dt = a_gl.elem().clone();
 
     // A strip [block_m × k_step]; B strip per `b_order`; both XOR-swizzled, and
-    // `stages`-deep when the pipeline runs.
-    let a_smem = ker.shared_sw_stages((cfg.block_m, k_step), in_dt.clone(), TileLayout::Row, cfg.stages);
-    let b_smem = ker.shared_sw_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages);
+    // `stages`-deep when the pipeline runs. A strip the waves take by row bands
+    // (A always, B when it arrives `[N, K]`) is laid out in whole rows where the
+    // arch has such a strip, so each row's fill lands contiguously.
+    let a_smem = ker.shared_rows_stages((cfg.block_m, k_step), in_dt.clone(), TileLayout::Row, cfg.stages);
+    let b_smem = match cfg.b_order {
+        BOrder::Nk => ker.shared_rows_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages),
+        BOrder::Kn => ker.shared_sw_stages(b_strip(&cfg), in_dt.clone(), TileLayout::Row, cfg.stages),
+    };
 
     let (row, col) = block_coords(ker, m, n, &cfg); // (pid_m, pid_n) in block units
     let warp_row = g.warp_row();

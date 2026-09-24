@@ -167,6 +167,16 @@ pub const RT_16X16_GFX12: RTBaseShape = RTBaseShape {
 /// swizzled conflict-free for the m16n8k16 gather ([`Swizzle::Sw16x16Mma`]).
 pub const ST_16X16_MMA: STBaseShape =
     STBaseShape { base: BaseShape { rows: 16, cols: 16, ept: 8 }, swizzle: Swizzle::Sw16x16Mma };
+/// The warp32 strip whose base tile spans a whole 64-byte row (32 16-bit
+/// columns): a row's four 16-byte `cp.async` chunks land side by side instead of
+/// in two base tiles 512 bytes apart, and the chunk swizzle keeps the
+/// `ldmatrix` phase conflict-free. For a strip read only by whole rows — a
+/// [`crate::ST::subtile`] along its rows — see [`crate::ArchCaps::shared_rows`].
+pub const ST_16X32_MMA: STBaseShape =
+    STBaseShape { base: BaseShape { rows: 16, cols: 32, ept: 8 }, swizzle: Swizzle::Sw16x16Mma };
+/// [`ST_16X32_MMA`] for 128-byte rows (64 16-bit columns).
+pub const ST_16X64_MMA: STBaseShape =
+    STBaseShape { base: BaseShape { rows: 16, cols: 64, ept: 8 }, swizzle: Swizzle::Sw16x16Mma };
 /// warp32 `mma.sync` fragment: the B-position operand and the f32 accumulator.
 /// Under tk's `Col` accumulator the B-position tile is the core's A operand,
 /// read as one run of all four pairs.

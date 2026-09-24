@@ -10,7 +10,9 @@ use svod_dtype::{CudaArch, DType, DeviceSpec, GpuArch};
 use svod_ir::{ConstValue, Op, UOp};
 use test_case::test_case;
 
-use crate::tiles::{RT_16X16_MMA, RT_16X16_MMA_HALVES, RTBaseShape, ST_16X16_MMA, TileLayout};
+use crate::tiles::{
+    RT_16X16_MMA, RT_16X16_MMA_HALVES, RTBaseShape, ST_16X16_MMA, ST_16X32_MMA, ST_16X64_MMA, STBaseShape, TileLayout,
+};
 use crate::{ArchCaps, Kernel, MoveIdx};
 use svod_ir::ops;
 
@@ -52,14 +54,19 @@ fn word_of(store: &Arc<UOp>) -> usize {
 /// four `ldmatrix.x4` (plain when the layouts agree, `.trans` when they differ), and
 /// result `i` of each lands in register pair `feed[i]`: the order the core reads
 /// the fragment's pairs in.
-#[test_case(TileLayout::Row, RT_16X16_MMA, false; "row gather")]
-#[test_case(TileLayout::Col, RT_16X16_MMA, true; "col gather is ldsm4t")]
-#[test_case(TileLayout::Row, RT_16X16_MMA_HALVES, false; "row gather in n-halves")]
-#[test_case(TileLayout::Col, RT_16X16_MMA_HALVES, true; "col gather in n-halves")]
-fn ldmatrix_gather_shape(rt_layout: TileLayout, base: RTBaseShape, trans: bool) {
+/// The strip may be the fragment-wide [`ST_16X16_MMA`] or a full-row one, whose
+/// 64- or 128-byte base tile holds several fragments of a row.
+#[test_case(TileLayout::Row, RT_16X16_MMA, false, ST_16X16_MMA; "row gather")]
+#[test_case(TileLayout::Col, RT_16X16_MMA, true, ST_16X16_MMA; "col gather is ldsm4t")]
+#[test_case(TileLayout::Row, RT_16X16_MMA_HALVES, false, ST_16X16_MMA; "row gather in n-halves")]
+#[test_case(TileLayout::Col, RT_16X16_MMA_HALVES, true, ST_16X16_MMA; "col gather in n-halves")]
+#[test_case(TileLayout::Row, RT_16X16_MMA, false, ST_16X32_MMA; "row gather from 64-byte rows")]
+#[test_case(TileLayout::Row, RT_16X16_MMA_HALVES, false, ST_16X32_MMA; "n-halves from 64-byte rows")]
+#[test_case(TileLayout::Col, RT_16X16_MMA, true, ST_16X32_MMA; "col gather from 64-byte rows")]
+fn ldmatrix_gather_shape(rt_layout: TileLayout, base: RTBaseShape, trans: bool, strip: STBaseShape) {
     let ker = Kernel::new("ldsm", [1, 1, 1], 32, vec![], ArchCaps::for_arch(SM_86));
     let warp = ker.warp();
-    let st = ker.st((32, 32), DType::BFloat16, TileLayout::Row, ST_16X16_MMA);
+    let st = ker.st((32, 32), DType::BFloat16, TileLayout::Row, strip);
     let rt = ker.rt((32, 32), DType::BFloat16, rt_layout, base);
     let rt = warp.load(rt, st, MoveIdx::default());
     let nodes = rt.uop().toposort();
@@ -183,6 +190,24 @@ fn cp_async_fill_shape() {
     assert_eq!(customs(&nodes, "cp.async.wait.group(i32 0)").len(), 1);
     assert_eq!(nodes.iter().filter(|u| matches!(u.op(), Op::Barrier(..))).count(), 1);
     assert!(!nodes.iter().any(|u| matches!(u.op(), Op::Store(..))), "no register-staged LDS store");
+}
+
+/// A full-row strip, one base tile across, fills the same way: `64·cols·2 /
+/// (128·16)` copies per lane under one commit.
+#[test_case(ST_16X32_MMA, 2; "64-byte rows")]
+#[test_case(ST_16X64_MMA, 4; "128-byte rows")]
+fn cp_async_fill_of_full_rows(strip: STBaseShape, copies: usize) {
+    let n = 256usize;
+    let bufs = vec![UOp::new_buffer(DeviceSpec::Cpu, n * n, DType::BFloat16)];
+    let ker = Kernel::new("fill", [1, 1, 1], 128, bufs, ArchCaps::for_arch(SM_86));
+    let g = ker.group(4);
+    let src = ker.gl(&[1, 1, n, n], DType::BFloat16);
+    let st = ker.st((64, strip.base.cols), DType::BFloat16, TileLayout::Row, strip);
+    assert_eq!(st.shape()[st.shape().len() - 3], 1, "one base tile spans the row");
+    assert!(g.cp_async_fill_applies(&st, &src));
+    let nodes = g.cp_async_fill(&st, &src, &[0.into(), 0.into(), 0.into(), 0.into()], 2).toposort();
+    assert_eq!(customs(&nodes, "cp.async.cg.shared.global.16(").len(), copies);
+    assert_eq!(customs(&nodes, "cp.async.commit.group").len(), 1);
 }
 
 /// `cp.async` needs 16-byte lane runs with no element cast and a chunk-contiguous
