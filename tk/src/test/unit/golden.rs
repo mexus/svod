@@ -50,12 +50,19 @@ fn fa_bufs(mask: FaMask) -> Vec<Arc<UOp>> {
         bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b, DType::Int32)); // key_lens [B], trailing
     }
     if mask.seg_start {
-        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // seg_start [B, N], last
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // seg_start [B, N]
+    }
+    if mask.key_mask {
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Int32)); // key_mask [B, N], last
     }
     bufs
 }
 
 fn fa_sink_cfg(causal: bool, mask: FaMask) -> Arc<UOp> {
+    fa_sink_windowed(causal, None, mask)
+}
+
+fn fa_sink_windowed(causal: bool, window: Option<(usize, usize)>, mask: FaMask) -> Arc<UOp> {
     let (b, h, h_kv, d, n) = FA_DIMS;
     let ker =
         Kernel::new("fa_mw_rdb", [h as i64, (n / 16 / 8) as i64, b as i64], 8 * 64, fa_bufs(mask), ArchCaps::GFX942);
@@ -66,7 +73,7 @@ fn fa_sink_cfg(causal: bool, mask: FaMask) -> Arc<UOp> {
         h,
         h_kv,
         d,
-        FaConfig { q_blk: 16, kv_blk: 16, causal, ..Default::default() },
+        FaConfig { q_blk: 16, kv_blk: 16, causal, window, ..Default::default() },
         DType::BFloat16,
         mask,
     );
@@ -106,6 +113,13 @@ const FA_MASKED_NODES: usize = 806;
 // table read inside the score mask.
 const FA_SEGMENTED_DIGEST: u128 = 0x332c_6e0e_d894_ad5a_0000_0000_0000_0000;
 const FA_SEGMENTED_NODES: usize = 836;
+// Sliding window (the band's KV block range per workgroup, the band mask and the
+// empty-row norm floor) and the general `[B, N]` key mask (a per-key table read
+// inside the score mask, and the same floor).
+const FA_WINDOWED_DIGEST: u128 = 0x51a9_5991_af18_250d_0000_0000_0000_0000;
+const FA_WINDOWED_NODES: usize = 872;
+const FA_KEY_MASKED_DIGEST: u128 = 0xae3e_1c05_e8a6_9e3c_0000_0000_0000_0000;
+const FA_KEY_MASKED_NODES: usize = 829;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
@@ -137,14 +151,26 @@ fn golden_fa_mw_rdb_noncausal() {
 
 #[test]
 fn golden_fa_mw_rdb_masked() {
-    let mask = FaMask { key_lens: true, seg_start: false };
+    let mask = FaMask { key_lens: true, ..FaMask::NONE };
     check("fa_mw_rdb[noncausal,masked]", fa_sink_cfg(false, mask), FA_MASKED_DIGEST, FA_MASKED_NODES);
 }
 
 #[test]
 fn golden_fa_mw_rdb_segmented() {
-    let mask = FaMask { key_lens: false, seg_start: true };
+    let mask = FaMask { seg_start: true, ..FaMask::NONE };
     check("fa_mw_rdb[causal,segmented]", fa_sink_cfg(true, mask), FA_SEGMENTED_DIGEST, FA_SEGMENTED_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_windowed() {
+    let sink = fa_sink_windowed(false, Some((64, 64)), FaMask::NONE);
+    check("fa_mw_rdb[noncausal,window]", sink, FA_WINDOWED_DIGEST, FA_WINDOWED_NODES);
+}
+
+#[test]
+fn golden_fa_mw_rdb_key_masked() {
+    let mask = FaMask { key_mask: true, ..FaMask::NONE };
+    check("fa_mw_rdb[noncausal,key_mask]", fa_sink_cfg(false, mask), FA_KEY_MASKED_DIGEST, FA_KEY_MASKED_NODES);
 }
 
 /// The fingerprint is invariant to the global id counter: building the same kernel
