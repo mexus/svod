@@ -743,17 +743,18 @@ impl<'k> Group<'k> {
     }
 
     /// LOCAL→REG fragment gather as one warp-collective `ldmatrix.x4[.trans]` per
-    /// 16×16 fragment: lane `L` supplies the (swizzled) address of row `L % 16`,
-    /// columns `8·(L/16)..+8`, and the four returned 32-bit words are scattered onto
-    /// the fragment's register pairs per the plan (every register index constant,
-    /// so the fragment stays in registers). Replaces the eight scalar `ld.shared.b16`
-    /// per fragment of the generic gather.
+    /// 16×16 fragment: lane `L` supplies the (swizzled) address of one row of the
+    /// `L/8`-th matrix fetched ([`ldmatrix_lane_rc`]), and the four returned 32-bit
+    /// words land on the fragment's register pairs in the order the core reads them
+    /// ([`crate::tiles::RTBaseShape::feed`]; every register index constant, so the
+    /// fragment stays in registers). Replaces the eight scalar `ld.shared.b16` per
+    /// fragment of the generic gather.
     fn ldmatrix_local_to_reg(&self, rt: RT<'k>, st: &ST, dst_idxs: &[Idx], idxs: &[Idx], plan: LdmatrixX4) -> RT<'k> {
         let laneid = self.ker.laneid();
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
-        let row = imod(&laneid, 16);
-        let col = imul(&idiv(&laneid, 16), 8);
+        let feed = rt.base.feed;
+        let (row, col) = ldmatrix_lane_rc(&laneid, plan.fetch(feed));
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
         let pair = rt.elem().vec(2).expect("16-bit element pair");
         let at = |block: Option<&Idx>, frags: i64, i: i64| match block {
@@ -770,11 +771,11 @@ impl<'k> Group<'k> {
                     Idx::Uop(scol.clone()),
                 ];
                 let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
-                for (p, &m) in plan.words.iter().enumerate() {
+                for (word, &p) in words.iter().zip(&feed) {
                     for e in 0..2 {
                         let mut didx = dst_idxs.to_vec();
                         didx.extend([Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)]);
-                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(word.index_axes(vec![e])));
                     }
                 }
             }
@@ -810,8 +811,8 @@ impl<'k> Group<'k> {
         let laneid = self.ker.laneid();
         let n = rt.shape().len();
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
-        let lane_row = imod(&laneid, 16);
-        let col = imul(&idiv(&laneid, 16), 8);
+        let feed = rt.base.feed;
+        let (lane_row, col) = ldmatrix_lane_rc(&laneid, plan.fetch(feed));
         let pair = rt.elem().vec(2).expect("16-bit element pair");
         let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
         for h in 0..rt_h {
@@ -825,10 +826,10 @@ impl<'k> Group<'k> {
                 };
                 let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow.clone()), Idx::Uop(scol.clone())];
                 let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
-                for (p, &m) in plan.words.iter().enumerate() {
+                for (word, &p) in words.iter().zip(&feed) {
                     for e in 0..2 {
                         let didx = [Idx::Const(h), Idx::Const(w), Idx::Const(2 * p as i64 + e as i64)];
-                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(words[m].index_axes(vec![e])));
+                        stores.push(flat_index(rt.uop(), rt.shape(), &didx).store(word.index_axes(vec![e])));
                     }
                 }
             }
@@ -1105,6 +1106,21 @@ impl<'k> Group<'k> {
             target.store(load)
         });
         self.finalize_gl(dst, ended)
+    }
+}
+
+/// Lane `L`'s `(row, col)` in a 16×16 fragment for an `ldmatrix.x4` that fetches
+/// the fragment's matrices in `fetch` order ([`LdmatrixX4::fetch`]): row `L % 8`
+/// of matrix `fetch[L/8]`, whose row and column blocks are its number's low and
+/// high bits.
+fn ldmatrix_lane_rc(laneid: &Arc<UOp>, fetch: [usize; 4]) -> (Arc<UOp>, Arc<UOp>) {
+    match fetch {
+        // TL, BL, TR, BR: row `L % 16`, column block `L / 16`.
+        [0, 1, 2, 3] => (imod(laneid, 16), imul(&idiv(laneid, 16), 8)),
+        // TL, TR, BL, BR: row block `L / 16`, column block `(L / 8) % 2`.
+        [0, 2, 1, 3] => (iadd(&imod(laneid, 8), &imul(&idiv(laneid, 16), 8)), imul(&imod(&idiv(laneid, 8), 2), 8)),
+        // A feed and a plan each keep TL and BR in place, so their composition does.
+        other => unreachable!("ldmatrix fetch order {other:?} moves a diagonal matrix"),
     }
 }
 
