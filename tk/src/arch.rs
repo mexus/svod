@@ -42,9 +42,9 @@
 use svod_dtype::{AmdArch, CudaArch, GpuArch};
 
 use crate::tiles::{
-    RT_8X8_SIMD, RT_8X8_SIMD_T, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_W32_ACC, RT_16X16_W32_ACC_T,
-    RT_16X16_W32_IN, RTBaseShape, ST_8X8, ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED, ST_16X16_SWIZZLED_W32,
-    STBaseShape,
+    RT_8X8_SIMD, RT_8X8_SIMD_T, RT_16X16, RT_16X16_GFX12, RT_16X16_MMA, RT_16X16_MMA_HALVES, RT_16X16_W32_ACC,
+    RT_16X16_W32_ACC_T, RT_16X16_W32_IN, RTBaseShape, ST_8X8, ST_16X16, ST_16X16_MMA, ST_16X16_SWIZZLED,
+    ST_16X16_SWIZZLED_W32, STBaseShape,
 };
 
 /// Logical role of a 16×16 matrix-core fragment, independent of arch packing.
@@ -168,16 +168,20 @@ impl ArchCaps {
     /// [`RT_16X16`]; gfx11 (RDNA3 WMMA) splits into the even/odd-interleaved
     /// accumulator, the replicated input, and the transposed accumulator, while
     /// gfx12 (RDNA4) shares one strided 8/lane [`RT_16X16_GFX12`] across all four; CUDA
-    /// sm_80+ resolves every role to the two-half [`RT_16X16_MMA`] (an accumulator
-    /// IS the A-operand register order, and the transposed store is the `Col`
-    /// reading of the same map). `None` where tk has no fragment table (Metal,
+    /// sm_80+ resolves every role to the two-half [`RT_16X16_MMA`] map (an
+    /// accumulator IS the A-operand register order, and the transposed store is the
+    /// `Col` reading of the same map), the A position read by the core in n-halves
+    /// ([`RT_16X16_MMA_HALVES`]). `None` where tk has no fragment table (Metal,
     /// pre-Ampere CUDA) — see the module docs.
     pub fn frag(&self, role: FragRole) -> Option<RTBaseShape> {
         if !self.has_matrix_core_layouts() {
             return None;
         }
         Some(match self.arch {
-            GpuArch::Cuda(_) => RT_16X16_MMA,
+            GpuArch::Cuda(_) => match role {
+                FragRole::Operand => RT_16X16_MMA_HALVES,
+                FragRole::OperandB | FragRole::Accumulator | FragRole::AccumulatorT => RT_16X16_MMA,
+            },
             // Apple's core computes `D = A·B` straight off the fragment map, with no
             // per-operand calibration table to absorb tk's `Col` convention. tk's
             // accumulators are `Col`, so the product is emitted transposed
