@@ -640,11 +640,18 @@ impl<'k> Group<'k> {
         // SI-1 off-by-one guard: the wave's RT sub-tile must fit inside the ST.
         let sn = st.shape().len();
         let (st_h, st_w) = (st.shape()[sn - 4] as i64, st.shape()[sn - 3] as i64);
-        assert!(rt_h <= st_h && rt_w <= st_w, "load LOCAL→REG: RT {rt_h}×{rt_w} exceeds ST {st_h}×{st_w}");
+        let (rows, cols) = ((rt_h * rt.base.base.rows as i64), (rt_w * rt.base.base.cols as i64));
+        let (st_rows, st_cols) = (st_h * st.base.base.rows as i64, st_w * st.base.base.cols as i64);
+        assert!(rows <= st_rows && cols <= st_cols, "load LOCAL→REG: RT {rows}×{cols} exceeds ST {st_rows}×{st_cols}");
         let transpose = rt.layout != st.layout;
         if let Some(plan) = self.ldmatrix_plan(&rt, st, transpose) {
             return self.ldmatrix_local_to_reg(rt, st, dst_idxs, idxs, plan);
         }
+        assert_eq!(
+            (st.base.base.rows, st.base.base.cols),
+            (rt.base.base.rows, rt.base.base.cols),
+            "load LOCAL→REG: only the ldmatrix gather reads a fragment out of a wider shared base tile"
+        );
         if let Some(group) = self.lds_vec_plan(&rt, st, transpose) {
             return self.vec_local_to_reg(rt, st, dst_idxs, idxs, group);
         }
@@ -725,18 +732,20 @@ impl<'k> Group<'k> {
     }
 
     /// The `ldmatrix.x4` plan for the LOCAL→REG hop, when it applies: a CUDA
-    /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a lane
-    /// map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4) covers,
-    /// and a swizzle that keeps 16-byte row chunks contiguous. The CUDA guard is
-    /// load-bearing: gfx12's fragment passes the shape test too, and only its
-    /// strided map having no `ldmatrix` form would otherwise keep it out.
+    /// target, a 16-bit fragment with no cast, the 16×16 / 8-per-lane base, a
+    /// shared base tile as tall as the fragment and a whole number of fragments
+    /// wide, a lane map [`LaneMap::ldmatrix_x4`](crate::layout::LaneMap::ldmatrix_x4)
+    /// covers, and a swizzle that keeps 16-byte row chunks contiguous. The CUDA
+    /// guard is load-bearing: gfx12's fragment passes the shape test too, and only
+    /// its strided map having no `ldmatrix` form would otherwise keep it out.
     fn ldmatrix_plan(&self, rt: &RT<'k>, st: &ST, transpose: bool) -> Option<LdmatrixX4> {
         let base = &rt.base.base;
         (self.ker.caps.cuda().is_some()
             && rt.elem().bytes() == 2
             && st.elem() == rt.elem()
             && (base.rows, base.cols, base.elements_per_thread()) == (16, 16, 8)
-            && st.base.base == *base
+            && st.base.base.rows == base.rows
+            && st.base.base.cols.is_multiple_of(base.cols)
             && st.base.swizzle.keeps_16b_chunks())
         .then(|| rt.base.map.ldmatrix_x4(transpose))
         .flatten()
@@ -755,7 +764,6 @@ impl<'k> Group<'k> {
         let (rt_h, rt_w) = (rt.shape()[n - 3] as i64, rt.shape()[n - 2] as i64);
         let feed = rt.base.feed;
         let (row, col) = ldmatrix_lane_rc(&laneid, plan.fetch(feed));
-        let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
         let pair = rt.elem().vec(2).expect("16-bit element pair");
         let at = |block: Option<&Idx>, frags: i64, i: i64| match block {
             None => Idx::Const(i),
@@ -764,12 +772,9 @@ impl<'k> Group<'k> {
         let mut stores = Vec::with_capacity((rt_h * rt_w * 8) as usize);
         for h in 0..rt_h {
             for w in 0..rt_w {
-                let src_idx = [
-                    at(idxs.first(), rt_h, h),
-                    at(idxs.get(1), rt_w, w),
-                    Idx::Uop(srow.clone()),
-                    Idx::Uop(scol.clone()),
-                ];
+                let (w_blk, col) = frag_in_base(st, &rt, at(idxs.get(1), rt_w, w), &col);
+                let (srow, scol) = st.base.swizzle.swizzle_rc(row.clone(), col, st.base.base.cols, st.elem().base());
+                let src_idx = [at(idxs.first(), rt_h, h), w_blk, Idx::Uop(srow), Idx::Uop(scol)];
                 let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
                 for (word, &p) in words.iter().zip(&feed) {
                     for e in 0..2 {
@@ -818,13 +823,14 @@ impl<'k> Group<'k> {
         for h in 0..rt_h {
             let logical = row(&iadd(&lane_row, &cidx(h * 16)));
             let (frag, within) = (idiv(&logical, 16), imod(&logical, 16));
-            let (srow, scol) = st.base.swizzle.swizzle_rc(within, col.clone(), st.base.base.cols, st.elem().base());
             for w in 0..rt_w {
                 let wblk = match col_blk {
                     None => Idx::Const(w),
                     Some(b) => Idx::Uop(iadd(&imul(&b.to_uop(), rt_w), &cidx(w))),
                 };
-                let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow.clone()), Idx::Uop(scol.clone())];
+                let (wblk, col) = frag_in_base(st, &rt, wblk, &col);
+                let (srow, scol) = st.base.swizzle.swizzle_rc(within.clone(), col, st.base.base.cols, st.elem().base());
+                let src_idx = [Idx::Uop(frag.clone()), wblk, Idx::Uop(srow), Idx::Uop(scol)];
                 let words = ldmatrix(&st_index(st, &src_idx), 4, plan.trans, pair.clone());
                 for (word, &p) in words.iter().zip(&feed) {
                     for e in 0..2 {
@@ -1106,6 +1112,19 @@ impl<'k> Group<'k> {
             target.store(load)
         });
         self.finalize_gl(dst, ended)
+    }
+}
+
+/// Fragment column block `w` of `rt` inside `st`, whose base tile may span several
+/// fragments of a row: the shared base-tile column block holding it, and the lane's
+/// fragment column `col` moved to the fragment's place within that base tile.
+fn frag_in_base(st: &ST, rt: &RT<'_>, w: Idx, col: &Arc<UOp>) -> (Idx, Arc<UOp>) {
+    let (cols, span) = (rt.base.base.cols as i64, (st.base.base.cols / rt.base.base.cols) as i64);
+    match w {
+        _ if span == 1 => (w, col.clone()),
+        Idx::Const(w) if w % span == 0 => (Idx::Const(w / span), col.clone()),
+        Idx::Const(w) => (Idx::Const(w / span), iadd(&cidx(w % span * cols), col)),
+        Idx::Uop(w) => (Idx::Uop(idiv(&w, span)), iadd(&imul(&imod(&w, span), cols), col)),
     }
 }
 
