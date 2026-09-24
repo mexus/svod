@@ -53,8 +53,7 @@ impl EncoderLayer {
             Some(ln) => ln.forward(x)?,
             None => x.clone(),
         };
-        let h = x.try_add(&self.attention.forward(&normed, rope, padding_mask)?)?;
-        let delta = self.mlp.forward(&self.mlp_norm.forward(&h)?)?;
-        Ok(h.try_add(&delta)?)
+        let h = self.attention.forward(&normed, rope, padding_mask, Some(x))?;
+        self.mlp.forward(&self.mlp_norm.forward(&h)?, Some(&h))
     }
 }
