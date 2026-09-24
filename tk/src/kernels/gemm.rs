@@ -1034,7 +1034,8 @@ pub fn select_cfg(m: usize, k: usize, n: usize) -> Option<GemmCfg> {
 /// ([`GemmPolicy::tuned`]): the first request of a shape times every candidate
 /// once and caches the winner on disk ([`crate::tune`]); `SVOD_TK_TUNE=0` keeps
 /// the table's static choice instead.
-/// - `Err` — *malformed request:* a symbolic dim, `x` below rank 2 or `w` not
+/// - `Err` — *malformed request:* a symbolic dim (one a JIT variable pins to a
+///   single value counts as static), `x` below rank 2 or `w` not
 ///   rank 2, a dtype outside {bf16, f16}, a dtype mismatch between `x` and `w`,
 ///   or `w`'s K disagreeing with `x`'s.
 /// - `Ok(Some(y))` — it ran.
@@ -1107,6 +1108,7 @@ fn build_gemm(
 ) -> crate::LaunchResult<Option<Tensor>> {
     let xd = crate::launch::concrete_dims_at_least(x, "gemm-nt", "x", 2)?;
     let wd = crate::launch::concrete_dims(w, "gemm-nt", "w", 2)?;
+    let (x, w) = (&crate::launch::statically(x, &xd)?, &crate::launch::statically(w, &wd)?);
     // `x` is `[lead..., K]`: the leading dims are the GEMM's rows and come back
     // on `y` as `[lead..., N]`.
     let (lead, k) = (xd[..xd.len() - 1].to_vec(), xd[xd.len() - 1]);
@@ -1121,6 +1123,10 @@ fn build_gemm(
     let y_shape: Vec<usize> = lead.iter().copied().chain([kind.out_cols(n)]).collect();
     let res_dims = match epi {
         Epilogue::Add(r) => Some(crate::launch::concrete_dims_at_least(r, "gemm-nt", "residual", 2)?),
+        _ => None,
+    };
+    let residual = match (epi, &res_dims) {
+        (Epilogue::Add(r), Some(dims)) => Some(crate::launch::statically(r, dims)?),
         _ => None,
     };
     let res_dtype = match epi {
@@ -1195,9 +1201,7 @@ fn build_gemm(
                 Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through conv2d_nhwc"),
             };
             let mut ins = vec![x, w];
-            if let Epilogue::Add(r) = epi {
-                ins.push(r);
-            }
+            ins.extend(residual.as_ref());
             let y = crate::graph_launch(name, grid, block, out, &ins, caps, move |ker| {
                 build_gemm_nt(ker, (m, k, n), cfg, in_dt, out_dt, kind);
                 ker.finish(cfg.acc_m)

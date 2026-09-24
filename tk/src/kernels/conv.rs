@@ -12,7 +12,7 @@ use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use snafu::{ResultExt, ensure};
+use snafu::ensure;
 use svod_dtype::DType;
 use svod_ir::UOp;
 use svod_tensor::Tensor;
@@ -497,15 +497,7 @@ pub fn conv2d_nhwc(
     let rd = residual.map(|r| crate::launch::concrete_dims(r, "conv2d", "residual", 4)).transpose()?;
     let geom =
         ConvGeom { batch: xd[0], h: xd[1], w: xd[2], cin: xd[3], cout: wd[0], kh: wd[1], kw: wd[2], stride, pad };
-    // A dim pinned to one value is that value ([`crate::launch::pinned_dim`]),
-    // but the tensor still carries it symbolically and a kernel placeholder
-    // needs a static shape: reshape to what the dims resolved to.
-    let statically = |t: &Tensor, dims: &[usize]| -> crate::LaunchResult<Tensor> {
-        if t.shape().is_ok_and(|s| s.iter().all(|d| d.as_const().is_some())) {
-            return Ok(t.clone());
-        }
-        t.try_reshape(dims.iter().map(|&d| d as isize).collect::<Vec<_>>()).context(crate::launch::OperandSnafu)
-    };
+    let statically = crate::launch::statically;
     let dtype = x.uop().dtype();
     let y_shape = y_dims(&geom);
     let x = &statically(x, &xd)?;
