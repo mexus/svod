@@ -580,14 +580,13 @@ pub(crate) fn silu(x: &Arc<UOp>, dt: &DType) -> Arc<UOp> {
 /// explicitly unrolled copy into a same-layout tile, so the store that follows
 /// moves plain elements.
 ///
-/// Storing the f32 tile and letting the store's own cast do it is a 3.4× cliff on
-/// NVPTX: an f32→bf16 cast lowers to a 17-instruction integer round-to-nearest-even
-/// ([`svod_ir::decompositions`]), and with that body inside the store's rolled
-/// `[height, width, inner]` loops LLVM stops unrolling them — the register tile is
-/// then indexed dynamically, falls out of registers into local memory, and the
-/// whole K-loop pays for it (measured on sm_86: 256 B/lane of spill, 13.7 → 4.0
+/// Storing the f32 tile and letting the store's own cast do it once cost 3.4× on
+/// NVPTX, back when an f32→bf16 cast lowered to a 17-instruction integer rounding:
+/// with that body inside the store's rolled `[height, width, inner]` loops LLVM
+/// stopped unrolling them, the register tile was indexed dynamically and fell out
+/// of registers into local memory (sm_86: 256 B/lane of spill, 13.7 → 4.0
 /// TFLOP/s). Every index here is a constant, so the accumulator stays in registers
-/// and only the narrow result reaches the store.
+/// whatever the cast costs, and only the narrow result reaches the store.
 pub(super) fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &DType) -> RT<'k> {
     if acc.elem() == out_dt {
         return acc;
