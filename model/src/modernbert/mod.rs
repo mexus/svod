@@ -16,6 +16,7 @@ mod jit;
 mod linear;
 mod mlp;
 mod model;
+mod norm;
 
 pub use attention::ModernBertAttention;
 pub use config::ModernBertConfig;
