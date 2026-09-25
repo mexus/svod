@@ -764,6 +764,69 @@ fn test_fa_window_key_mask(
     assert!(got.iter().all(|x| x.is_finite()), "a hidden row must be zeros, not NaN");
 }
 
+/// `SVOD_DEVICE=CUDA:0 cargo test --release -p svod-tk --lib fa::a_key_mask_only_hides_keys -- --ignored --nocapture`.
+///
+/// The key mask changes which keys a row sees and nothing else, whichever form
+/// the arch applies it in (the CUDA accumulator seed or the score mask): a mask
+/// that hides no key is bit-identical to no mask, and right padding agrees with
+/// `key_lens` of the same lengths — at both tile heights the CUDA tuner picks
+/// between, with and without ModernBERT's band.
+#[test_case::test_case((16, 32), None; "16x32")]
+#[test_case::test_case((16, 64), None; "16x64")]
+#[test_case::test_case((16, 32), Some((64, 64)); "16x32 band")]
+#[test_case::test_case((16, 64), Some((64, 64)); "16x64 band")]
+#[ignore]
+fn a_key_mask_only_hides_keys((q_blk, kv_blk): (usize, usize), window: Option<(usize, usize)>) {
+    use crate::kernels::fa::{FaPolicy, flash_attention_tuned};
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip a_key_mask_only_hides_keys: unsupported device/toolchain");
+        return;
+    }
+    let (b, n, h, d, short) = (2usize, 512usize, 4usize, 64usize, 77i32);
+    let mk = || {
+        let t = Tensor::randn(&[b, n, h, d]).expect("randn").cast(DType::BFloat16);
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (mk(), mk(), mk());
+    let policy = move |spec: &DeviceSpec, arch| FaPolicy {
+        big: &[],
+        small: (q_blk, kv_blk),
+        ..FaPolicy::for_device(spec, arch)
+    };
+    let run = |opts: FaOpts| -> Vec<u32> {
+        let o = flash_attention_tuned(&q, &k, &v, FaOpts { causal: false, window, ..opts }, policy)
+            .expect("fa")
+            .expect("the kernel applies")
+            .cast(DType::Float32);
+        o.realize().expect("realize");
+        o.as_vec::<f32>().expect("read").into_iter().map(f32::to_bits).collect()
+    };
+    let key_mask = |lens: [i32; 2]| {
+        let valid: Vec<i32> = (0..b * n).map(|i| i32::from((i % n) < lens[i / n] as usize)).collect();
+        Tensor::from_slice(valid.as_slice()).try_reshape([b, n]).expect("reshape")
+    };
+    let all = key_mask([n as i32; 2]);
+    let (right, lens) = (key_mask([n as i32, short]), Tensor::from_slice([n as i32, short]));
+    let unmasked = run(FaOpts::default());
+    assert!(run(FaOpts { key_mask: Some(&all), ..Default::default() }) == unmasked, "an all-valid key mask");
+    let by_lens = run(FaOpts { key_lens: Some(&lens), ..Default::default() });
+    assert!(by_lens != unmasked, "the padding must hide keys");
+    // Within one bf16 ulp at the output's scale, not bitwise: `key_lens` selects
+    // the scaled score, which keeps the scale's product out of the exp2
+    // argument's FMA. Under the band both select, and agree bitwise.
+    let as_key_mask = run(FaOpts { key_mask: Some(&right), ..Default::default() });
+    let values = |bits: &[u32]| bits.iter().map(|x| f32::from_bits(*x)).collect::<Vec<_>>();
+    let (got, want) = (values(&as_key_mask), values(&by_lens));
+    let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let ulp = f32::from_bits((scale.to_bits() & 0x7f80_0000) - (7 << 23));
+    let worst = got.iter().zip(&want).fold(0f32, |m, (a, r)| m.max((a - r).abs()));
+    assert!(worst <= ulp, "right padding as a key mask is {worst} off key_lens (a bf16 ulp at {scale} is {ulp})");
+    if window.is_some() {
+        assert!(as_key_mask == by_lens, "under the band both select the scaled score");
+    }
+}
+
 /// A fully key-masked lane (`key_lens[b] == 0`) — the inactive-lane case the
 /// GigaAM JIT produces when a chunk-batch's tail lanes pad to length 0 — must
 /// produce a FINITE row, not `NaN`. With no valid key the online-softmax running
@@ -873,13 +936,23 @@ fn test_fa_tile_bench_cuda() {
 /// Render `build_fa_mw_rdb` for sm_86 through the launch path's pipeline
 /// (post-optimization with the CUDA profile → linearize → render); with
 /// `TK_DUMP_IR=dir` the IR is written to `dir/<name>.ll` for offline `ptxas -v`.
-fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, usize), cfg: FaConfig) -> String {
+fn render_fa_sm86(
+    name: &str,
+    (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
+    cfg: FaConfig,
+    mask: FaMask,
+) -> String {
     use crate::kernels::fa::NUM_WARPS;
     let sm86 = svod_dtype::CudaArch::from_compute_capability(8, 6);
     let caps = crate::ArchCaps::for_arch(svod_dtype::GpuArch::Cuda(sm86));
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
-    let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, dummy_fa_buffers(b, n, h, h_kv, d), caps);
-    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, FaMask::NONE);
+    let mut bufs = dummy_fa_buffers(b, n, h, h_kv, d);
+    assert!(!mask.key_lens && !mask.seg_start, "render_fa_sm86 binds the key mask only");
+    if mask.key_mask {
+        bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Float32));
+    }
+    let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, bufs, caps);
+    build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, mask);
     let sink = ker.finish(1);
     let renderer = svod_codegen::llvm::LlvmTextRenderer::nvptx(sm86);
     let opt_renderer = svod_schedule::OptimizerRenderer::for_cuda_arch(sm86).with_rewrite_capabilities(
@@ -922,7 +995,8 @@ fn render_fa_sm86(name: &str, (b, n, h, h_kv, d): (usize, usize, usize, usize, u
 fn test_fa_sm86_renders_mma_sync(q_blk: usize, kv_blk: usize, unroll: bool, causal: bool, d: usize) {
     let body = if unroll { "flat" } else { "rolled" };
     let name = format!("fa_sm86_{q_blk}x{kv_blk}_{body}{}_d{d}", if causal { "_causal" } else { "" });
-    let code = render_fa_sm86(&name, (1, 512, 2, 2, d), FaConfig { q_blk, kv_blk, unroll, causal, window: None });
+    let cfg = FaConfig { q_blk, kv_blk, unroll, causal, window: None };
+    let code = render_fa_sm86(&name, (1, 512, 2, 2, d), cfg, FaMask::NONE);
     let mma =
         code.lines().filter(|l| l.contains("llvm.nvvm.mma.m16n8k16.row.col.bf16") && !l.contains("declare")).count();
     let per_slice = 2 * (kv_blk / 16) * (d / 16) * 2; // QKᵀ + A·V halves per fragment product
@@ -1000,8 +1074,8 @@ fn test_fa_sm86_causal_skips_kv_blocks(q_blk: usize, kv_blk: usize) {
     let (n, d) = (512usize, 128usize);
     let shape = (1, n, 2, 2, d);
     let cfg = |causal| FaConfig { q_blk, kv_blk, unroll: true, causal, window: None };
-    let full = render_fa_sm86(&format!("fa_skip_full_{q_blk}x{kv_blk}"), shape, cfg(false));
-    let causal = render_fa_sm86(&format!("fa_skip_causal_{q_blk}x{kv_blk}"), shape, cfg(true));
+    let full = render_fa_sm86(&format!("fa_skip_full_{q_blk}x{kv_blk}"), shape, cfg(false), FaMask::NONE);
+    let causal = render_fa_sm86(&format!("fa_skip_causal_{q_blk}x{kv_blk}"), shape, cfg(true), FaMask::NONE);
 
     let full_bounds = loop_bounds(&full);
     assert!(full_bounds.contains(&(n / kv_blk).to_string()), "bidirectional sweeps every KV block: {full_bounds:?}");
@@ -1624,4 +1698,29 @@ fn fa_output_store_contract() {
         println!("   ({i:2},{j:2}) want {w:9.1} got {g:9.1}");
     }
     assert!(bad.is_empty(), "FA output store wrong");
+}
+
+/// On CUDA the key mask seeds the `QKᵀ` accumulator with its f32 `0`/`−∞` bias
+/// instead of masking every score after it: next to the unmasked kernel it adds
+/// one 8-byte load per key pair a lane holds and no compare or select — the
+/// masked form spent one of each per score.
+#[test_case::test_case(16, 32; "16x32")]
+#[test_case::test_case(16, 64; "16x64")]
+fn fa_sm86_key_mask_seeds_the_scores(q_blk: usize, kv_blk: usize) {
+    let cfg = FaConfig { q_blk, kv_blk, unroll: true, causal: false, window: None };
+    let render = |mask: FaMask| {
+        render_fa_sm86(&format!("fa_seed_{q_blk}x{kv_blk}_{}", mask.key_mask), (1, 512, 2, 2, 64), cfg, mask)
+    };
+    let (plain, masked) = (render(FaMask::NONE), render(FaMask { key_mask: true, ..FaMask::NONE }));
+    let count = |code: &str, needle: &str| code.lines().filter(|l| l.contains(needle)).count();
+    for needle in [" select ", " icmp ", " fcmp "] {
+        assert_eq!(count(&masked, needle), count(&plain, needle), "the key mask added a per-score `{needle}`");
+    }
+    if let (Some(plain), Some(masked)) = (ptx_of(&plain), ptx_of(&masked)) {
+        for needle in ["selp.", "setp."] {
+            assert_eq!(masked.matches(needle).count(), plain.matches(needle).count(), "`{needle}` in:\n{masked}");
+        }
+        assert_eq!(masked.matches("ld.global.nc.v2.b32").count(), kv_blk / 8, "the bias loads:\n{masked}");
+        assert_eq!(plain.matches("ld.global.nc.v2.b32").count(), 0);
+    }
 }

@@ -126,7 +126,8 @@ impl Default for FaConfig {
 /// The optional score masks a build binds, each a trailing global after
 /// `o, q, k, v` in this order: the `[B]` valid-key counts of
 /// [`FaOpts::key_lens`], then the `[B, N]` segment starts of
-/// [`FaOpts::seg_start`], then the `[B, N]` key validity of [`FaOpts::key_mask`].
+/// [`FaOpts::seg_start`], then the `[B, N]` key validity of [`FaOpts::key_mask`]
+/// (as an f32 bias where it seeds the scores, [`key_mask_seeds`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FaMask {
     pub key_lens: bool,
@@ -187,6 +188,9 @@ struct FaCtx<'a, 'k> {
     seg_start: Option<(crate::tile::GL, Arc<UOp>)>,
     /// The `[B, N]` key-validity table and the batch index it is read at.
     key_mask: Option<(crate::tile::GL, Arc<UOp>)>,
+    /// The key mask is the f32 bias the `QKᵀ` accumulator starts from
+    /// ([`key_mask_seeds`]), not an `i32` table the scores are masked by.
+    seed_key_mask: bool,
     /// `log2(e)/sqrt(d)` — the softmax scale, folded with the `exp2` base change.
     /// Applied to the f32 `QKᵀ` accumulator rather than to `Q`: scaling `Q` costs a
     /// second rounding to the 16-bit mma input dtype, and that error enters the
@@ -194,6 +198,34 @@ struct FaCtx<'a, 'k> {
     /// grow with the square of the activation scale, so pre-scaling `Q` is accurate
     /// only near unit variance and drifts badly on real activations.
     score_scale: f64,
+}
+
+/// Whether the `[B, N]` key mask reaches the kernel as an f32 bias (`0` for a
+/// valid key, `−∞` for a hidden one) that the `QKᵀ` accumulator starts from,
+/// rather than as an `i32` validity table the scores are masked by after it. A
+/// key's validity is one value per column, so the seed costs a load per key a
+/// lane holds and nothing per score: at 1×8192 on sm_86 the masked kernel runs
+/// within 1% of the unmasked one instead of 3% behind it. The scores are
+/// bit-identical — `0 + s = s`, and a hidden key stays `−∞` through the MMA and
+/// the scale. CUDA only: the seed is not re-validated on the AMD or Apple cores.
+fn key_mask_seeds(caps: &crate::ArchCaps) -> bool {
+    caps.cuda().is_some()
+}
+
+/// The dtype the kernel reads the key mask in ([`key_mask_seeds`]).
+fn key_mask_dtype(caps: &crate::ArchCaps) -> DType {
+    if key_mask_seeds(caps) { DType::Float32 } else { DType::Int32 }
+}
+
+/// A `[B, N]` key validity (any integer or bool dtype, non-zero = valid) as the
+/// kernel reads it ([`key_mask_seeds`]).
+fn key_mask_operand(valid: &Tensor, caps: &crate::ArchCaps) -> Tensor {
+    if !key_mask_seeds(caps) {
+        return valid.cast(DType::Int32);
+    }
+    let shape = [valid.dim_const(0).expect("static key mask"), valid.dim_const(1).expect("static key mask")];
+    let bias = |v: f64| Tensor::full(&shape, ConstValue::Float(v), DType::Float32);
+    bias(0.0).where_(&valid.cast(DType::Bool), bias(f64::NEG_INFINITY)).expect("key-mask bias")
 }
 
 /// Apply the FA score-mask (causal + optional padding + optional segments +
@@ -211,7 +243,8 @@ fn score_mask<'k>(ctx: &FaCtx<'_, 'k>, att: RT<'k>, slice_idx: &Arc<UOp>) -> RT<
     /// `(kv_pos, q_pos) → hidden`.
     type Hidden<'a> = &'a dyn Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>;
     let FaCtx { warp, causal, window, .. } = *ctx;
-    let (valid_len, seg_start, key_mask) = (ctx.valid_len.as_ref(), ctx.seg_start.as_ref(), ctx.key_mask.as_ref());
+    let key_mask = ctx.key_mask.as_ref().filter(|_| !ctx.seed_key_mask);
+    let (valid_len, seg_start) = (ctx.valid_len.as_ref(), ctx.seg_start.as_ref());
     if !causal && valid_len.is_none() && seg_start.is_none() && window.is_none() && key_mask.is_none() {
         return att;
     }
@@ -278,8 +311,18 @@ fn fa_qk<'k>(
         None => (k_reg, v_reg),
     };
 
-    // QKᵀ into a freshly-zeroed att tile (re-zeroed each trip via the loop scope).
-    let att = warp.zero(ctx.lp.reinit(att));
+    // QKᵀ into a freshly-seeded att tile (re-seeded each trip via the loop scope):
+    // zeros, or the key mask's `0`/`−∞` bias ([`key_mask_seeds`]).
+    let att = ctx.lp.reinit(att);
+    let att = match ctx.key_mask.as_ref().filter(|_| ctx.seed_key_mask) {
+        Some((table, batch)) => {
+            let (kv_blk, q_blk) = (Idx::Uop(slice_idx.clone()), Idx::Uop(ctx.q_blk.clone()));
+            warp.map_position(att, kv_blk, q_blk, |_, _, kv_pos, _| {
+                load_at(table.uop(), table.shape(), &[Idx::from(batch), Idx::from(kv_pos)])
+            })
+        }
+        None => warp.zero(att),
+    };
     let k_reg_t = warp.transpose(k_reg_t, &k_reg);
     let att = warp.mma_atb(att, &k_reg_t, ctx.q_reg_t);
     // Scale in f32, on the accumulator — see `FaCtx::score_scale`.
@@ -425,8 +468,9 @@ pub(crate) fn build_fa_mw_rdb(
     // The `[B, N]` segment starts, bound after `lens`; read per query row inside
     // the score mask at this workgroup's batch.
     let seg_start = mask.seg_start.then(|| (ker.gl(&[b, n], DType::Int32), ker.block_idx[2].clone()));
-    // The `[B, N]` key validity, bound last; read per key inside the score mask.
-    let key_mask = mask.key_mask.then(|| (ker.gl(&[b, n], DType::Int32), ker.block_idx[2].clone()));
+    // The `[B, N]` key validity, bound last: the scores' seed, or read per key
+    // inside the score mask ([`key_mask_seeds`]).
+    let key_mask = mask.key_mask.then(|| (ker.gl(&[b, n], key_mask_dtype(&ker.caps)), ker.block_idx[2].clone()));
 
     let head = ker.grid_x();
     let head_kv = head.floor_div(&iconst(group_size));
@@ -625,6 +669,7 @@ pub(crate) fn build_fa_mw_rdb(
         valid_len,
         seg_start,
         key_mask,
+        seed_key_mask: key_mask_seeds(&ker.caps),
         score_scale,
     };
     // The two pipeline stages: gather + QKᵀ + mask, then online-softmax + A·V.
@@ -845,7 +890,7 @@ impl FaPolicy {
                 bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, DType::Int32));
             }
             if mask.key_mask {
-                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, DType::Int32));
+                bufs.push(UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, b * n, key_mask_dtype(&caps)));
             }
             bufs
         };
@@ -873,7 +918,8 @@ impl FaPolicy {
                 ins.push(Tensor::full(&[b, n], ConstValue::Int(0), DType::Int32).to(spec.clone()));
             }
             if mask.key_mask {
-                ins.push(Tensor::full(&[b, n], ConstValue::Int(1), DType::Int32).to(spec.clone()));
+                let valid = Tensor::full(&[b, n], ConstValue::Int(1), DType::Int32);
+                ins.push(key_mask_operand(&valid, &caps).to(spec.clone()));
             }
             let ins: Vec<&Tensor> = ins.iter().collect();
             let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
@@ -1156,7 +1202,7 @@ pub fn flash_attention_tuned(
                 .key_mask
                 .map(|m| -> crate::LaunchResult<Tensor> {
                     let _shared = svod_ir::origin::OriginScope::suspend();
-                    Ok(statically(m, &[b, n])?.cast(DType::Int32))
+                    Ok(key_mask_operand(&statically(m, &[b, n])?, &caps))
                 })
                 .transpose()?;
             let mut ins: Vec<&Tensor> = vec![q, k, v];
