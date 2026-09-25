@@ -91,6 +91,20 @@ fn the_fine_tile_is_declined_on_a_wide_grid(arch: GpuArch, g: ConvGeom, declined
     assert!(plans.iter().all(|p| g.tiles(&p.cfg())));
 }
 
+/// The CUDA table's stepped tile is a linear-layer tile: the tap-wise and patch
+/// forms have only the whole-strip loop, so no convolution takes it, while the
+/// same tile on that loop serves the shape.
+#[test]
+fn no_convolution_takes_the_stepped_tile() {
+    let (policy, caps) = (GemmPolicy::for_arch(SM86), crate::ArchCaps::for_arch(SM86));
+    let stepped = *policy.tiles.iter().find(|cfg| cfg.stepped).expect("the CUDA table has a stepped tile");
+    let g = geom(40, 192, 192, 3, 1);
+    assert!(!g.tiles(&stepped));
+    assert!(g.tiles(&GemmCfg { stepped: false, stages: 2, ..stepped }));
+    let plans = conv_candidates(&policy, &g, &caps);
+    assert!(!plans.is_empty() && plans.iter().all(|p| !p.cfg().stepped), "{plans:?}");
+}
+
 /// The kernel builds off the GPU, on every arch of the table, with and without a
 /// residual — the row gather, the ragged store and the epilogue all lower.
 #[test_case(RDNA4, geom(40, 192, 192, 3, 1), true; "rdna4 3x3 with residual")]

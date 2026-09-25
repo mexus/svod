@@ -22,7 +22,7 @@ use super::device_supported;
 /// when one of these tiles it, so the predicate tests are written against the
 /// same list the policy searches rather than a restatement of its divisibility
 /// rules.
-const TABLE: [GemmCfg; 4] = CUDA_TILES;
+const TABLE: [GemmCfg; 5] = CUDA_TILES;
 
 /// The accumulator fragment width of every arch the GEMM is built for
 /// (`mma.sync`'s and gfx11 WMMA's 16×16).
@@ -340,6 +340,51 @@ fn every_table_tile_matches_linear_gpu(index: usize) {
     let err = rel_err(&to_f32_vec(&y), &want);
     println!("gemm_nt tile {index} {cfg:?}: relative error {err:e}");
     assert!(err < BF16_REL_TOL, "tile {index}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
+}
+
+/// Both `cp.async` loops — whole strips and stepped — at every strip depth the
+/// stepped one runs through (one, two and four 16-deep MMA steps) and every
+/// pipeline depth, down to a K slab exactly one pipeline long (the prologue then
+/// fills every shared half and the tail's prefetches all wrap), on a 64×64 tile
+/// with two accumulators per wave — at most 48 KiB of shared memory in every
+/// case. Each sums every output in the same order as the single-buffered loop
+/// over the same tile, so all three must agree bit for bit.
+#[test_case(16, 2, 2; "one step, two stages, K of one pipeline")]
+#[test_case(16, 3, 7; "one step, three stages")]
+#[test_case(32, 2, 5; "two steps, two stages")]
+#[test_case(32, 3, 3; "two steps, three stages, K of one pipeline")]
+#[test_case(32, 4, 9; "two steps, four stages")]
+#[test_case(64, 2, 4; "four steps, two stages")]
+#[test_case(64, 3, 3; "four steps, three stages, K of one pipeline")]
+#[ignore]
+fn cp_async_loops_match_single_buffered_gpu(k_step: usize, stages: usize, trips: usize) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip cp_async_loops_match_single_buffered_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (256usize, k_step * trips, 128usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    if arch.cuda().is_none() {
+        eprintln!("skip cp_async_loops_match_single_buffered_gpu: {arch:?} has no cp.async");
+        return;
+    }
+    let cfg = GemmCfg { acc_m: 2, k_step, stages, ..NT_64X64 };
+    assert!(cfg.shared_bytes(2) <= SHARED_MAX, "{cfg:?} must fit static shared memory");
+    let run = |cfg: GemmCfg| {
+        let y = gemm_nt_with(&x, &w, move |_, _, _| Some(cfg)).expect("gemm_nt build").expect("the tile applies");
+        to_f32_vec(&y)
+    };
+    let single = run(GemmCfg { stages: 1, ..cfg });
+    let want = to_f32_vec(&x.linear().weight(&w).call().expect("reference linear"));
+    for stepped in [false, true] {
+        let cfg = GemmCfg { stepped, ..cfg };
+        let got = run(cfg);
+        let err = rel_err(&got, &want);
+        println!("{cfg:?}: relative error {err:e}");
+        assert!(err < BF16_REL_TOL, "{cfg:?}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
+        assert_eq!(got, single, "{cfg:?} and its single-buffered form sum in the same order");
+    }
 }
 
 /// A `[B, L, K]` activation is `B·L` rows: the output is `[B, L, N]` and equals

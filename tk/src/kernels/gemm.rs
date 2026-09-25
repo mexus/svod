@@ -13,12 +13,14 @@
 //!   two coordinates exchanged, so both strips fill and gather identically and the
 //!   orientation is carried entirely by the `mma` variant.
 //! - [`GemmCfg::stages`] — `1` keeps the single-buffered fill/barrier/gather/mma
-//!   loop; `2` runs the software pipeline (the flash-attention K/V pattern): the
-//!   next K strip is in flight under the current strip's gathers and MMAs, under
-//!   one workgroup barrier per trip. The fill primitive is the arch's, chosen
-//!   through [`Group`]: `cp.async` straight into the other shared half where it
-//!   applies (CUDA sm_80+), else the register-staged stream — `global_load`
-//!   before the MMAs, `ds_write` into the other half after them.
+//!   loop; more runs a software pipeline (the flash-attention K/V pattern): the
+//!   next K strips are in flight under the current strip's gathers and MMAs,
+//!   under one workgroup barrier per trip. The fill primitive is the arch's,
+//!   chosen through [`Group`]: `cp.async` straight into another shared strip
+//!   where it applies (CUDA sm_80+), else the two-deep register-staged stream —
+//!   `global_load` before the MMAs, `ds_write` into the other half after them.
+//!   Under `cp.async`, [`GemmCfg::stepped`] consumes each strip one MMA step at a
+//!   time instead of gathering it whole — cutlass's multistage main loop.
 //!
 //! The output dtype is the bound C buffer's: a bf16 `c_gl` makes the epilogue cast
 //! the f32 accumulators on the way out, with no f32 round trip through memory.
@@ -135,6 +137,15 @@ pub struct GemmCfg {
     /// double-buffered software pipeline (`cp.async` where the arch has it, the
     /// register-staged stream elsewhere; deeper pipelines are `cp.async`-only).
     pub stages: usize,
+    /// Consume each `cp.async` strip in MMA steps, cutlass's way: the next
+    /// step's fragments gathered under the current step's MMAs, the trip's
+    /// barrier before its last step, and the next strip's first fragments
+    /// carried across the back edge, so the matrix core never idles behind the
+    /// barrier and a burst of copies — which cost the whole-strip 128×128 tile
+    /// ~180 ns a trip on sm_86. The carried fragments cost registers, and the whole-strip
+    /// loop still wins where enough blocks are resident to cover its trip head.
+    /// Ignored where the strips do not go through `cp.async`.
+    pub stepped: bool,
     /// B's global layout.
     pub b_order: BOrder,
     /// Drive `(pid_m, pid_n)` from a flattened 1-D grid via the chiplet/L2
@@ -376,89 +387,20 @@ pub fn gemm_core_with(
 
     let lp = ker.loop_static(trips);
     let strip = Strips { cfg: &cfg, a_gl: &a_gl, b_gl: &b_gl, row: &row, col: &col, slab: slab.clone(), trips, a_rows };
-
-    let (a_cur, b_cur, stream) =
-        if cfg.stages > 1 { strip.pipelined(&g, &lp, a_smem, b_smem) } else { strip.single(&g, &lp, a_smem, b_smem) };
-    let ragged_m = m % cfg.block_m != 0;
-
-    // Shared B sub-tile (N col-block {warp_col}, same for every accumulator), and
-    // per-accumulator A sub-tiles (M row-block {warp_row + a·warps_m}).
-    let (b_reg, b_view) = b_operand(ker, &cfg, &in_dt, &warp_col, &b_cur);
-    let bb = g.load(b_reg, b_view, MoveIdx::default());
-    let a_subs: Vec<RT> = (0..cfg.acc_m)
-        .map(|a| {
-            g.load(
-                ker.operand((reg_m, k_step), in_dt.clone(), TileLayout::Row),
-                a_cur.subtile((reg_m, k_step), (acc_row(&warp_row, a, &cfg), 0)),
-                MoveIdx::default(),
-            )
-        })
-        .collect();
-
-    // Cross-wave WAR barrier: every wave must finish reading LDS before the next
-    // K iteration's collaborative fill overwrites it. The pipelines fence
-    // elsewhere — at the loop top (`cp.async`) or in the tail commit (staged) —
-    // with one barrier covering both the RAW and the WAR.
-    let (bb, a_subs) = if matches!(stream, Stream::Single) {
-        let mut bar_deps: SmallVec<[Arc<UOp>; 4]> = smallvec![bb.uop().clone()];
-        bar_deps.extend(a_subs.iter().skip(1).map(|t| t.uop().clone()));
-        let sync = a_subs[0].uop().barrier(bar_deps);
-        let bb = bb.after(smallvec![sync.clone()]);
-        (bb, a_subs.into_iter().map(|t| t.after(smallvec![sync.clone()])).collect())
+    let wave = Wave { ker, cfg: &cfg, in_dt, row: warp_row.clone(), col: warp_col.clone(), k_edge: wmma_k };
+    let copies = cfg.stages > 1 && g.cp_async_fill_applies(&a_smem, &a_gl) && g.cp_async_fill_applies(&b_smem, &b_gl);
+    let ended = if copies && cfg.stepped {
+        strip.stepped(&g, &lp, a_smem, b_smem, &wave, &accs)
     } else {
-        (bb, a_subs)
+        strip.whole(&g, &lp, a_smem, b_smem, &wave, &accs, copies)
     };
-
-    // MMA-accumulate each accumulator over the K sub-steps; chain accumulator `a`'s
-    // A-input through accumulator `a-1`'s MMA so a single `END` scopes them all
-    // inside the K-loop.
-    let mut prev_out: Option<Arc<UOp>> = None;
-    for (a, a_sub) in a_subs.iter().enumerate() {
-        let a_sub = match &prev_out {
-            Some(p) => a_sub.after(smallvec![p.clone()]),
-            None => a_sub.clone(),
-        };
-        let acc = accs[a].clone();
-        let out = match cfg.b_order {
-            BOrder::Kn => g.mma_ab(acc, &a_sub, &bb),
-            BOrder::Nk => g.mma_abt(acc, &a_sub, &bb),
-        };
-        prev_out = Some(out.uop().clone());
-    }
-    let ended = match &stream {
-        // The staged stream's `ds_write` of the next strip lands after this trip's
-        // MMAs (ordered through the last one), and the one barrier-wrapped commit
-        // of both strips is the loop's terminal store: one fence per trip,
-        // covering the RAW on the half just written and the WAR on the half every
-        // wave just gathered.
-        Stream::Staged { stage, nxt } => {
-            let after_mma = prev_out.clone().expect("at least one accumulator");
-            // Pin the trip's shape against the AMDGPU machine scheduler. Left to
-            // itself it hoists the whole commit — the `ds_write`s, their
-            // `s_wait_loadcnt` on the prefetch, and the barrier that closes them —
-            // *above* the MMAs, which is the one order the double buffer must not
-            // have: the workgroup then waits on global memory at a barrier with no
-            // MMAs in flight to cover it, so every wave's stall becomes the whole
-            // group's. The `mask = 0` fence forbids the move, leaving the trip's
-            // MMAs between the prefetch issue and the wait that consumes it.
-            let after_mma = if ker.caps.needs_pipeline_commit_fence() {
-                crate::asm::sched_barrier(0, after_mma)
-            } else {
-                after_mma
-            };
-            let (a_nxt, b_nxt) = (nxt[0].after(&after_mma), nxt[1].after(&after_mma));
-            let fenced = g.commit_regs_to_local(&[(&a_nxt, &stage[0]), (&b_nxt, &stage[1])]).barrier(smallvec![]);
-            ker.push_store(fenced, a_nxt.uop().clone());
-            lp.close()
-        }
-        _ => lp.close(),
-    };
+    let ragged_m = m % cfg.block_m != 0;
     // Each accumulator reads its fully-reduced register value *outside* the loop.
     let final_accs: Vec<RT> = accs.iter().map(|c| c.after(smallvec![ended.clone()])).collect();
     // No copy may be outstanding at exit: drain the last trip's wrapped prefetch
     // before the epilogue writes (threaded through the GLOBAL tile, so the carried
     // accumulators keep their plain post-loop reads).
-    let c_gl = if matches!(stream, Stream::Async) {
+    let c_gl = if copies {
         let drained = cp_async_wait_all(smallvec![final_accs[0].uop().clone()]);
         c_gl.rewrap(c_gl.uop().after(smallvec![drained]))
     } else {
@@ -600,10 +542,15 @@ pub(super) fn narrow<'k>(ker: &'k Kernel, g: &Group<'k>, acc: RT<'k>, out_dt: &D
     out
 }
 
-/// How the K strips reach shared memory, and what [`gemm_core`] owes each stream
-/// after the trip's MMAs.
+/// Shared strip `p` of the `stages`-deep `st`.
+fn half(st: &ST, p: &Arc<UOp>) -> ST {
+    st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)))
+}
+
+/// How [`Strips::whole`] gets its strips into shared memory, and what it owes
+/// each stream after the trip's MMAs.
 enum Stream {
-    /// Single-buffered: the caller fences the gathers against the next fill.
+    /// Single-buffered: the gathers are fenced against the next fill.
     Single,
     /// The `cp.async` pipeline: fenced at the loop top; drained after the loop.
     Async,
@@ -611,6 +558,90 @@ enum Stream {
     /// and is committed into the `nxt` halves after the MMAs, under the trip's
     /// one barrier.
     Staged { stage: [Arc<UOp>; 2], nxt: Box<[ST; 2]> },
+}
+
+/// One wave's share of the workgroup: the accumulators it owns (M row-blocks
+/// `row + a·warps_m`, N col-block `col`) and the operand fragments it gathers
+/// for them out of the shared strips.
+struct Wave<'a, 'k> {
+    ker: &'k Kernel,
+    cfg: &'a GemmCfg,
+    in_dt: DType,
+    row: Arc<UOp>,
+    col: Arc<UOp>,
+    /// The matrix core's K-edge: the depth of one MMA step.
+    k_edge: usize,
+}
+
+/// A wave's operand fragments over one slice of K: B's, then A's per accumulator.
+#[derive(Clone)]
+struct Frags<'k> {
+    b: RT<'k>,
+    a: Vec<RT<'k>>,
+}
+
+impl<'k> Frags<'k> {
+    fn map(&self, f: impl Fn(&RT<'k>) -> RT<'k>) -> Self {
+        Self { b: f(&self.b), a: self.a.iter().map(f).collect() }
+    }
+
+    fn uops(&self) -> impl Iterator<Item = Arc<UOp>> + '_ {
+        std::iter::once(&self.b).chain(&self.a).map(|t| t.uop().clone())
+    }
+}
+
+impl<'k> Wave<'_, 'k> {
+    /// Fresh fragments `depth` deep in K.
+    fn frags(&self, depth: usize) -> Frags<'k> {
+        let (cfg, dt) = (self.cfg, &self.in_dt);
+        let b = match cfg.b_order {
+            BOrder::Kn => self.ker.operand_b((depth, cfg.reg_n()), dt.clone(), TileLayout::Col),
+            BOrder::Nk => self.ker.operand_b((cfg.reg_n(), depth), dt.clone(), TileLayout::Row),
+        };
+        let a = (0..cfg.acc_m).map(|_| self.ker.operand((cfg.reg_m(), depth), dt.clone(), TileLayout::Row)).collect();
+        Frags { b, a }
+    }
+
+    /// Gather K step `step` — `dst`'s depth deep — of the strips `a_st` and `b_st`
+    /// into `dst`, each tile after the one before, so the last one orders after
+    /// all of them.
+    fn gather(&self, g: &Group<'k>, dst: Frags<'k>, a_st: &ST, b_st: &ST, step: usize) -> Frags<'k> {
+        let (cfg, step) = (self.cfg, Idx::Const(step as i64));
+        let (b_view, b_at) = match cfg.b_order {
+            BOrder::Kn => {
+                (b_st.subtile((cfg.k_step, cfg.reg_n()), (0, self.col.clone())), (step.clone(), Idx::Const(0)))
+            }
+            BOrder::Nk => {
+                (b_st.subtile((cfg.reg_n(), cfg.k_step), (self.col.clone(), 0)), (Idx::Const(0), step.clone()))
+            }
+        };
+        let b = g.load(dst.b, b_view, MoveIdx::block(b_at, 0));
+        let mut prev = b.uop().clone();
+        let a = (dst.a.into_iter().enumerate())
+            .map(|(i, t)| {
+                let view = a_st.subtile((cfg.reg_m(), cfg.k_step), (acc_row(&self.row, i, cfg), 0));
+                let t = g.load(t.after(&prev), view, MoveIdx::block((Idx::Const(0), step.clone()), 0));
+                prev = t.uop().clone();
+                t
+            })
+            .collect();
+        Frags { b, a }
+    }
+
+    /// Accumulate `f` into `accs`, one accumulator after another (the first after
+    /// `deps`), so the update returned — the last one — orders after them all and
+    /// a single `END` scopes them inside the K loop.
+    fn mma(&self, g: &Group<'k>, accs: &mut [RT<'k>], f: &Frags<'k>, mut deps: SmallVec<[Arc<UOp>; 4]>) -> Arc<UOp> {
+        for (acc, a) in accs.iter_mut().zip(&f.a) {
+            let a = if deps.is_empty() { a.clone() } else { a.after(deps) };
+            *acc = match self.cfg.b_order {
+                BOrder::Kn => g.mma_ab(acc.clone(), &a, &f.b),
+                BOrder::Nk => g.mma_abt(acc.clone(), &a, &f.b),
+            };
+            deps = smallvec![acc.uop().clone()];
+        }
+        deps.pop().expect("at least one accumulator")
+    }
 }
 
 /// The K-strip stream: everything the fill strategies share (the operand
@@ -648,6 +679,18 @@ impl Strips<'_> {
         [a, g.stage_global_to_reg(b_smem, self.b_gl, &bi, 2)]
     }
 
+    /// Issue the `cp.async` copies of K-strip `tile` of both operands into
+    /// `a_smem` / `b_smem` (one commit group each): A through its row source when
+    /// it has one.
+    fn copy(&self, g: &Group<'_>, a_smem: &ST, b_smem: &ST, tile: &Arc<UOp>) -> [Arc<UOp>; 2] {
+        let (ai, bi) = self.at(tile);
+        let a = match self.a_rows {
+            Some(rows) => g.cp_async_fill_rows(a_smem, self.a_gl, |r| rows(r, self.row, tile)),
+            None => g.cp_async_fill(a_smem, self.a_gl, &ai, 2),
+        };
+        [a, g.cp_async_fill(b_smem, self.b_gl, &bi, 2)]
+    }
+
     /// Single-buffered: one collaborative GLOBAL→LDS fill per trip, the two strips
     /// sharing ONE barrier (the RAW edge) before the gathers; the WAR edge back to
     /// the next fill is the barrier the caller puts after them (`fence = true`).
@@ -670,15 +713,83 @@ impl Strips<'_> {
         (a_f.after(smallvec![filled.clone()]), b_f.after(smallvec![filled]), Stream::Single)
     }
 
-    /// The software pipeline, on the fill primitive the arch has: `cp.async`
-    /// where it applies to both strips ([`Group::cp_async_fill_applies`]), else
-    /// the two-deep register-staged stream.
-    fn pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
-        if g.cp_async_fill_applies(&a_smem, self.a_gl) && g.cp_async_fill_applies(&b_smem, self.b_gl) {
-            self.async_pipelined(g, lp, a_smem, b_smem)
+    /// The K loop over whole strips: each trip fills a strip — single-buffered,
+    /// through the `cp.async` pipeline where `copies` says both strips take it,
+    /// else the register-staged double buffer — gathers all of it, then runs its
+    /// MMAs. Returns the loop's `END`.
+    #[allow(clippy::too_many_arguments)]
+    fn whole<'k>(
+        &self,
+        g: &Group<'k>,
+        lp: &Loop<'_>,
+        a_smem: ST,
+        b_smem: ST,
+        wave: &Wave<'_, 'k>,
+        accs: &[RT<'k>],
+        copies: bool,
+    ) -> Arc<UOp> {
+        let (ker, cfg) = (g.kernel(), self.cfg);
+        let (a_cur, b_cur, stream) = match cfg.stages {
+            1 => self.single(g, lp, a_smem, b_smem),
+            _ if copies => self.async_pipelined(g, lp, a_smem, b_smem),
+            _ => {
+                assert_eq!(cfg.stages, 2, "the register-staged pipeline is two-deep (one strip in flight)");
+                self.staged(g, lp, a_smem, b_smem)
+            }
+        };
+        // Shared B sub-tile (N col-block {warp_col}, same for every accumulator), and
+        // per-accumulator A sub-tiles (M row-block {warp_row + a·warps_m}).
+        let (b_reg, b_view) = b_operand(ker, cfg, &wave.in_dt, &wave.col, &b_cur);
+        let b = g.load(b_reg, b_view, MoveIdx::default());
+        let a: Vec<RT> = (0..cfg.acc_m)
+            .map(|i| {
+                g.load(
+                    ker.operand((cfg.reg_m(), cfg.k_step), wave.in_dt.clone(), TileLayout::Row),
+                    a_cur.subtile((cfg.reg_m(), cfg.k_step), (acc_row(&wave.row, i, cfg), 0)),
+                    MoveIdx::default(),
+                )
+            })
+            .collect();
+        let frags = Frags { b, a };
+        // Cross-wave WAR barrier: every wave must finish reading LDS before the next
+        // K iteration's collaborative fill overwrites it. The pipelines fence
+        // elsewhere — at the loop top (`cp.async`) or in the tail commit (staged) —
+        // with one barrier covering both the RAW and the WAR.
+        let frags = if matches!(stream, Stream::Single) {
+            let mut bar_deps: SmallVec<[Arc<UOp>; 4]> = frags.uops().collect();
+            let first = bar_deps.remove(1);
+            let sync = first.barrier(bar_deps);
+            frags.map(|t| t.after(smallvec![sync.clone()]))
         } else {
-            assert_eq!(self.cfg.stages, 2, "the register-staged pipeline is two-deep (one strip in flight)");
-            self.staged(g, lp, a_smem, b_smem)
+            frags
+        };
+        let after_mma = wave.mma(g, &mut accs.to_vec(), &frags, SmallVec::new());
+        match &stream {
+            // The staged stream's `ds_write` of the next strip lands after this trip's
+            // MMAs (ordered through the last one), and the one barrier-wrapped commit
+            // of both strips is the loop's terminal store: one fence per trip,
+            // covering the RAW on the half just written and the WAR on the half every
+            // wave just gathered.
+            Stream::Staged { stage, nxt } => {
+                // Pin the trip's shape against the AMDGPU machine scheduler. Left to
+                // itself it hoists the whole commit — the `ds_write`s, their
+                // `s_wait_loadcnt` on the prefetch, and the barrier that closes them —
+                // *above* the MMAs, which is the one order the double buffer must not
+                // have: the workgroup then waits on global memory at a barrier with no
+                // MMAs in flight to cover it, so every wave's stall becomes the whole
+                // group's. The `mask = 0` fence forbids the move, leaving the trip's
+                // MMAs between the prefetch issue and the wait that consumes it.
+                let after_mma = if ker.caps.needs_pipeline_commit_fence() {
+                    crate::asm::sched_barrier(0, after_mma)
+                } else {
+                    after_mma
+                };
+                let (a_nxt, b_nxt) = (nxt[0].after(&after_mma), nxt[1].after(&after_mma));
+                let fenced = g.commit_regs_to_local(&[(&a_nxt, &stage[0]), (&b_nxt, &stage[1])]).barrier(smallvec![]);
+                ker.push_store(fenced, a_nxt.uop().clone());
+                lp.close()
+            }
+            Stream::Single | Stream::Async => lp.close(),
         }
     }
 
@@ -690,7 +801,6 @@ impl Strips<'_> {
     /// index wraps modulo the trip count, so the last trip re-reads strip 0
     /// (never gathered) instead of running off the operand.
     fn staged(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
-        let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
         let [s_a, s_b] = self.stage(g, &a_smem, &b_smem, &cidx(0));
         let (a_half, b_half) = (half(&a_smem, &cidx(0)), half(&b_smem, &cidx(0)));
         let landed = g.commit_regs_to_local(&[(&a_half, &s_a), (&b_half, &s_b)]).barrier(smallvec![]);
@@ -724,19 +834,10 @@ impl Strips<'_> {
     /// trips re-read strip 0 (never gathered) instead of running off the operand.
     fn async_pipelined(&self, g: &Group<'_>, lp: &Loop<'_>, a_smem: ST, b_smem: ST) -> (ST, ST, Stream) {
         let stages = self.cfg.stages as i64;
-        let half = |st: &ST, p: &Arc<UOp>| st.with_base_offset(p.mul(&cidx(st.half_elems() as i64)));
-        let issue = |a: &ST, b: &ST, t: &Arc<UOp>| {
-            let (ai, bi) = self.at(t);
-            let a_copy = match self.a_rows {
-                Some(rows) => g.cp_async_fill_rows(a, self.a_gl, |r| rows(r, self.row, t)),
-                None => g.cp_async_fill(a, self.a_gl, &ai, 2),
-            };
-            [a_copy, g.cp_async_fill(b, self.b_gl, &bi, 2)]
-        };
         // Prologue: strips `0..stages-1`, each into its own half.
         let mut deps: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
         for j in 0..stages - 1 {
-            deps.extend(issue(&half(&a_smem, &cidx(j)), &half(&b_smem, &cidx(j)), &cidx(j % self.trips)));
+            deps.extend(self.copy(g, &half(&a_smem, &cidx(j)), &half(&b_smem, &cidx(j)), &cidx(j % self.trips)));
         }
         let a_smem = a_smem.after(deps.clone());
         let b_smem = b_smem.after(deps);
@@ -751,8 +852,103 @@ impl Strips<'_> {
         // one per operand) in flight and retires everything older, i.e. strip `idx`.
         let landed = cp_async_wait(2 * (stages as u32).saturating_sub(2), smallvec![idx]).barrier(smallvec![]);
         let mut issued: SmallVec<[Arc<UOp>; 4]> = smallvec![landed.clone()];
-        issued.extend(issue(&half(&a_smem, &par_nxt).after(&landed), &half(&b_smem, &par_nxt).after(&landed), &pf));
+        issued.extend(self.copy(
+            g,
+            &half(&a_smem, &par_nxt).after(&landed),
+            &half(&b_smem, &par_nxt).after(&landed),
+            &pf,
+        ));
         (half(&a_smem, &par_cur).after(issued.clone()), half(&b_smem, &par_cur).after(issued), Stream::Async)
+    }
+
+    /// The K loop over the `cp.async` pipeline, in the shape of cutlass's
+    /// multistage main loop: a strip is consumed in `k_step / k_edge` MMA steps,
+    /// each step's fragments gathered while the step before it runs, so no MMA
+    /// waits on its own gather. The trip's one barrier sits before its last step
+    /// rather than at its head, and the next strip's first fragments are gathered
+    /// there, under the last step's MMAs, and carried across the back edge — the
+    /// matrix core is never left idle behind the barrier and a burst of copies,
+    /// which cost the whole-strip loop ~340 cycles a trip on sm_86.
+    ///
+    /// A prologue issues strips `0..stages`, one per shared half, waits for the
+    /// first and gathers its first step. At trip `t`'s barrier strip `t + 1` has
+    /// landed (`wait_group` leaves the `stages - 2` newer strips in flight) and
+    /// every wave is past its gathers of strip `t`, so the copy of strip
+    /// `t + stages` goes into strip `t`'s half right there, `stages - 1` whole
+    /// trips ahead of its own barrier. Prefetch indices wrap modulo the trip
+    /// count, so the tail re-reads the first strips (never gathered) instead of
+    /// running off the operand; the copies still in flight at exit are the
+    /// caller's to drain.
+    fn stepped<'k>(
+        &self,
+        g: &Group<'k>,
+        lp: &Loop<'_>,
+        a_smem: ST,
+        b_smem: ST,
+        wave: &Wave<'_, 'k>,
+        accs: &[RT<'k>],
+    ) -> Arc<UOp> {
+        let ker = g.kernel();
+        let (stages, depth) = (self.cfg.stages as i64, wave.k_edge);
+        let steps = self.cfg.k_step / depth;
+        // Wait until only the `newer` newest strips (two commits each, one per
+        // operand) are in flight, then fence the workgroup.
+        let fence = |newer: i64, deps| cp_async_wait(2 * newer as u32, deps).barrier(smallvec![]);
+
+        let mut copies: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
+        for j in 0..stages {
+            copies.extend(self.copy(g, &half(&a_smem, &cidx(j)), &half(&b_smem, &cidx(j)), &cidx(j % self.trips)));
+        }
+        let landed = fence(stages - 1, copies);
+        let (a_smem, b_smem) = (a_smem.after(&landed), b_smem.after(&landed));
+        let carried = wave.gather(g, wave.frags(depth), &half(&a_smem, &cidx(0)), &half(&b_smem, &cidx(0)), 0);
+
+        let idx = lp.index();
+        let par = |ahead: i64| idx.add(&cidx(ahead)).try_mod(&cidx(stages)).expect("stage parity");
+        let (a_cur, b_cur) = (half(&a_smem, &par(0)), half(&b_smem, &par(0)));
+        let pf = idx.add(&cidx(stages)).try_mod(&cidx(self.trips)).expect("prefetch strip % trips");
+        let prefetch =
+            |deps: SmallVec<[Arc<UOp>; 4]>| self.copy(g, &a_cur.after(deps.clone()), &b_cur.after(deps), &pf);
+
+        // Every register index of an unrolled MMA is a constant, which the carried
+        // fragments need to stay in registers across the back edge.
+        let rolled = ker.unrolled();
+        ker.set_unroll(true);
+        let first = carried.map(|t| lp.reinit(t.clone()));
+        let mut accs = accs.to_vec();
+        // The barrier stays in the loop even when no gather of this strip is left
+        // to order it (a strip of one step).
+        let (mut frags, mut reads) = (first.clone(), smallvec![idx.clone()]);
+        let (mut step0, mut after) = (None, SmallVec::new());
+        for s in 1..steps {
+            let next = wave.gather(g, wave.frags(depth), &a_cur, &b_cur, s);
+            reads.extend(next.uops());
+            after = smallvec![wave.mma(g, &mut accs, &frags, after)];
+            step0.get_or_insert_with(|| after.clone());
+            frags = next;
+        }
+        let landed = fence(stages - 2, reads);
+        let (a_nxt, b_nxt) = (half(&a_smem, &par(1)).after(&landed), half(&b_smem, &par(1)).after(&landed));
+        // The next strip's first step overwrites the carried fragments step 0 read,
+        // and the copy of strip `t + stages` the half every wave has now finished
+        // gathering; the last step's MMAs order after both — or, with a single step,
+        // the reload after the MMAs and the copy — so they end the trip.
+        match step0 {
+            Some(step0) => {
+                let reload = wave.gather(g, first.map(|t| t.after(step0.clone())), &a_nxt, &b_nxt, 0);
+                after.extend(reload.uops());
+                after.extend(prefetch(reload.uops().collect()));
+                wave.mma(g, &mut accs, &frags, after);
+            }
+            None => {
+                let done = wave.mma(g, &mut accs, &frags, after);
+                let copies = prefetch(smallvec![landed]);
+                let deps: SmallVec<[Arc<UOp>; 4]> = [done].into_iter().chain(copies).collect();
+                wave.gather(g, first.map(|t| t.after(deps.clone())), &a_nxt, &b_nxt, 0);
+            }
+        }
+        ker.set_unroll(rolled);
+        lp.close()
     }
 }
 
@@ -778,6 +974,7 @@ pub const NT_128X64: GemmCfg = GemmCfg {
     acc_m: 2,
     k_step: 32,
     stages: 2,
+    stepped: false,
     b_order: BOrder::Nk,
     l2_swizzle: true,
     vec_load: true,
@@ -817,11 +1014,20 @@ pub const NT_32X32: GemmCfg = GemmCfg { block_m: 32, block_n: 32, acc_m: 1, k_st
 /// still). Kept for a device with more bandwidth per FLOP, which flips the sign.
 pub const NT_SPLIT_K: GemmCfg = GemmCfg { split_k: 2, l2_swizzle: false, ..NT_128X64 };
 
-/// The CUDA sm_80+ tiles, widest first. The two fine ones are never the static
+/// [`NT_64X64`] on the stepped main loop ([`GemmCfg::stepped`]) over three
+/// strips. Measured on sm_86 against the best whole-strip tile: ModernBERT's
+/// `512×1152×768` 49.2 against 50.2 µs and Qwen3's `4096×3072×1024` down
+/// projection 994 against 1004, a tie at `512×768×768`, and 2-6% behind on
+/// ModernBERT's other shapes, which keep the whole-strip tiles.
+pub const NT_64X64_STEPPED: GemmCfg = GemmCfg { stages: 3, stepped: true, ..NT_64X64 };
+
+/// The CUDA sm_80+ tiles, widest first. The last three are never the static
 /// choice ([`GemmPolicy::cfg`] keeps its order among the tiles narrower than the
-/// widest): they are there for [`GemmPolicy::tuned`] to measure on a shape whose
-/// grid starves the device, which the convolutions at 20² and 40² do.
-pub const CUDA_TILES: [GemmCfg; 4] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32];
+/// widest, and [`NT_64X64`] tiles every shape the stepped one does): they are
+/// there for [`GemmPolicy::tuned`] to measure — the two fine ones on a shape
+/// whose grid starves the device, which the convolutions at 20² and 40² do, the
+/// stepped one on the short linear layers.
+pub const CUDA_TILES: [GemmCfg; 5] = [NT_128X64, NT_64X64, NT_64X64_W8, NT_32X32, NT_64X64_STEPPED];
 
 /// The RDNA (wave32 WMMA) tiles, measured on gfx1151: the CUDA tiles without the
 /// L2 swizzle, plus the fine tile on a 64-deep strip, which halves the barriers
@@ -1342,6 +1548,7 @@ impl MatmulCfg {
             acc_m: self.n_accum,
             k_step,
             stages: 1,
+            stepped: false,
             b_order: BOrder::Kn,
             l2_swizzle: self.l2_swizzle,
             vec_load: self.vec_load,
