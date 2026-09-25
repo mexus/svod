@@ -936,26 +936,40 @@ fn test_fa_tile_bench_cuda() {
 /// Render `build_fa_mw_rdb` for sm_86 through the launch path's pipeline
 /// (post-optimization with the CUDA profile → linearize → render); with
 /// `TK_DUMP_IR=dir` the IR is written to `dir/<name>.ll` for offline `ptxas -v`.
-fn render_fa_sm86(
+fn render_fa_sm86(name: &str, dims: (usize, usize, usize, usize, usize), cfg: FaConfig, mask: FaMask) -> String {
+    render_fa_llvm(SM_86, name, dims, cfg, mask)
+}
+
+/// [`render_fa_sm86`] for any LLVM-rendered arch (CUDA or AMD). The key mask is
+/// bound as the f32 bias both seeding arches read.
+fn render_fa_llvm(
+    arch: svod_dtype::GpuArch,
     name: &str,
     (b, n, h, h_kv, d): (usize, usize, usize, usize, usize),
     cfg: FaConfig,
     mask: FaMask,
 ) -> String {
     use crate::kernels::fa::NUM_WARPS;
-    let sm86 = svod_dtype::CudaArch::from_compute_capability(8, 6);
-    let caps = crate::ArchCaps::for_arch(svod_dtype::GpuArch::Cuda(sm86));
+    let caps = crate::ArchCaps::for_arch(arch);
     let grid = [h as i64, (n / cfg.q_blk / NUM_WARPS) as i64, b as i64];
     let mut bufs = dummy_fa_buffers(b, n, h, h_kv, d);
-    assert!(!mask.key_lens && !mask.seg_start, "render_fa_sm86 binds the key mask only");
+    assert!(!mask.key_lens && !mask.seg_start, "render_fa_llvm binds the key mask only");
     if mask.key_mask {
         bufs.push(UOp::new_buffer(DeviceSpec::Cpu, b * n, DType::Float32));
     }
     let ker = Kernel::new(name, grid, (NUM_WARPS * caps.wave_size) as i64, bufs, caps);
     build_fa_mw_rdb(&ker, b, n, h, h_kv, d, cfg, DType::BFloat16, mask);
     let sink = ker.finish(1);
-    let renderer = svod_codegen::llvm::LlvmTextRenderer::nvptx(sm86);
-    let opt_renderer = svod_schedule::OptimizerRenderer::for_cuda_arch(sm86).with_rewrite_capabilities(
+    let (renderer, opt_renderer) = match arch {
+        svod_dtype::GpuArch::Cuda(cuda) => {
+            (svod_codegen::llvm::LlvmTextRenderer::nvptx(cuda), svod_schedule::OptimizerRenderer::for_cuda_arch(cuda))
+        }
+        svod_dtype::GpuArch::Amd(amd) => {
+            (svod_codegen::llvm::LlvmTextRenderer::amd(amd), svod_schedule::OptimizerRenderer::for_amd_arch(amd))
+        }
+        other => panic!("render_fa_llvm renders CUDA or AMD, not {other:?}"),
+    };
+    let opt_renderer = opt_renderer.with_rewrite_capabilities(
         svod_ir::RendererOps::all(),
         svod_codegen::traits::Renderer::decompositor(&renderer),
         None,
@@ -1722,5 +1736,30 @@ fn fa_sm86_key_mask_seeds_the_scores(q_blk: usize, kv_blk: usize) {
         }
         assert_eq!(masked.matches("ld.global.nc.v2.b32").count(), kv_blk / 8, "the bias loads:\n{masked}");
         assert_eq!(plain.matches("ld.global.nc.v2.b32").count(), 0);
+    }
+}
+
+/// On gfx12 too the key mask seeds the `QKᵀ` accumulator (no per-score compare or
+/// select next to the unmasked kernel — the rolled body's seed loop adds only its
+/// own `icmp ult` exit tests), and the softmax runs on the bare
+/// `v_exp_f32`: every f32 `exp2` is `llvm.amdgcn.exp2`, none keeps the
+/// denormal fix-up of `llvm.exp2`.
+#[test_case::test_case(16, 32; "16x32")]
+#[test_case::test_case(32, 32; "32x32")]
+fn fa_gfx1201_key_mask_seeds_the_scores(q_blk: usize, kv_blk: usize) {
+    let gfx1201 = svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1201);
+    let cfg = FaConfig { q_blk, kv_blk, unroll: false, causal: false, window: None };
+    let render = |mask: FaMask| {
+        let name = format!("fa_seed_gfx1201_{q_blk}x{kv_blk}_{}", mask.key_mask);
+        render_fa_llvm(gfx1201, &name, (1, 512, 2, 2, 64), cfg, mask)
+    };
+    let (plain, masked) = (render(FaMask::NONE), render(FaMask { key_mask: true, ..FaMask::NONE }));
+    let count = |code: &str, needle: &str| code.lines().filter(|l| l.contains(needle)).count();
+    for needle in [" select ", " icmp eq ", " icmp ne ", " fcmp "] {
+        assert_eq!(count(&masked, needle), count(&plain, needle), "the key mask added a per-score `{needle}`");
+    }
+    for code in [&plain, &masked] {
+        assert!(count(code, "call float @llvm.amdgcn.exp2.f32(") > 0, "the softmax exp2 is v_exp_f32:\n{code}");
+        assert_eq!(count(code, "@llvm.exp2.f32"), 0, "an exp2 kept the denormal fix-up:\n{code}");
     }
 }

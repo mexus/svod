@@ -205,11 +205,12 @@ struct FaCtx<'a, 'k> {
 /// rather than as an `i32` validity table the scores are masked by after it. A
 /// key's validity is one value per column, so the seed costs a load per key a
 /// lane holds and nothing per score: at 1×8192 on sm_86 the masked kernel runs
-/// within 1% of the unmasked one instead of 3% behind it. The scores are
-/// bit-identical — `0 + s = s`, and a hidden key stays `−∞` through the MMA and
-/// the scale. CUDA only: the seed is not re-validated on the AMD or Apple cores.
+/// within 1% of the unmasked one instead of 3% behind it; on gfx1201, where the
+/// table's compare and select cost registers too, 2796 µs instead of 3229. The
+/// scores are bit-identical — `0 + s = s`, and a hidden key stays `−∞` through
+/// the MMA and the scale. Validated on CUDA and gfx12 only.
 fn key_mask_seeds(caps: &crate::ArchCaps) -> bool {
-    caps.cuda().is_some()
+    caps.cuda().is_some() || caps.amd().is_some_and(svod_dtype::AmdArch::is_rdna4)
 }
 
 /// The dtype the kernel reads the key mask in ([`key_mask_seeds`]).
@@ -354,7 +355,7 @@ fn fa_softmax_pv<'k>(
     let FaAcc { mut max_vec, mut norm_vec, mut o_reg } = acc;
 
     let max_vec_last = warp.copy(lp.reinit(max_vec_last), &max_vec);
-    max_vec = warp.col_reduce(max_vec.after(&max_vec_last), &att, |a, b| a.max(b), f64::NEG_INFINITY);
+    max_vec = warp.col_reduce(max_vec.after(&max_vec_last), &att, |a, b| warp.max_num(a, b), f64::NEG_INFINITY);
 
     // Online-softmax rescale `exp2(prev_max - new_max)` as a same-shape vec−vec op
     // — reuses `max_vec_last`'s buffer (dead after this), so no scratch `scale_vec`
