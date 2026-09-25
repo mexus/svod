@@ -95,8 +95,10 @@ fn fa_sink() -> Arc<UOp> {
 // FA graphs lose the per-commit `After`s and their fences).
 const MATMUL_DIGEST: u128 = 0x46f1_2eba_2d20_2f85_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 1208;
-const FA_DIGEST: u128 = 0xcc62_ca0c_cd87_072f_0000_0000_0000_0000;
+const FA_DIGEST: u128 = 0xcfc7_ea8f_ee49_2c9a_0000_0000_0000_0000;
 const FA_NODES: usize = 808;
+// Every FA digest moved, node counts unchanged, when tk's f32 `exp2` became the bare
+// `v_exp_f32` on AMD (`exp2_flush`: one CUSTOM in place of each EXP2).
 // The FA digests moved again for the packed-row segment mask: the running max
 // starts at the finite f32 floor instead of `-∞` (one constant node per graph).
 // Non-causal and non-causal+key-masked build variants (pin the `causal:false` and
@@ -105,20 +107,20 @@ const FA_NODES: usize = 808;
 // Before #177 the FA digests moved when the Q tile lost its f32 staging copy: the
 // gather lands the 16-bit operand dtype straight in registers (the softmax scale
 // already rides on the f32 `QKᵀ` accumulator), so each variant drops those 16 nodes.
-const FA_NONCAUSAL_DIGEST: u128 = 0x2ef6_f110_3b75_10d9_0000_0000_0000_0000;
+const FA_NONCAUSAL_DIGEST: u128 = 0x6f71_e0e8_ab87_8e7f_0000_0000_0000_0000;
 const FA_NONCAUSAL_NODES: usize = 782;
-const FA_MASKED_DIGEST: u128 = 0xd0c5_244b_c74b_6a0c_0000_0000_0000_0000;
+const FA_MASKED_DIGEST: u128 = 0xc339_22d9_570a_75a3_0000_0000_0000_0000;
 const FA_MASKED_NODES: usize = 806;
 // Causal + segment-masked (packed rows): the `seg_start:Some` branch, a per-row
 // table read inside the score mask.
-const FA_SEGMENTED_DIGEST: u128 = 0xe7bf_c1ef_e0ab_810c_0000_0000_0000_0000;
+const FA_SEGMENTED_DIGEST: u128 = 0x4fe3_ef91_7fc1_1c7c_0000_0000_0000_0000;
 const FA_SEGMENTED_NODES: usize = 836;
 // Sliding window (the band's KV block range per workgroup, the band mask and the
 // empty-row norm floor) and the general `[B, N]` key mask (a per-key table read
 // inside the score mask, and the same floor).
-const FA_WINDOWED_DIGEST: u128 = 0x14c5_1d86_aef9_cb2a_0000_0000_0000_0000;
+const FA_WINDOWED_DIGEST: u128 = 0x8b3d_f541_229d_eb71_0000_0000_0000_0000;
 const FA_WINDOWED_NODES: usize = 872;
-const FA_KEY_MASKED_DIGEST: u128 = 0x8e0c_2283_8862_0ffa_0000_0000_0000_0000;
+const FA_KEY_MASKED_DIGEST: u128 = 0xb443_6d4b_1058_10d8_0000_0000_0000_0000;
 const FA_KEY_MASKED_NODES: usize = 829;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
