@@ -1040,40 +1040,96 @@ impl<'k> Group<'k> {
     where
         F: Fn(Vec<Arc<UOp>>, &Arc<UOp>) -> Vec<Arc<UOp>>,
     {
+        self.store_local_runs(dst, st, ix, None, |mut runs, off| vec![value(runs.remove(0), off)])
+    }
+
+    /// [`Self::store_local_vec`] a pair of runs at a time: a thread takes a run
+    /// in the first half of each `2·half`-column group of a row together with
+    /// the run `half` columns along it, and `value` receives both (and the flat
+    /// global offset of the first) and returns both. Two columns that different
+    /// waves computed — a rotary embedding's halves of a head — meet in one
+    /// thread, each read once.
+    ///
+    /// # Panics
+    /// As [`Self::store_local_vec`], and unless `half` is a whole number of runs
+    /// and a row a whole number of `2·half` groups whose pairs divide evenly over
+    /// the group.
+    pub fn store_local_vec_paired<F>(&self, dst: GL, st: &ST, ix: MoveIdx, half: usize, value: F) -> GL
+    where
+        F: Fn([Vec<Arc<UOp>>; 2], &Arc<UOp>) -> [Vec<Arc<UOp>>; 2],
+    {
+        self.store_local_runs(dst, st, ix, Some(half), |runs, off| {
+            let pair: [Vec<Arc<UOp>>; 2] = runs.try_into().expect("a pair of runs");
+            value(pair, off).into()
+        })
+    }
+
+    /// The body of both staged stores: each thread moves a unit of runs of one
+    /// row per pass — one run, or a run and its partner `half` columns along.
+    fn store_local_runs(
+        &self,
+        dst: GL,
+        st: &ST,
+        ix: MoveIdx,
+        half: Option<usize>,
+        value: impl Fn(Vec<Vec<Arc<UOp>>>, &Arc<UOp>) -> Vec<Vec<Arc<UOp>>>,
+    ) -> GL {
         let run = lds_group(st);
         let row_stride: i64 = dst.shape()[ix.axis + 1..].iter().product::<usize>() as i64;
         let runs_per_row = (st.cols / run) as i64;
+        let half_runs = half.map(|half| {
+            assert!(
+                half.is_multiple_of(run) && st.cols.is_multiple_of(2 * half),
+                "store LOCAL→GLOBAL: a {half}-column half is not whole runs of a {}-column row",
+                st.cols
+            );
+            (half / run) as i64
+        });
+        let units_per_row = if half_runs.is_some() { runs_per_row / 2 } else { runs_per_row };
         let threads = self.group_threads() as i64;
         assert!(
             st.base.swizzle.keeps_16b_chunks()
-                && (st.rows as i64 * runs_per_row) % threads == 0
+                && (st.rows as i64 * units_per_row) % threads == 0
                 && row_stride % run as i64 == 0
                 && !ix.masked,
             "store LOCAL→GLOBAL: 16-byte runs over {threads} threads into whole rows of an unmasked block"
         );
         let (base_rows, base_cols) = (st.base.base.rows as i64, st.base.base.cols as i64);
         let base = Self::tile_base(st, &dst, &ix.block, ix.axis);
-        let stores = (0..st.rows as i64 * runs_per_row / threads)
-            .map(|pass| {
+        // The run at `(row, chunk)` of `st`, `chunk` counted in runs, cast to `dst`'s dtype.
+        let read = |row: &Arc<UOp>, chunk: &Arc<UOp>| -> Vec<Arc<UOp>> {
+            let col = imul(chunk, run as i64);
+            let (srow, scol) = st.base.swizzle.swizzle_chunk(
+                imod(row, base_rows),
+                &imod(chunk, base_cols / run as i64),
+                st.base.base.cols,
+                st.elem().base(),
+            );
+            let lds = st_swizzled_offset(st, idiv(row, base_rows), idiv(&col, base_cols), srow, scol);
+            let loaded = load_off_vec(st.uop(), &lds, run);
+            (0..run)
+                .map(|j| {
+                    let v = vec_elem(&loaded, j, run);
+                    if st.elem() == dst.elem() { v } else { v.cast(dst.elem().clone()) }
+                })
+                .collect()
+        };
+        let stores = (0..st.rows as i64 * units_per_row / threads)
+            .flat_map(|pass| {
                 let at = iadd(&cidx(pass * threads), &self.laneid());
-                let (row, chunk) = (idiv(&at, runs_per_row), imod(&at, runs_per_row));
-                let col = imul(&chunk, run as i64);
-                let (srow, scol) = st.base.swizzle.swizzle_chunk(
-                    imod(&row, base_rows),
-                    &imod(&chunk, base_cols / run as i64),
-                    st.base.base.cols,
-                    st.elem().base(),
-                );
-                let lds = st_swizzled_offset(st, idiv(&row, base_rows), idiv(&col, base_cols), srow, scol);
-                let loaded = load_off_vec(st.uop(), &lds, run);
-                let vals = (0..run)
-                    .map(|j| {
-                        let v = vec_elem(&loaded, j, run);
-                        if st.elem() == dst.elem() { v } else { v.cast(dst.elem().clone()) }
-                    })
-                    .collect();
-                let off = iadd(&base, &iadd(&imul(&row, row_stride), &col));
-                store_off_vec(dst.uop(), &off, value(vals, &off))
+                let (row, unit) = (idiv(&at, units_per_row), imod(&at, units_per_row));
+                let chunks = match half_runs {
+                    None => vec![unit],
+                    Some(h) => {
+                        let first = iadd(&imul(&idiv(&unit, h), 2 * h), &imod(&unit, h));
+                        let second = iadd(&first, &cidx(h));
+                        vec![first, second]
+                    }
+                };
+                let offs: Vec<_> =
+                    chunks.iter().map(|c| iadd(&base, &iadd(&imul(&row, row_stride), &imul(c, run as i64)))).collect();
+                let vals = value(chunks.iter().map(|c| read(&row, c)).collect(), &offs[0]);
+                offs.into_iter().zip(vals).map(|(off, v)| store_off_vec(dst.uop(), &off, v)).collect::<Vec<_>>()
             })
             .collect();
         self.finalize_gl(dst, super::group_or_single(stores))

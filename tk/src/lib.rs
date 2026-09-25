@@ -81,8 +81,8 @@ pub use kernels::conv::{
     select_conv_cfg,
 };
 pub use kernels::fa::{
-    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOpts, flash_attention, flash_attention_supported,
-    flash_attention_tuned, flash_attention_with,
+    FLASH_ATTENTION_SEQUENCE_MULTIPLE, FaMask, FaOperands, FaOpts, flash_attention, flash_attention_packed,
+    flash_attention_packed_tuned, flash_attention_supported, flash_attention_tuned, flash_attention_with,
 };
 pub use kernels::gemm::{Epilogue, GemmCfg, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, matmul, swiglu_pair_width};
 pub use kernels::kmeans::{kmeans_assign, kmeans_update};

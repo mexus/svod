@@ -24,6 +24,9 @@ fn flash_attention_with_non_rank4_operand_is_operand_shape_err() {
     let k2 = Tensor::randn(&[4, 64]).expect("randn"); // k: rank 2
     let e = flash_attention_with(&q4, &k2, &q4, FaOpts::default()).expect_err("rank-2 k must error, not panic");
     assert!(matches!(e, crate::launch::Error::OperandRank { operand: "k", .. }), "got {e:?}");
+    let e = crate::kernels::fa::flash_attention_packed(&q3, (2, 1), FaOpts::default())
+        .expect_err("a rank-3 packed qkv must error, not panic");
+    assert!(matches!(e, crate::launch::Error::OperandRank { operand: "qkv", .. }), "got {e:?}");
 }
 
 /// `(o, q, k, v)` dummy BUFFER UOps for a GPU-free FA build.
@@ -825,6 +828,75 @@ fn a_key_mask_only_hides_keys((q_blk, kv_blk): (usize, usize), window: Option<(u
     if window.is_some() {
         assert!(as_key_mask == by_lens, "under the band both select the scaled score");
     }
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test --release -p svod-tk --lib fa::packed_operands_match_split -- --ignored --nocapture`.
+///
+/// Q, K and V read out of one fused `[B, N, H + 2·H_kv, D]` tensor are the
+/// operands the split layout reads out of three copies of its head ranges, so
+/// the two agree bit for bit: at each tile the tuner picks between, under the
+/// band, the key mask and the causal sweep, and with grouped KV heads, whose
+/// offsets into the packed heads differ from the query's.
+#[test_case::test_case((16, 32), None, Keys::All, false, 4, 4; "16x32")]
+#[test_case::test_case((16, 64), None, Keys::Right(&[512, 200]), false, 4, 4; "16x64 over right padding")]
+#[test_case::test_case((32, 32), Some((64, 64)), Keys::Holes, false, 4, 4; "32x32 band over holes")]
+#[test_case::test_case((16, 16), Some((64, 64)), Keys::All, false, 4, 2; "grouped kv heads under the band")]
+#[test_case::test_case((16, 32), None, Keys::All, true, 4, 1; "causal over one kv head")]
+#[ignore]
+fn packed_operands_match_split(
+    (q_blk, kv_blk): (usize, usize),
+    window: Option<(usize, usize)>,
+    keys: Keys,
+    causal: bool,
+    h: usize,
+    h_kv: usize,
+) {
+    use crate::kernels::fa::{FaPolicy, flash_attention_packed_tuned, flash_attention_tuned};
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip packed_operands_match_split: unsupported device/toolchain");
+        return;
+    }
+    let (b, n, d) = (2usize, 512usize, 64usize);
+    let qkv = Tensor::randn(&[b, n, h + 2 * h_kv, d]).expect("randn").cast(DType::BFloat16);
+    qkv.realize().expect("realize");
+    let heads = |from: usize, count: usize| {
+        let t = qkv.narrow(2, from, count).expect("head range").contiguous();
+        t.realize().expect("realize");
+        t
+    };
+    let (q, k, v) = (heads(0, h), heads(h, h_kv), heads(h + h_kv, h_kv));
+    let key_mask = keys.mask(b, n).map(|m| Tensor::from_slice(m.as_slice()).try_reshape([b, n]).expect("reshape"));
+    let opts = FaOpts { causal, key_mask: key_mask.as_ref(), window, ..Default::default() };
+    let policy = move |spec: &DeviceSpec, arch| FaPolicy {
+        big: &[],
+        small: (q_blk, kv_blk),
+        ..FaPolicy::for_device(spec, arch)
+    };
+    let bits = |o: Tensor| -> Vec<u32> {
+        let o = o.cast(DType::Float32);
+        o.realize().expect("realize");
+        o.as_vec::<f32>().expect("read").into_iter().map(f32::to_bits).collect()
+    };
+    let split = bits(flash_attention_tuned(&q, &k, &v, opts, policy).expect("fa").expect("the kernel applies"));
+    let packed = flash_attention_packed_tuned(&qkv, (h, h_kv), opts, policy).expect("fa").expect("the kernel applies");
+    assert_eq!(packed.dims().expect("dims"), [b, n, h, d]);
+    let packed = bits(packed);
+    assert!(packed.iter().all(|x| f32::from_bits(*x).is_finite()), "a non-finite output");
+    assert!(packed == split, "the packed heads must be read as their split copies are");
+}
+
+/// A packed `qkv` whose head count is not `h + 2·h_kv` is the caller's bug.
+#[test]
+#[ignore]
+fn packed_head_count_mismatch_is_err() {
+    if !super::device_supported(crate::kernels::fa::FA_SUPPORTED_ARCHS) {
+        eprintln!("skip packed_head_count_mismatch_is_err: unsupported device/toolchain");
+        return;
+    }
+    let qkv = Tensor::randn(&[1, 128, 10, 64]).expect("randn").cast(DType::BFloat16);
+    let e = crate::kernels::fa::flash_attention_packed(&qkv, (4, 2), FaOpts { causal: false, ..Default::default() })
+        .expect_err("4 + 2·2 heads is not 10");
+    assert!(matches!(e, crate::launch::Error::OperandShape { operand: "qkv", .. }), "got {e:?}");
 }
 
 /// A fully key-masked lane (`key_lens[b] == 0`) — the inactive-lane case the

@@ -77,6 +77,16 @@ pub enum Epilogue<T> {
     /// dtype, and `act` applies SiLU. Every step rounds to the output dtype
     /// where the graph's conv → bias → silu → add chain rounds.
     BiasAct { bias: T, residual: Option<T>, act: bool },
+    /// `y = x·wᵀ` with its first `heads` heads of `head_dim` columns rotated as
+    /// [`Tensor::apply_rotary_emb`] rotates split halves, by the `[seq,
+    /// head_dim/2]` tables `cos` and `sin` in the operand dtype — row `m` at
+    /// position `m % seq` — and the columns after them (a fused projection's
+    /// values) stored as they are. The rotation runs op for op in the output
+    /// dtype on the rounded GEMM output, as the graph's does, so the two agree bit
+    /// for bit. A head's halves lie in different waves' accumulators, so only
+    /// the staged store ([`GemmCfg::stage_out`]), whose band holds whole heads
+    /// side by side, carries it.
+    Rope { cos: T, sin: T, seq: usize, head_dim: usize, heads: usize },
 }
 
 impl<T> Epilogue<T> {
@@ -90,6 +100,7 @@ impl<T> Epilogue<T> {
             Epilogue::BiasAct { residual, act, .. } => {
                 Epilogue::BiasAct { bias: (), residual: residual.as_ref().map(|_| ()), act: *act }
             }
+            &Epilogue::Rope { seq, head_dim, heads, .. } => Epilogue::Rope { cos: (), sin: (), seq, head_dim, heads },
         }
     }
 
@@ -112,6 +123,7 @@ impl<T> Epilogue<T> {
             Epilogue::BiasAct { residual: None, act: true, .. } => 4,
             Epilogue::BiasAct { residual: Some(_), act: false, .. } => 5,
             Epilogue::BiasAct { residual: Some(_), act: true, .. } => 6,
+            Epilogue::Rope { .. } => 7,
         }
     }
 }
@@ -173,19 +185,32 @@ pub struct GemmCfg {
 }
 
 impl GemmCfg {
-    /// Whether this tile can carry `epi`. The fused epilogues write the operand
-    /// dtype, so they need the direct (un-split) store; [`Epilogue::SwiGlu`]
-    /// additionally needs each wave's accumulator to hold a gate block beside its
-    /// matching up block — its `reg_n/2` must be the `pair` width the weight rows
-    /// were arranged in, and a whole number of `frag_cols`-wide fragments, so the
-    /// gate/up split falls on a fragment boundary. `frag_cols` is the arch's
-    /// accumulator-fragment width (`None` on an arch with no matrix core).
-    pub fn carries(&self, epi: Epilogue<()>, frag_cols: Option<usize>) -> bool {
+    /// Whether this tile can carry `epi` on `caps`' arch. The fused epilogues
+    /// write the operand dtype, so they need the un-split store;
+    /// [`Epilogue::SwiGlu`] additionally needs each wave's accumulator to hold a
+    /// gate block beside its matching up block — its `reg_n/2` must be the `pair`
+    /// width the weight rows were arranged in, and a whole number of accumulator
+    /// fragments, so the gate/up split falls on a fragment boundary (an arch with
+    /// no matrix core has none). [`Epilogue::Rope`] needs the staged store, a
+    /// band that fits the strips, whole heads per block and whole runs per half
+    /// head.
+    pub fn carries(&self, epi: Epilogue<()>, caps: &crate::ArchCaps) -> bool {
+        let frag_cols = caps.frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
         match epi {
             Epilogue::Plain => true,
             Epilogue::Add(()) | Epilogue::BiasAct { .. } => self.split_k == 1,
             Epilogue::SwiGlu { pair } => {
                 self.split_k == 1 && self.reg_n() == 2 * pair && frag_cols.is_some_and(|c| pair.is_multiple_of(c))
+            }
+            // The band's head pairs, a pair of runs each, divide over the threads.
+            Epilogue::Rope { head_dim, .. } => {
+                let pairs = self.block_m / self.acc_m * self.block_n / (2 * RUN_ELEMS);
+                self.split_k == 1
+                    && self.stage_out
+                    && head_dim.is_multiple_of(2 * RUN_ELEMS)
+                    && self.block_n.is_multiple_of(head_dim)
+                    && pairs.is_multiple_of(self.threads(caps.wave_size) as usize)
+                    && band_base(caps, self, self.block_n).is_some()
             }
         }
     }
@@ -424,15 +449,22 @@ pub fn gemm_core_with(
     // reading the fusion's other operand at the store's own position.
     let out_dt = c_gl.elem().clone();
     let fused = fusion(&epi, n, ragged_m.then_some(m), &out_dt);
+    let rope = match &epi {
+        &Epilogue::Rope { ref cos, ref sin, seq, head_dim, heads } => {
+            Some((head_dim / 2, rope(cos, sin, n, seq, head_dim, heads)))
+        }
+        _ => None,
+    };
     let outs = final_accs.into_iter().map(|c| match epi {
         Epilogue::SwiGlu { .. } => swiglu(ker, &g, c, &out_dt),
         _ => narrow(ker, &g, c, &out_dt),
     });
     let staging = (cfg.stage_out && !ragged_m && slab.is_none() && &out_dt == a_strips.elem())
-        .then(|| out_band(ker, &cfg, &a_strips, epi.out_cols(cfg.block_n), g.group_threads()))
+        .then(|| out_band(ker, &cfg, &a_strips, epi.out_cols(cfg.block_n)))
         .flatten();
     let mut c_t = c_gl;
     let Some(band) = staging else {
+        assert!(rope.is_none(), "gemm epilogue: only the staged store holds a head's two halves together");
         let nidx = col.mul(&cidx(cfg.blocks_n() as i64)).add(&warp_col);
         let zslab: Idx = match &slab {
             // Split-K writes one `[split_k, M, N]` partial per grid-z (summed by the
@@ -463,25 +495,38 @@ pub fn gemm_core_with(
         );
         let brow = row.mul(&cidx(cfg.acc_m as i64)).add(&cidx(a as i64));
         let ix = MoveIdx::block((Idx::Const(0), Idx::Const(0), Idx::from(&brow), Idx::from(&col)), 2);
-        c_t = g.store_local_vec(c_t, &st, ix, &fused);
+        c_t = match &rope {
+            Some((half, rope)) => g.store_local_vec_paired(c_t, &st, ix, *half, rope),
+            None => g.store_local_vec(c_t, &st, ix, &fused),
+        };
         free = c_t.uop().barrier(smallvec![]);
     }
 }
 
-/// The shared tile C is staged through a band at a time ([`GemmCfg::stage_out`]):
-/// the A strips, which the loop is done with, seen as `block_m / acc_m` rows of
-/// `cols` output columns laid out in whole rows of 16-byte runs — `None` where a
-/// band does not fit them or does not divide into whole runs per thread.
-fn out_band(ker: &Kernel, cfg: &GemmCfg, a_strips: &ST, cols: usize, threads: usize) -> Option<ST> {
-    let rows = cfg.block_m / cfg.acc_m;
-    let run = 16 / a_strips.elem().bytes();
+/// Elements of a 16-bit operand in one 16-byte run of the staged store.
+const RUN_ELEMS: usize = 8;
+
+/// The base tile of the band C is staged through ([`GemmCfg::stage_out`]):
+/// `block_m / acc_m` rows of `cols` 16-bit output columns in whole rows of
+/// 16-byte runs, laid over the A strips — `None` where a band does not fit them
+/// or does not divide into whole runs per thread.
+fn band_base(caps: &crate::ArchCaps, cfg: &GemmCfg, cols: usize) -> Option<crate::tiles::STBaseShape> {
+    let (rows, threads) = (cfg.block_m / cfg.acc_m, cfg.threads(caps.wave_size) as usize);
     let base = [64, 32].into_iter().find(|w| cols.is_multiple_of(*w))?;
-    let base = ker.caps.shared_rows(base, a_strips.elem().bytes())?;
+    let base = caps.shared_rows(base, 2)?;
     (rows * cols <= cfg.stages * cfg.block_m * cfg.k_step
         && rows.is_multiple_of(base.base.rows)
         && base.swizzle.keeps_16b_chunks()
-        && (rows * cols / run).is_multiple_of(threads))
-    .then(|| a_strips.view((rows, cols), TileLayout::Row, base))
+        && (rows * cols / RUN_ELEMS).is_multiple_of(threads))
+    .then_some(base)
+}
+
+/// The shared tile C is staged through a band at a time: the A strips, which
+/// the loop is done with, seen as [`band_base`]'s band.
+fn out_band(ker: &Kernel, cfg: &GemmCfg, a_strips: &ST, cols: usize) -> Option<ST> {
+    assert_eq!(a_strips.elem().bytes(), 2, "the GEMM's operands are 16-bit");
+    let base = band_base(&ker.caps, cfg, cols)?;
+    Some(a_strips.view((cfg.block_m / cfg.acc_m, cols), TileLayout::Row, base))
 }
 
 /// What the epilogue stores for `vals`, consecutive output elements (already in
@@ -501,7 +546,7 @@ fn fusion(
     out_dt: &DType,
 ) -> impl Fn(Vec<Arc<UOp>>, &Arc<UOp>) -> Vec<Arc<UOp>> + use<> {
     let (bias, res, act) = match epi {
-        Epilogue::Plain | Epilogue::SwiGlu { .. } => (None, None, false),
+        Epilogue::Plain | Epilogue::SwiGlu { .. } | Epilogue::Rope { .. } => (None, None, false),
         Epilogue::Add(res) => (None, Some(res.uop().clone()), false),
         Epilogue::BiasAct { bias, residual, act } => {
             (Some(bias.uop().clone()), residual.as_ref().map(|r| r.uop().clone()), *act)
@@ -532,6 +577,44 @@ fn fusion(
             None => off.clone(),
         };
         add(vals, res, &at, "gemm epilogue: residual add")
+    }
+}
+
+/// [`Epilogue::Rope`] on one staged pair of runs ([`Group::store_local_vec_paired`]):
+/// `x1`, consecutive output elements (already in the output dtype) from flat
+/// offset `off` in the first half of a head, and `x2`, the run half a head
+/// along. A rotated head's pair turns as [`Tensor::apply_rotary_emb`] turns it,
+/// op for op in the output dtype — `x1·cos − x2·sin` into the first half,
+/// `x1·sin + x2·cos` into the second — by the table row of the output row's
+/// position; a pair past the rotated heads stores as it is. Each product feeds
+/// one sum, as in the graph's kernel, so the backend contracts the same ones.
+#[allow(clippy::type_complexity)]
+fn rope(
+    cos: &GL,
+    sin: &GL,
+    n: usize,
+    seq: usize,
+    head_dim: usize,
+    heads: usize,
+) -> impl Fn([Vec<Arc<UOp>>; 2], &Arc<UOp>) -> [Vec<Arc<UOp>>; 2] + use<> {
+    let (cos, sin, half) = (cos.uop().clone(), sin.uop().clone(), (head_dim / 2) as i64);
+    move |[x1, x2], off| {
+        let w = x1.len();
+        let col = off.try_mod(&cidx(n as i64)).expect("rope: output column");
+        let pos = off.try_div(&cidx(n as i64)).and_then(|r| r.try_mod(&cidx(seq as i64))).expect("rope: position");
+        let freq = col.try_mod(&cidx(head_dim as i64)).expect("rope: frequency");
+        let at = pos.mul(&cidx(half)).add(&freq);
+        let (cos, sin) = (load_off_vec(&cos, &at, w), load_off_vec(&sin, &at, w));
+        let rotated = col.lt(&cidx(heads as i64 * head_dim as i64));
+        let mul = |a: &Arc<UOp>, b: &Arc<UOp>| a.try_mul(b).expect("rope: product");
+        let keep = |turned: Arc<UOp>, x: &Arc<UOp>| UOp::try_where(rotated.clone(), turned, x.clone()).expect("rope");
+        let (mut real, mut imag) = (Vec::with_capacity(w), Vec::with_capacity(w));
+        for (j, (a, b)) in x1.iter().zip(&x2).enumerate() {
+            let (c, s) = (vec_elem(&cos, j, w), vec_elem(&sin, j, w));
+            real.push(keep(mul(a, &c).try_sub(&mul(b, &s)).expect("rope: x1·cos − x2·sin"), a));
+            imag.push(keep(mul(a, &s).try_add(&mul(b, &c)).expect("rope: x1·sin + x2·cos"), b));
+        }
+        [real, imag]
     }
 }
 
@@ -1212,8 +1295,7 @@ impl GemmPolicy {
         epi: Epilogue<()>,
     ) -> Option<GemmCfg> {
         let caps = crate::ArchCaps::for_arch(arch);
-        let frag = caps.frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
-        let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, frag);
+        let fits = |cfg: &GemmCfg| cfg.tiles(m, k, n) && cfg.carries(epi, &caps);
         let candidates: Vec<GemmCfg> = self.tiles.iter().copied().filter(fits).collect();
         let fallback = || self.cfg(m, k, n).filter(fits);
         if candidates.len() < 2 {
@@ -1230,9 +1312,7 @@ impl GemmPolicy {
         let builds = || {
             let placeholders = || {
                 let mut sizes = vec![m * cols, m * k, n * k];
-                if let Epilogue::Add(()) = epi {
-                    sizes.push(m * cols);
-                }
+                sizes.extend(epi_operand_shapes(epi, m, cols).iter().map(|s| s.iter().product::<usize>()));
                 sizes.into_iter().map(|s| UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, s, dtype.clone())).collect()
             };
             candidates
@@ -1251,8 +1331,8 @@ impl GemmPolicy {
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
             let (x, w) = (operand(&[m, k])?, operand(&[n, k])?);
             let mut ins = vec![x, w];
-            if let Epilogue::Add(()) = epi {
-                ins.push(operand(&[m, cols])?);
+            for shape in epi_operand_shapes(epi, m, cols) {
+                ins.push(operand(&shape)?);
             }
             let ins: Vec<&Tensor> = ins.iter().collect();
             let mut y = Tensor::empty(&[m, cols], dtype.clone()).to(spec.clone());
@@ -1358,15 +1438,20 @@ pub fn gemm_nt_with(
 /// - [`Epilogue::SwiGlu`] gives `y = silu(gate)·up` off a fused gate/up weight,
 ///   so the `[M, 2I]` intermediate is never written and no separate SwiGLU pass
 ///   reads it back.
+/// - [`Epilogue::Rope`] gives a fused QKV projection with its query and key
+///   heads already rotated, so attention reads them straight from `y`.
 ///
 /// Shapes, dtypes and the three-way outcome are [`gemm_nt`]'s, plus:
 ///
 /// - `Ok(None)` — the selected tile cannot carry the epilogue: split-K (its
-///   store is f32 partials), or, for SwiGLU, a tile whose `reg_n/2` is not the
+///   store is f32 partials), for SwiGLU a tile whose `reg_n/2` is not the
 ///   `pair` width the weight rows were arranged in (see
-///   [`GemmPolicy::swiglu_pair_width`]).
-/// - `Err` — a `residual` whose shape or dtype is not `y`'s, or a SwiGLU `pair`
-///   that does not divide `N/2`.
+///   [`GemmPolicy::swiglu_pair_width`]), for RoPE a tile without the staged
+///   store or narrower than a head, or a head dim that is not a whole number
+///   of 16-byte runs per half.
+/// - `Err` — a `residual` whose shape or dtype is not `y`'s, a SwiGLU `pair`
+///   that does not divide `N/2`, RoPE tables that are not `[seq, head_dim/2]`
+///   in `x`'s dtype, a `seq` that does not divide `M`, or rotated heads past `N`.
 pub fn gemm_nt_with_epilogue(
     x: &Tensor,
     w: &Tensor,
@@ -1376,8 +1461,7 @@ pub fn gemm_nt_with_epilogue(
     build_gemm(x, w, epilogue, |arch, m, k, n| {
         let policy = GemmPolicy::for_device(&spec, arch);
         if !crate::tune::enabled() {
-            let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            return policy.cfg(m, k, n).filter(|c| c.carries(kind, frag.map(|f| f.base.cols)));
+            return policy.cfg(m, k, n).filter(|c| c.carries(kind, &crate::ArchCaps::for_arch(arch)));
         }
         policy.tuned(crate::tune::TuneStore::global(), &spec, arch, &dtype, (m, k, n), kind)
     })
@@ -1401,23 +1485,24 @@ pub(crate) fn build_gemm(
     let (w_dtype, kw) = (w.uop().dtype(), wd[1]);
     let err_dtype = dtype.clone();
 
-    // The epilogue's own operand: its dims are resolved up front (a symbolic one
-    // is an `Err` like any other operand's), the rest is checked by `validate`.
+    // The epilogue's own operands: their dims are resolved up front (a symbolic
+    // one is an `Err` like any other operand's), the rest is checked by
+    // `validate` against the shape each must have.
     let kind = epi.kind();
     let y_shape: Vec<usize> = lead.iter().copied().chain([kind.out_cols(n)]).collect();
-    let res_dims = match epi {
-        Epilogue::Add(r) => Some(crate::launch::concrete_dims_at_least(r, "gemm-nt", "residual", 2)?),
-        _ => None,
+    let epi_operands = match epi {
+        Epilogue::Add(r) => vec![("residual", r, y_shape.clone())],
+        Epilogue::Rope { cos, sin, seq, head_dim, .. } => {
+            vec![("cos", cos, vec![seq, head_dim / 2]), ("sin", sin, vec![seq, head_dim / 2])]
+        }
+        Epilogue::Plain | Epilogue::SwiGlu { .. } | Epilogue::BiasAct { .. } => vec![],
     };
-    let residual = match (epi, &res_dims) {
-        (Epilogue::Add(r), Some(dims)) => Some(crate::launch::statically(r, dims)?),
-        _ => None,
-    };
-    let res_dtype = match epi {
-        Epilogue::Add(r) => Some(r.uop().dtype()),
-        _ => None,
-    };
-    let want_res = y_shape.clone();
+    let (mut extra, mut extra_checks) = (Vec::new(), Vec::new());
+    for (operand, t, want) in epi_operands {
+        let dims = crate::launch::concrete_dims_at_least(t, "gemm-nt", operand, 2)?;
+        extra.push(crate::launch::statically(t, &dims)?);
+        extra_checks.push((operand, t.uop().dtype(), dims, want));
+    }
     // The chooser measures on first use, so it runs once per launch: the tiling
     // predicate and the build share its answer.
     let chosen: Rc<OnceCell<Option<GemmCfg>>> = Rc::default();
@@ -1439,36 +1524,45 @@ pub(crate) fn build_gemm(
                 kw == k,
                 crate::launch::OperandShapeSnafu { kernel: "gemm-nt", operand: "w", expected: vec![n, k], got: wd }
             );
-            if let Some(got) = res_dims {
+            for (operand, got_dtype, got, expected) in extra_checks {
                 ensure!(
-                    res_dtype == Some(err_dtype.clone()),
-                    crate::launch::DtypeSnafu {
-                        kernel: "gemm-nt",
-                        got: res_dtype.unwrap_or(err_dtype),
-                        expected: "the dtype of x"
-                    }
+                    got_dtype == err_dtype,
+                    crate::launch::DtypeSnafu { kernel: "gemm-nt", got: got_dtype, expected: "the dtype of x" }
                 );
                 ensure!(
-                    got == want_res,
-                    crate::launch::OperandShapeSnafu {
-                        kernel: "gemm-nt",
-                        operand: "residual",
-                        expected: want_res,
-                        got
-                    }
+                    got == expected,
+                    crate::launch::OperandShapeSnafu { kernel: "gemm-nt", operand, expected, got }
                 );
             }
-            if let Epilogue::SwiGlu { pair } = kind {
-                ensure!(
+            match kind {
+                Epilogue::SwiGlu { pair } => ensure!(
                     pair > 0 && n.is_multiple_of(2 * pair),
                     crate::launch::DimMultipleSnafu { kernel: "gemm-nt", dim: "N", value: n, multiple: 2 * pair }
-                );
+                ),
+                // Every output row has a table row, and `w` has a row for every
+                // column the rotated heads take.
+                Epilogue::Rope { seq, head_dim, heads, .. } => {
+                    ensure!(
+                        seq > 0 && m.is_multiple_of(seq),
+                        crate::launch::DimMultipleSnafu { kernel: "gemm-nt", dim: "M", value: m, multiple: seq }
+                    );
+                    ensure!(
+                        head_dim > 0 && heads * head_dim <= n,
+                        crate::launch::OperandShapeSnafu {
+                            kernel: "gemm-nt",
+                            operand: "w",
+                            expected: vec![heads * head_dim, k],
+                            got: wd
+                        }
+                    );
+                }
+                _ => {}
             }
             Ok(())
         },
         move |arch| {
-            let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator);
-            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| c.carries(kind, frag.map(|f| f.base.cols)))
+            let caps = crate::ArchCaps::for_arch(arch);
+            fit_chosen.get_or_init(|| cfg(arch, m, k, n)).is_some_and(|c| c.carries(kind, &caps))
         },
         move |arch| {
             let caps = crate::ArchCaps::for_arch(arch);
@@ -1480,12 +1574,13 @@ pub(crate) fn build_gemm(
             let name = match kind {
                 Epilogue::Add(()) => "gemm_nt_add",
                 Epilogue::SwiGlu { .. } => "gemm_nt_swiglu",
+                Epilogue::Rope { .. } => "gemm_nt_rope",
                 Epilogue::Plain if split > 1 => "gemm_nt_split",
                 Epilogue::Plain => "gemm_nt",
                 Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through conv2d_nhwc"),
             };
             let mut ins = vec![x, w];
-            ins.extend(residual.as_ref());
+            ins.extend(&extra);
             let y = crate::graph_launch(name, grid, block, out, &ins, caps, move |ker| {
                 build_gemm_nt(ker, (m, k, n), cfg, in_dt, out_dt, kind);
                 ker.finish(cfg.acc_m)
@@ -1518,17 +1613,29 @@ pub fn build_gemm_nt(
     let cols = epi.out_cols(n);
     let out_shape = if cfg.split_k > 1 { vec![1, cfg.split_k, m, cols] } else { vec![1, 1, m, cols] };
     let mut in_specs = vec![GlSpec::new(&[1, 1, m, k], in_dt.clone()), GlSpec::new(&[1, 1, n, k], in_dt.clone())];
-    if let Epilogue::Add(()) = epi {
-        in_specs.push(GlSpec::new(&[1, 1, m, cols], out_dt.clone()));
-    }
+    in_specs.extend(epi_operand_shapes(epi, m, cols).iter().map(|shape| GlSpec::new(shape, out_dt.clone())));
     let (outs, ins) = ker.bind_abi(&[GlSpec::new(&out_shape, out_dt)], &in_specs);
     let epi = match epi {
         Epilogue::Plain => Epilogue::Plain,
         Epilogue::Add(()) => Epilogue::Add(ins[2].clone()),
         Epilogue::SwiGlu { pair } => Epilogue::SwiGlu { pair },
+        Epilogue::Rope { seq, head_dim, heads, .. } => {
+            Epilogue::Rope { cos: ins[2].clone(), sin: ins[3].clone(), seq, head_dim, heads }
+        }
         Epilogue::BiasAct { .. } => unreachable!("a conv epilogue enters through build_conv"),
     };
     gemm_core(ker, (m, k, n), cfg, outs[0].clone(), ins[0].clone(), ins[1].clone(), epi);
+}
+
+/// The shapes of the NT GEMM's epilogue operands, bound after `x` and `w` in
+/// this order and in the output dtype: [`Epilogue::Add`]'s `m × cols`
+/// residual, [`Epilogue::Rope`]'s `[seq, head_dim/2]` cosine and sine tables.
+fn epi_operand_shapes(epi: Epilogue<()>, m: usize, cols: usize) -> Vec<Vec<usize>> {
+    match epi {
+        Epilogue::Add(()) => vec![vec![1, 1, m, cols]],
+        Epilogue::Rope { seq, head_dim, .. } => vec![vec![seq, head_dim / 2]; 2],
+        Epilogue::Plain | Epilogue::SwiGlu { .. } | Epilogue::BiasAct { .. } => vec![],
+    }
 }
 
 // ── The square matmul (`c = a · b`, n×n) ─────────────────────────────────────

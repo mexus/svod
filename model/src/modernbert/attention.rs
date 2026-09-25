@@ -5,9 +5,10 @@
 //! dot-product attention, then `Wo: Linear(D, D)` (no bias).
 //!
 //! The fused QKV output along dim -1 is `[Q(H*hd) | K(H*hd) | V(H*hd)]`. The
-//! tk flash-attention kernel takes each third as `(B, L, H, hd)`; the SDPA
-//! fallback as `(B, H, L, hd)`. Sliding-window local layers pass a `window`;
-//! global layers pass `None`.
+//! tk flash-attention kernel reads it whole as `(B, L, 3H, hd)` once the
+//! projection has rotated Q and K in its store, or takes each third as
+//! `(B, L, H, hd)`; the SDPA fallback as `(B, H, L, hd)`. Sliding-window local
+//! layers pass a `window`; global layers pass `None`.
 
 use snafu::ResultExt;
 use svod_dtype::DType;
@@ -19,7 +20,7 @@ use svod_tensor::nn::Module;
 use crate::init::fan_in_uniform;
 
 use super::error::{Result, TkSnafu};
-use super::linear::linear;
+use super::linear::{linear, tk_linear};
 
 #[derive(Clone, Module)]
 pub struct ModernBertAttention {
@@ -58,12 +59,49 @@ impl ModernBertAttention {
         padding_mask: Option<&Tensor>,
         residual: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let qkv = linear(x, &self.qkv_weight, None)?;
-        let attn = match self.flash(&qkv, rope, padding_mask)? {
+        let attn = match self.packed_flash(x, rope, padding_mask)? {
             Some(attn) => attn,
-            None => self.sdpa(&qkv, rope, padding_mask)?,
+            None => {
+                let qkv = linear(x, &self.qkv_weight, None)?;
+                match self.flash(&qkv, rope, padding_mask)? {
+                    Some(attn) => attn,
+                    None => self.sdpa(&qkv, rope, padding_mask)?,
+                }
+            }
         };
         linear(&attn, &self.out_weight, residual)
+    }
+
+    /// The QKV projection with Q and K rotated in its store
+    /// ([`svod_tk::Epilogue::Rope`]) and the tk flash-attention kernel reading
+    /// all three heads straight out of its output
+    /// ([`svod_tk::flash_attention_packed`]), so nothing passes over Q, K or V
+    /// between the two: rotated apart and split into head views instead, the
+    /// three are copied into buffers of their own, three kernels a layer.
+    /// `None` where either kernel declines — a length off the attention tile
+    /// (the padded path copies its operands anyway), or a device whose GEMM
+    /// tiles do not stage their store.
+    fn packed_flash(
+        &self,
+        x: &Tensor,
+        rope: &(Tensor, Tensor),
+        padding_mask: Option<&Tensor>,
+    ) -> Result<Option<Tensor>> {
+        let (b, l) = (x.dim(0)?, x.dim_const(1)?);
+        if !l.is_multiple_of(svod_tk::FLASH_ATTENTION_SEQUENCE_MULTIPLE) {
+            return Ok(None);
+        }
+        let (h, hd) = (self.num_heads, self.head_dim);
+        let table = |t: &Tensor| t.try_reshape([l as isize, hd as isize / 2]);
+        let (cos, sin) = (table(&rope.0)?, table(&rope.1)?);
+        let epilogue = svod_tk::Epilogue::Rope { cos: &cos, sin: &sin, seq: l, head_dim: hd, heads: 2 * h };
+        let Some(qkv) = tk_linear(x, &self.qkv_weight, epilogue)? else { return Ok(None) };
+        let qkv = qkv.try_reshape([b.clone(), l.into(), (3 * h).into(), hd.into()])?;
+        let opts = svod_tk::FaOpts { causal: false, key_mask: padding_mask, window: self.window, ..Default::default() };
+        let Some(out) = svod_tk::flash_attention_packed(&qkv, (h, h), opts).context(TkSnafu)? else {
+            return Ok(None);
+        };
+        Ok(Some(out.try_reshape([b, SInt::Const(l), SInt::Const(self.hidden_size)])?))
     }
 
     /// The tk flash-attention kernel, window and key mask included, or `None`
