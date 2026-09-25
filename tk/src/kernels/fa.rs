@@ -377,8 +377,10 @@ fn fa_softmax_pv<'k>(
     // store the accumulator (matrix `(kv,q)` order), barrier, reload under the input
     // map (on gfx11 `K=kv=element`, `N=q=lane%16`). Both lane maps are the
     // matmul-validated ones, so the relayout is correct by construction.
+    // `att` narrows as if never NaN ([`Group::narrow_finite`]): a NaN score
+    // still reaches the output through `norm_vec`, summed from the f32 `att`.
     let att_mma = match att_smem {
-        None => warp.copy(att_mma.after((lp.index(), &norm_vec)), &att),
+        None => warp.narrow_finite(att_mma.after((lp.index(), &norm_vec)), &att),
         Some(att_smem) => {
             // This warp's `(kv_blk × q_blk)` band of the shared relayout buffer, as a
             // zero-copy subtile — so the store and the reload address the warp's band

@@ -95,8 +95,10 @@ fn fa_sink() -> Arc<UOp> {
 // FA graphs lose the per-commit `After`s and their fences).
 const MATMUL_DIGEST: u128 = 0x46f1_2eba_2d20_2f85_0000_0000_0000_0000;
 const MATMUL_NODES: usize = 1208;
-const FA_DIGEST: u128 = 0xcfc7_ea8f_ee49_2c9a_0000_0000_0000_0000;
-const FA_NODES: usize = 808;
+const FA_DIGEST: u128 = 0x6fbf_953b_7f50_2e6f_0000_0000_0000_0000;
+const FA_NODES: usize = 818;
+// Every FA digest moved, 10 nodes more, when the softmax weights began narrowing
+// to bf16 through the integer rounding bias on AMD (`Group::narrow_finite`).
 // Every FA digest moved, node counts unchanged, when tk's f32 `exp2` became the bare
 // `v_exp_f32` on AMD (`exp2_flush`: one CUSTOM in place of each EXP2).
 // The FA digests moved again for the packed-row segment mask: the running max
@@ -107,21 +109,21 @@ const FA_NODES: usize = 808;
 // Before #177 the FA digests moved when the Q tile lost its f32 staging copy: the
 // gather lands the 16-bit operand dtype straight in registers (the softmax scale
 // already rides on the f32 `QKᵀ` accumulator), so each variant drops those 16 nodes.
-const FA_NONCAUSAL_DIGEST: u128 = 0x6f71_e0e8_ab87_8e7f_0000_0000_0000_0000;
-const FA_NONCAUSAL_NODES: usize = 782;
-const FA_MASKED_DIGEST: u128 = 0xc339_22d9_570a_75a3_0000_0000_0000_0000;
-const FA_MASKED_NODES: usize = 806;
+const FA_NONCAUSAL_DIGEST: u128 = 0x8d39_efc9_1824_6548_0000_0000_0000_0000;
+const FA_NONCAUSAL_NODES: usize = 792;
+const FA_MASKED_DIGEST: u128 = 0x1ae8_6211_e07b_0849_0000_0000_0000_0000;
+const FA_MASKED_NODES: usize = 816;
 // Causal + segment-masked (packed rows): the `seg_start:Some` branch, a per-row
 // table read inside the score mask.
-const FA_SEGMENTED_DIGEST: u128 = 0x4fe3_ef91_7fc1_1c7c_0000_0000_0000_0000;
-const FA_SEGMENTED_NODES: usize = 836;
+const FA_SEGMENTED_DIGEST: u128 = 0x722c_a625_a5ec_eb8e_0000_0000_0000_0000;
+const FA_SEGMENTED_NODES: usize = 846;
 // Sliding window (the band's KV block range per workgroup, the band mask and the
 // empty-row norm floor) and the general `[B, N]` key mask (a per-key table read
 // inside the score mask, and the same floor).
-const FA_WINDOWED_DIGEST: u128 = 0x8b3d_f541_229d_eb71_0000_0000_0000_0000;
-const FA_WINDOWED_NODES: usize = 872;
-const FA_KEY_MASKED_DIGEST: u128 = 0xb443_6d4b_1058_10d8_0000_0000_0000_0000;
-const FA_KEY_MASKED_NODES: usize = 829;
+const FA_WINDOWED_DIGEST: u128 = 0x94fe_469b_743f_0f44_0000_0000_0000_0000;
+const FA_WINDOWED_NODES: usize = 882;
+const FA_KEY_MASKED_DIGEST: u128 = 0x7a91_f793_078e_f43b_0000_0000_0000_0000;
+const FA_KEY_MASKED_NODES: usize = 839;
 
 fn check(name: &str, sink: Arc<UOp>, digest: u128, nodes: usize) {
     let fp = kernel_fingerprint(&sink);
