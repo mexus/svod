@@ -908,8 +908,13 @@ impl FaPolicy {
         };
         let shape = [b, n, h, h_kv, d, usize::from(causal), mask.code(), dtype.bytes()];
         let key = crate::tune::TuneKey::new("flash_attention", spec, arch, &shape, &(&candidates, dtype));
-        let compile = |i: usize| {
-            let cfg = candidates[i];
+        // One operand set for every candidate: each then reads what the previous one
+        // left in the cache, as the model's attention reads the Q/K/V the kernel before
+        // it just wrote. Fresh operands per candidate (25 MB each at 8×512 on gfx1201)
+        // outgrow the 64 MB MALL and time every dispatch cold, which ranked `{16,16}`
+        // (126 µs) over `{32,32}` (108 µs warm). Built at the first compile, i.e. on a
+        // store miss only: `randn` advances the global RNG counter.
+        let operands = || {
             let operand = |shape: &[usize]| Tensor::randn(shape).ok().map(|t| t.cast(dtype.clone()).to(spec.clone()));
             let mut ins = vec![operand(&[b, n, h, d])?, operand(&[b, n, h_kv, d])?, operand(&[b, n, h_kv, d])?];
             if mask.key_lens {
@@ -922,9 +927,17 @@ impl FaPolicy {
                 let valid = Tensor::full(&[b, n], ConstValue::Int(1), DType::Int32);
                 ins.push(key_mask_operand(&valid, &caps).to(spec.clone()));
             }
+            Some((ins, Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone())))
+        };
+        let mut shared = None;
+        let compile = |i: usize| {
+            let cfg = candidates[i];
+            if shared.is_none() {
+                shared = operands();
+            }
+            let (ins, o) = shared.as_mut()?;
             let ins: Vec<&Tensor> = ins.iter().collect();
-            let mut o = Tensor::empty(&[b, n, h, d], dtype.clone()).to(spec.clone());
-            crate::launch::compile_kernel("flash_attention_tune", grid(&cfg), block, &mut [&mut o], &ins, move |ker| {
+            crate::launch::compile_kernel("flash_attention_tune", grid(&cfg), block, &mut [o], &ins, move |ker| {
                 build(ker, cfg)
             })
             .ok()
