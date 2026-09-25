@@ -965,6 +965,7 @@ impl<'k> Group<'k> {
     }
 
     fn scatter_reg_to_local(&self, st: &ST, rt: &RT<'k>, idxs: &[Idx], src_idxs: &[Idx]) -> Arc<UOp> {
+        assert_eq!(st.base.base.rows, rt.base.base.rows, "store REG→LOCAL: a shared base tile one fragment tall");
         let laneid = self.ker.laneid();
         let ept = rt.base.base.elements_per_thread() as i64;
         let n = rt.shape().len();
@@ -973,7 +974,11 @@ impl<'k> Group<'k> {
         let width = self.ker.raw_range(rt_w, AxisType::Loop);
         let inner = self.ker.raw_range(ept, AxisType::Loop);
 
+        // Wave sub-tile fragment offset (SI-1), symmetric with `load_local_to_reg`;
+        // a shared base tile may span several fragments of a row.
         let (row, col) = rt.lane_rc(rt.layout != st.layout, &laneid, &inner);
+        let h_idx = wave_offset(idxs.first(), rt_h, &height);
+        let (w_idx, col) = frag_in_base(st, rt, wave_offset(idxs.get(1), rt_w, &width), &col);
         let (srow, scol) = st.base.swizzle.swizzle_rc(row, col, st.base.base.cols, st.elem().base());
 
         let mut sidx: Vec<Idx> = src_idxs.to_vec();
@@ -982,9 +987,6 @@ impl<'k> Group<'k> {
         if rt.elem() != st.elem() {
             load = load.cast(st.elem().clone());
         }
-        // Wave sub-tile fragment offset (SI-1), symmetric with `load_local_to_reg`.
-        let h_idx = wave_offset(idxs.first(), rt_h, &height);
-        let w_idx = wave_offset(idxs.get(1), rt_w, &width);
         let didx = [h_idx, w_idx, Idx::Uop(srow), Idx::Uop(scol)];
         st_index(st, &didx).store(load).end(smallvec![height, width, inner])
     }
@@ -1019,6 +1021,62 @@ impl<'k> Group<'k> {
         F: Fn(&Arc<UOp>, &Arc<UOp>) -> Arc<UOp>,
     {
         self.store_reg_to_global_with(dst, rt, &ix.block, &ix.frag, ix.axis, ix.masked, ix.clipped, None, value)
+    }
+
+    /// Coalesced LOCAL→GLOBAL write-back of `st` into the `st`-sized block
+    /// `ix.block` of `dst` — the second hop of an output staged through shared
+    /// memory, whose first is [`Self::store`]'s RT→ST scatter. Every group thread
+    /// moves whole 16-byte runs of a row, so a warp's store covers whole sectors
+    /// instead of the two-element pieces of a row a fragment's lane holds. `value`
+    /// receives a run's elements (cast to `dst`'s dtype) and the flat global
+    /// offset of its first, and returns what is stored, so an epilogue reading a
+    /// second tensor at the store's own position reads it a run at a time.
+    ///
+    /// # Panics
+    /// Panics unless `st`'s swizzle keeps 16-byte runs contiguous, its runs
+    /// divide evenly over the group, `dst`'s rows are whole runs, and `ix` is
+    /// unmasked: the block lies inside `dst`.
+    pub fn store_local_vec<F>(&self, dst: GL, st: &ST, ix: MoveIdx, value: F) -> GL
+    where
+        F: Fn(Vec<Arc<UOp>>, &Arc<UOp>) -> Vec<Arc<UOp>>,
+    {
+        let run = lds_group(st);
+        let row_stride: i64 = dst.shape()[ix.axis + 1..].iter().product::<usize>() as i64;
+        let runs_per_row = (st.cols / run) as i64;
+        let threads = self.group_threads() as i64;
+        assert!(
+            st.base.swizzle.keeps_16b_chunks()
+                && (st.rows as i64 * runs_per_row) % threads == 0
+                && row_stride % run as i64 == 0
+                && !ix.masked,
+            "store LOCAL→GLOBAL: 16-byte runs over {threads} threads into whole rows of an unmasked block"
+        );
+        let (base_rows, base_cols) = (st.base.base.rows as i64, st.base.base.cols as i64);
+        let base = Self::tile_base(st, &dst, &ix.block, ix.axis);
+        let stores = (0..st.rows as i64 * runs_per_row / threads)
+            .map(|pass| {
+                let at = iadd(&cidx(pass * threads), &self.laneid());
+                let (row, chunk) = (idiv(&at, runs_per_row), imod(&at, runs_per_row));
+                let col = imul(&chunk, run as i64);
+                let (srow, scol) = st.base.swizzle.swizzle_chunk(
+                    imod(&row, base_rows),
+                    &imod(&chunk, base_cols / run as i64),
+                    st.base.base.cols,
+                    st.elem().base(),
+                );
+                let lds = st_swizzled_offset(st, idiv(&row, base_rows), idiv(&col, base_cols), srow, scol);
+                let loaded = load_off_vec(st.uop(), &lds, run);
+                let vals = (0..run)
+                    .map(|j| {
+                        let v = vec_elem(&loaded, j, run);
+                        if st.elem() == dst.elem() { v } else { v.cast(dst.elem().clone()) }
+                    })
+                    .collect();
+                let off = iadd(&base, &iadd(&imul(&row, row_stride), &col));
+                store_off_vec(dst.uop(), &off, value(vals, &off))
+            })
+            .collect();
+        self.finalize_gl(dst, super::group_or_single(stores))
     }
 
     /// [`Self::store_global_with`] for a tile whose M rows are **scattered**:

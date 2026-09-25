@@ -139,12 +139,17 @@ pub(crate) fn declines(policy: &GemmPolicy, caps: &crate::ArchCaps, geom: &ConvG
     caps.cuda().is_some() && fine_only_on_a_wide_grid(policy, geom)
 }
 
+/// A table tile as the convolution runs it: without the L2 swizzle — the grid
+/// is the plain 2-D one and `M` may be ragged — and storing C straight from the
+/// fragments, the store its forms were measured with.
+fn plain(cfg: &GemmCfg) -> GemmCfg {
+    GemmCfg { l2_swizzle: false, stage_out: false, ..*cfg }
+}
+
 /// The tile for `geom` from `policy`'s table, or `None` when none tiles it:
 /// the widest tile unless its grid would not fill the device, in which case the
-/// finer ones come first, as [`GemmPolicy::cfg`] orders them. The L2 swizzle is
-/// off: the grid is the plain 2-D one and `M` may be ragged.
+/// finer ones come first, as [`GemmPolicy::cfg`] orders them ([`plain`]).
 pub fn select_conv_cfg(policy: &GemmPolicy, geom: &ConvGeom) -> Option<GemmCfg> {
-    let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let widest = policy.tiles.first()?;
     let wide = |cfg: &GemmCfg| cfg.block_m * cfg.block_n >= widest.block_m * widest.block_n;
     let mut table: Vec<GemmCfg> = policy.tiles.iter().map(plain).collect();
@@ -218,7 +223,6 @@ pub(crate) fn conv_tile_seeds(
     geom: &ConvGeom,
 ) -> Vec<GemmCfg> {
     let (m, _, n) = geom.mkn();
-    let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let base = plain(policy.tiles.first().unwrap_or(&super::gemm::NT_128X64));
     let mut seeds: Vec<GemmCfg> =
         budget.ranked(&base, dtype.bytes(), TripCost::PerStripRow, (m, n), CONV_SEEDS, |cfg| geom.tiles(cfg)).to_vec();
@@ -238,7 +242,6 @@ pub fn conv_candidates(policy: &GemmPolicy, geom: &ConvGeom, caps: &crate::ArchC
     if declines(policy, caps, geom) {
         return Vec::new();
     }
-    let plain = |cfg: &GemmCfg| GemmCfg { l2_swizzle: false, ..*cfg };
     let mut plans: Vec<ConvPlan> = select_conv_cfg(policy, geom).map(ConvPlan::Gathered).into_iter().collect();
     for cfg in policy.tiles.iter().map(plain).filter(|cfg| geom.tiles(cfg)) {
         if !plans.contains(&ConvPlan::Gathered(cfg)) {

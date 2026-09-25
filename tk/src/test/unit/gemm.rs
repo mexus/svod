@@ -12,8 +12,8 @@ use test_case::test_case;
 
 use crate::kernels::gemm::{
     CUDA_TILES, Epilogue, GEMM_NT_SUPPORTED_ARCHS, GemmCfg, GemmPolicy, NT_64X64, NT_128X64, NT_128X128_RDNA4,
-    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue, select_cfg, silu,
-    swiglu_pair_width,
+    NT_SPLIT_K, RDNA_TILES, RDNA4_TILES, build_gemm, build_gemm_nt, gemm_nt, gemm_nt_with, gemm_nt_with_epilogue,
+    select_cfg, silu, swiglu_pair_width,
 };
 
 use super::device_supported;
@@ -218,6 +218,38 @@ fn epilogue_out_cols_and_kind() {
     assert_eq!(Epilogue::<&Tensor>::SwiGlu { pair: 16 }.kind(), Epilogue::SwiGlu { pair: 16 });
 }
 
+/// The staged store is on for every CUDA tile, where it was measured, and off
+/// on the RDNA tables, where it never was.
+#[test]
+fn the_staged_store_is_on_where_it_was_measured() {
+    assert!(CUDA_TILES.iter().all(|cfg| cfg.stage_out), "{CUDA_TILES:?}");
+    assert!(RDNA_TILES.iter().chain(&RDNA4_TILES).all(|cfg| !cfg.stage_out));
+}
+
+/// `stage_out` changes the kernel only where the staged store can run: a
+/// single strip too short to hold an output band, and split-K's f32 partials,
+/// build the direct store's kernel either way.
+#[test_case(NT_64X64, true; "the band fits the strips")]
+#[test_case(NT_128X64, true; "two accumulator bands")]
+#[test_case(GemmCfg { stages: 1, block_n: 128, warps_n: 4, ..NT_64X64 }, false; "one strip, shorter than the band")]
+#[test_case(NT_SPLIT_K, false; "split-K partials")]
+fn stage_out_changes_the_kernel_only_where_the_band_fits(cfg: GemmCfg, staged: bool) {
+    let caps = crate::ArchCaps::for_arch(SM86);
+    let (m, k, n) = (256usize, 256usize, 256usize);
+    let out_dt = if cfg.split_k > 1 { DType::Float32 } else { DType::BFloat16 };
+    let fingerprint = |stage_out: bool| {
+        let cfg = GemmCfg { stage_out, ..cfg };
+        let bufs = [(cfg.split_k * m * n, out_dt.clone()), (m * k, DType::BFloat16), (n * k, DType::BFloat16)]
+            .into_iter()
+            .map(|(size, dt)| svod_ir::UOp::new_buffer(svod_dtype::DeviceSpec::Cpu, size, dt))
+            .collect();
+        let ker = crate::Kernel::new("gemm_nt", cfg.grid_dims(m, n), cfg.threads(caps.wave_size), bufs, caps);
+        build_gemm_nt(&ker, (m, k, n), cfg, DType::BFloat16, out_dt.clone(), Epilogue::Plain);
+        crate::kernel_fingerprint(&ker.finish(cfg.acc_m)).digest
+    };
+    assert_eq!(fingerprint(true) != fingerprint(false), staged, "{cfg:?}");
+}
+
 /// A tile carries an epilogue only when its store can: split-K writes f32
 /// partials, so neither fused form rides it; SwiGLU further needs `reg_n/2` to be
 /// the caller's `pair` and a whole number of fragments.
@@ -384,6 +416,46 @@ fn cp_async_loops_match_single_buffered_gpu(k_step: usize, stages: usize, trips:
         println!("{cfg:?}: relative error {err:e}");
         assert!(err < BF16_REL_TOL, "{cfg:?}: relative error {err} exceeds the bf16 tolerance {BF16_REL_TOL}");
         assert_eq!(got, single, "{cfg:?} and its single-buffered form sum in the same order");
+    }
+}
+
+/// Every table tile's staged store against its direct store, under each fused
+/// epilogue the linear layers use: the accumulators narrow, pair and add exactly
+/// as they did and only the route to memory changes, so the two agree bit for
+/// bit. SwiGLU runs on the tiles that carry it.
+#[test_case(0; "tile 0")]
+#[test_case(1; "tile 1")]
+#[test_case(2; "tile 2")]
+#[test_case(3; "tile 3")]
+#[test_case(4; "tile 4")]
+#[ignore]
+fn staged_store_matches_the_direct_store_gpu(index: usize) {
+    if !device_supported(GEMM_NT_SUPPORTED_ARCHS) {
+        eprintln!("skip staged_store_matches_the_direct_store_gpu: no supported device / toolchain");
+        return;
+    }
+    let (m, k, n) = (512usize, 192usize, 384usize);
+    let (x, w) = (operand(m, k, DType::BFloat16, 0.31), operand(n, k, DType::BFloat16, 0.17));
+    let arch = crate::target::resolve_supported_arch(&x.device(), GEMM_NT_SUPPORTED_ARCHS).expect("supported");
+    let Some(&cfg) = GemmPolicy::for_arch(arch).tiles.get(index).filter(|cfg| cfg.stage_out) else {
+        eprintln!("skip staged_store_matches_the_direct_store_gpu: tile {index} is absent or stores directly");
+        return;
+    };
+    let frag = crate::ArchCaps::for_arch(arch).frag(crate::arch::FragRole::Accumulator).map(|f| f.base.cols);
+    let pair = swiglu_pair_width(&x.device()).expect("a common pair width");
+    let (res, paired) = (operand(m, n, DType::BFloat16, 0.53), pair_rows(&w, pair));
+    for epi in [Epilogue::Plain, Epilogue::Add(&res), Epilogue::SwiGlu { pair }] {
+        if !cfg.carries(epi.kind(), frag) {
+            continue;
+        }
+        let w = if let Epilogue::SwiGlu { .. } = epi { &paired } else { &w };
+        let run = |cfg: GemmCfg| {
+            let y = build_gemm(&x, w, epi, move |_, _, _, _| Some(cfg)).expect("build").expect("the tile applies");
+            to_f32_vec(&y)
+        };
+        let staged = run(cfg);
+        assert!(staged.iter().all(|v| v.is_finite()), "tile {index} {:?}: a non-finite output", epi.kind());
+        assert_eq!(staged, run(GemmCfg { stage_out: false, ..cfg }), "tile {index} {:?}", epi.kind());
     }
 }
 
