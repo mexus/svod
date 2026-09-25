@@ -1763,3 +1763,26 @@ fn fa_gfx1201_key_mask_seeds_the_scores(q_blk: usize, kv_blk: usize) {
         assert_eq!(count(code, "@llvm.exp2.f32"), 0, "an exp2 kept the denormal fix-up:\n{code}");
     }
 }
+
+/// On gfx12 the softmax weights narrow to the bf16 `P·V` operand as if never NaN
+/// (`Group::narrow_finite`): the round-half-to-even bias alone, with no `fptrunc`
+/// and no NaN compare and select, so the only native cast left is the output
+/// store's. sm_86 narrows in hardware (`cvt.rn.bf16x2.f32`) and keeps `fptrunc`.
+#[test_case::test_case(16, 32, false; "16x32")]
+#[test_case::test_case(32, 32, false; "32x32")]
+#[test_case::test_case(32, 32, true; "32x32 key mask")]
+fn fa_gfx1201_narrows_p_without_the_nan_guard(q_blk: usize, kv_blk: usize, key_mask: bool) {
+    let gfx1201 = svod_dtype::GpuArch::Amd(svod_dtype::AmdArch::Gfx1201);
+    let (dims, mask) = ((1, 512, 2, 2, 64), FaMask { key_mask, ..FaMask::NONE });
+    let cfg = FaConfig { q_blk, kv_blk, unroll: false, causal: false, window: None };
+    let code = render_fa_llvm(gfx1201, &format!("fa_narrow_gfx1201_{q_blk}x{kv_blk}_{key_mask}"), dims, cfg, mask);
+    let count = |needle: &str| code.lines().filter(|l| l.contains(needle)).count();
+    assert_eq!(count(" fptrunc float "), 1, "P kept the native narrowing:\n{code}");
+    assert_eq!(count(" fcmp uno "), 0, "a narrowing kept its NaN guard:\n{code}");
+    assert_eq!(count(", 32767"), 1, "P narrows through the rounding bias:\n{code}");
+
+    let cfg = FaConfig { unroll: true, ..cfg };
+    let sm86 = render_fa_sm86(&format!("fa_narrow_sm86_{q_blk}x{kv_blk}_{key_mask}"), dims, cfg, mask);
+    assert!(sm86.contains(" fptrunc float "), "sm_86 lost its hardware narrowing:\n{sm86}");
+    assert!(!sm86.contains(", 32767"), "sm_86 took the integer narrowing:\n{sm86}");
+}
