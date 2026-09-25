@@ -61,12 +61,14 @@ impl ConvGeom {
     }
     /// Whether `cfg` tiles this convolution: a strip stays inside one tap
     /// (`cin` a multiple of `k_step`), `N` tiles exactly, the K loop is at least
-    /// as deep as the pipeline, and the tile carries a fused store (no split-K).
-    /// `M` may be ragged.
+    /// as deep as the pipeline, the tile carries a fused store (no split-K), and
+    /// its loop is the two-stage whole-strip one, the only loop the tap-wise and
+    /// patch forms have. `M` may be ragged.
     pub fn tiles(&self, cfg: &GemmCfg) -> bool {
         let (_, k, n) = self.mkn();
         cfg.split_k == 1
             && cfg.stages == 2
+            && !cfg.stepped
             && self.cin.is_multiple_of(cfg.k_step)
             && n.is_multiple_of(cfg.block_n)
             && k / cfg.k_step >= cfg.stages
