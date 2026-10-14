@@ -13,6 +13,7 @@ mod encoder_layer;
 mod error;
 mod head;
 mod jit;
+mod linear;
 mod mlp;
 mod model;
 
