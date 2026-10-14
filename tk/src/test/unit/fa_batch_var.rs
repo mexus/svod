@@ -9,7 +9,7 @@ use svod_tensor::jit::{InputSpec, JitError};
 use svod_tensor::{Tensor, Variable};
 use test_case::test_case;
 
-use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_with};
+use crate::kernels::fa::{FA_SUPPORTED_ARCHS, FaOpts, flash_attention_packed, flash_attention_with};
 
 const MAX_B: usize = 3;
 const N: usize = 256;
@@ -47,6 +47,15 @@ impl Attention {
     fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor, opts: FaOpts) -> Result<Tensor, JitError> {
         let opts = FaOpts { causal: self.causal, ..opts };
         let out = flash_attention_with(q, k, v, opts)
+            .map_err(|e| JitError::Build { source: Box::new(e) })?
+            .expect("the FA kernel applies on a supported device");
+        Ok(out.cast(DType::Float32))
+    }
+
+    /// Over one packed `[B, N, 3H, D]` operand, the key table masking it.
+    fn forward_packed(&self, qkv: &Tensor, keys: &Tensor) -> Result<Tensor, JitError> {
+        let opts = FaOpts { causal: self.causal, key_mask: Some(keys), ..Default::default() };
+        let out = flash_attention_packed(qkv, (H, H), opts)
             .map_err(|e| JitError::Build { source: Box::new(e) })?
             .expect("the FA kernel applies on a supported device");
         Ok(out.cast(DType::Float32))
@@ -114,7 +123,18 @@ macro_rules! batch_plan {
 }
 batch_plan!(AttentionJit);
 batch_plan!(MaskedAttentionJit);
+jit_wrapper! {
+    PackedAttentionJit(Attention) {
+        inputs { qkv: Tensor, keys: Tensor }
+        batch_var b: (1, MAX_B),
+        outputs { o }
+
+        build(qkv, keys) { model.forward_packed(qkv, keys) }
+    }
+}
+
 batch_plan!(KeyTableAttentionJit);
+batch_plan!(PackedAttentionJit);
 
 fn copy_into(t: &Tensor, dst: &mut svod_device::Buffer) {
     t.realize().expect("realize");
@@ -182,6 +202,37 @@ fn fa_batch_var_matches_concrete_batch(causal: bool, mask: Mask) {
             Box::new(jit)
         }
     };
+    check_every_batch(plan.as_mut(), (&q, &k, &v), causal, mask);
+}
+
+/// `SVOD_DEVICE=CUDA:0 cargo test --release -p svod-tk --lib fa_batch_var -- --ignored --nocapture`.
+///
+/// The packed `[B, N, 3H, D]` operand takes the batch variable as the split
+/// ones do: one plan, the key table masking it, matches the split kernel built
+/// for each concrete batch and SDPA.
+#[test_case(false; "bidirectional")]
+#[test_case(true; "causal")]
+#[ignore]
+fn fa_batch_var_packed_matches_concrete_batch(causal: bool) {
+    if !super::device_supported(FA_SUPPORTED_ARCHS) {
+        eprintln!("skip fa_batch_var_packed_matches_concrete_batch: unsupported device/toolchain");
+        return;
+    }
+    let (q, k, v) = (operand(0.0), operand(1.0), operand(2.0));
+    let qkv = Tensor::cat(&[&q, &k, &v], 2).expect("pack the heads");
+    let mut jit = PackedAttentionJit::new(Attention { causal });
+    jit.prepare(InputSpec::new(&[MAX_B, N, 3 * H, D], DType::Float16), InputSpec::i32(&[MAX_B, N])).expect("prepare");
+    copy_into(&qkv, jit.qkv_mut().expect("qkv"));
+    let table = Tensor::from_slice(key_table().as_slice()).try_reshape([MAX_B, N]).expect("reshape");
+    copy_into(&table, jit.keys_mut().expect("keys"));
+    check_every_batch(&mut jit, (&q, &k, &v), causal, Mask::Keys);
+}
+
+/// Execute `plan` at every bound batch, down and back to one, against the split
+/// kernel built for that concrete batch and SDPA; the plan holds exactly one
+/// flash-attention dispatch, whose grid takes the batch variable.
+fn check_every_batch(plan: &mut dyn BatchPlan, (q, k, v): (&Tensor, &Tensor, &Tensor), causal: bool, mask: Mask) {
+    let keys = key_table();
     let dispatches = plan.fa_dispatches();
     assert_eq!(dispatches.len(), 1, "one flash-attention dispatch, got {dispatches:?}");
     assert!(dispatches[0].1.iter().any(|n| n == "b"), "the FA grid takes `b`: {dispatches:?}");
@@ -190,7 +241,7 @@ fn fa_batch_var_matches_concrete_batch(causal: bool, mask: Mask) {
         let got = plan.run(b);
 
         let live = |t: &Tensor| t.try_shrink([Some((0, b as isize)), None, None, None]).expect("shrink").contiguous();
-        let (qb, kb, vb) = (live(&q), live(&k), live(&v));
+        let (qb, kb, vb) = (live(q), live(k), live(v));
         let lens = Tensor::from_slice(&LENS[..b]);
         let table = Tensor::from_slice(&keys[..b * N]).try_reshape([b, N]).expect("reshape");
         let (by_lens, by_keys) = (matches!(mask, Mask::Lens), matches!(mask, Mask::Keys));
