@@ -11,6 +11,7 @@ pub mod audio;
 pub mod bgem3;
 pub mod blocks;
 pub mod diarizen;
+pub mod encoder_head;
 pub mod firered_vad;
 pub mod gigaam;
 pub mod gtcrn;
